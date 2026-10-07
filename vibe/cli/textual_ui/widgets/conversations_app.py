@@ -74,9 +74,7 @@ class ConversationsApp(Container):
             yield Static("")
 
             if not self.sessions:
-                yield Static(
-                    "  No past sessions found.", classes="conversations-empty"
-                )
+                yield Static("  No past sessions found.", classes="conversations-empty")
             else:
                 for _ in self.sessions:
                     widget = Static("", classes="conversations-option")
@@ -142,6 +140,102 @@ class ConversationsApp(Container):
 
     def action_close(self) -> None:
         self.post_message(self.ConversationsClosed())
+
+    def on_blur(self, event: events.Blur) -> None:
+        self.call_after_refresh(self.focus)
+
+
+class ForkApp(Container):
+    """Pick a recent user message to fork the session from."""
+
+    can_focus = True
+    can_focus_children = False
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("up", "move_up", "Up", show=False),
+        Binding("down", "move_down", "Down", show=False),
+        Binding("enter", "select_message", "Select", show=False),
+    ]
+
+    class MessageSelected(Message):
+        def __init__(self, entry_id: str) -> None:
+            super().__init__()
+            self.entry_id = entry_id
+
+    class ForkClosed(Message):
+        """Message emitted when the fork picker is dismissed."""
+
+    def __init__(self, messages: list[tuple[str, str]], **kwargs: Any) -> None:
+        super().__init__(id="fork-app", **kwargs)
+        self.messages = messages
+        self.selected_index = 0
+        self.message_widgets: list[Static] = []
+        self.title_widget: Static | None = None
+        self.help_widget: Static | None = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fork-content"):
+            self.title_widget = Static(
+                "Fork conversation from message", classes="conversations-title"
+            )
+            yield self.title_widget
+
+            yield Static("")
+
+            if not self.messages:
+                yield Static(
+                    "  No user messages to fork from.", classes="conversations-empty"
+                )
+            else:
+                for _ in self.messages:
+                    widget = Static("", classes="conversations-option")
+                    self.message_widgets.append(widget)
+                    yield widget
+
+            yield Static("")
+
+            self.help_widget = Static(
+                "↑↓ navigate  Enter fork  ESC cancel", classes="conversations-help"
+            )
+            yield self.help_widget
+
+    def on_mount(self) -> None:
+        self._update_display()
+        self.focus()
+
+    def _update_display(self) -> None:
+        for i, (widget, (_entry_id, preview)) in enumerate(
+            zip(self.message_widgets, self.messages, strict=True)
+        ):
+            cursor = "> " if i == self.selected_index else "  "
+            widget.update(f"{cursor}{_truncate_message(preview, 70)}")
+            widget.remove_class("conversations-selected")
+            widget.remove_class("conversations-unselected")
+            if i == self.selected_index:
+                widget.add_class("conversations-selected")
+            else:
+                widget.add_class("conversations-unselected")
+
+    def action_move_up(self) -> None:
+        if not self.messages:
+            return
+        self.selected_index = (self.selected_index - 1) % len(self.messages)
+        self._update_display()
+
+    def action_move_down(self) -> None:
+        if not self.messages:
+            return
+        self.selected_index = (self.selected_index + 1) % len(self.messages)
+        self._update_display()
+
+    def action_select_message(self) -> None:
+        if not self.messages:
+            return
+        entry_id, _ = self.messages[self.selected_index]
+        self.post_message(self.MessageSelected(entry_id))
+
+    def action_close(self) -> None:
+        self.post_message(self.ForkClosed())
 
     def on_blur(self, event: events.Blur) -> None:
         self.call_after_refresh(self.focus)

@@ -440,7 +440,12 @@ def build_prompt_sections(
     additional_directory_contexts: list[Path] | None = None,
 ) -> PromptSections:
     sections = PromptSections()
-    sections.set(PromptSection("preamble", config.system_prompt, tagged=False))
+    preamble = (
+        config.system_prompt_override
+        if config.system_prompt_override is not None
+        else config.system_prompt
+    )
+    sections.set(PromptSection("preamble", preamble, tagged=False))
 
     if config.include_commit_signature:
         sections.set(
@@ -500,6 +505,11 @@ def build_prompt_sections(
         sections.set(
             PromptSection("additional_context", additional_context, tagged=False)
         )
+
+    if appended := "\n\n".join(
+        block.strip() for block in config.append_system_prompt if block.strip()
+    ):
+        sections.set(PromptSection("append", appended, tagged=False))
 
     return sections
 

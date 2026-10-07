@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from enum import StrEnum, auto
 import os
 from pathlib import Path
@@ -14,15 +15,15 @@ from textual.events import MouseUp
 from textual.widget import Widget
 from textual.widgets import Static
 
-from vibe.cli.clipboard import copy_selection_to_clipboard
+from vibe.cli.clipboard import copy_selection_to_clipboard, copy_text_to_clipboard
 from vibe.cli.commands import CommandRegistry
 from vibe.cli.textual_ui.handlers.event_handler import EventHandler
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
-from vibe.cli.textual_ui.widgets.config_app import ConfigApp
+from vibe.cli.textual_ui.widgets.config_app import ConfigApp, ScopedModelsApp
 from vibe.cli.textual_ui.widgets.context_progress import ContextProgress, TokenState
-from vibe.cli.textual_ui.widgets.conversations_app import ConversationsApp
+from vibe.cli.textual_ui.widgets.conversations_app import ConversationsApp, ForkApp
 from vibe.cli.textual_ui.widgets.history_message import (
     HistoricalToolCall,
     HistoricalToolResult,
@@ -51,13 +52,17 @@ from vibe.cli.update_notifier.version_update_gateway import VersionUpdateGateway
 from vibe.core import __version__ as CORE_VERSION
 from vibe.core.agent import Agent
 from vibe.core.autocompletion.path_prompt_adapter import render_path_prompt
-from vibe.core.config import HISTORY_FILE, VibeConfig, get_vibe_home
+from vibe.core.config import HISTORY_FILE, ThinkingLevel, VibeConfig, get_vibe_home
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.prompts.templates import load_templates, render_template
+from vibe.core.sessions.entries import MessageEntry
+from vibe.core.sessions.export import export_session, import_session
+from vibe.core.sessions.store import JsonlSessionStore
 from vibe.core.skills.manager import SkillManager, SkillNotFoundError
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.types import (
     AgentMode,
+    AgentStats,
     BaseEvent,
     ContextUsageEvent,
     LLMMessage,
@@ -79,8 +84,37 @@ class BottomApp(StrEnum):
     Approval = auto()
     Config = auto()
     Conversations = auto()
+    Fork = auto()
     Input = auto()
     PlanApproval = auto()
+    ScopedModels = auto()
+
+
+THINKING_LEVELS: tuple[ThinkingLevel, ...] = (
+    ThinkingLevel.OFF,
+    ThinkingLevel.MINIMAL,
+    ThinkingLevel.LOW,
+    ThinkingLevel.MEDIUM,
+    ThinkingLevel.HIGH,
+)
+
+
+@dataclass(frozen=True)
+class UISessionOptions:
+    """Optional session state restored when the UI starts."""
+
+    name: str | None = None
+    thinking_level: ThinkingLevel | None = None
+
+
+def _stats_from_metadata(metadata: dict[str, Any]) -> AgentStats | None:
+    raw = metadata.get("stats")
+    if isinstance(raw, dict):
+        try:
+            return AgentStats.model_validate(raw)
+        except Exception:
+            return None
+    return None
 
 
 class VibeApp(App):
@@ -91,6 +125,9 @@ class VibeApp(App):
         Binding("ctrl+c", "force_quit", "Quit", show=False),
         Binding("escape", "interrupt", "Interrupt", show=False, priority=True),
         Binding("ctrl+o", "toggle_tool", "Toggle Tool", show=False),
+        Binding("ctrl+p", "cycle_model", "Next Model", show=False),
+        Binding("shift+ctrl+p", "cycle_model_previous", "Previous Model", show=False),
+        Binding("ctrl+y", "cycle_thinking", "Cycle Thinking", show=False),
         Binding("shift+tab", "cycle_mode", "Cycle Mode", show=False, priority=True),
     ]
 
@@ -107,10 +144,13 @@ class VibeApp(App):
         current_version: str = CORE_VERSION,
         additional_directory_contexts: list[Path] | None = None,
         prompt_template_dirs: list[Path] | None = None,
+        resume: UISessionOptions | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.config = config
+        self._session_name = resume.name if resume else None
+        self._initial_thinking_level = resume.thinking_level if resume else None
         # Support both agent_mode and legacy auto_approve parameter
         if agent_mode is not None:
             self.agent_mode = agent_mode
@@ -130,6 +170,7 @@ class VibeApp(App):
 
         self.event_handler: EventHandler | None = None
         self.commands = CommandRegistry()
+        self._chat_input_container: ChatInputContainer | None = None
         self._prompt_template_dirs = list(prompt_template_dirs or [])
         self.skill_manager = SkillManager(config)
         self.prompt_templates = load_templates(
@@ -137,7 +178,6 @@ class VibeApp(App):
         )
         self._register_dynamic_commands()
 
-        self._chat_input_container: ChatInputContainer | None = None
         self._mode_indicator: ModeIndicator | None = None
         self._context_progress: ContextProgress | None = None
         self._current_bottom_app: BottomApp = BottomApp.Input
@@ -352,9 +392,69 @@ class VibeApp(App):
         self, message: ConversationsApp.ConversationSelected
     ) -> None:
         """Handle selection of a past conversation."""
+        await self._load_session_file(message.filepath)
+        await self._switch_to_input_app()
+
+    async def on_conversations_app_conversations_closed(
+        self, message: ConversationsApp.ConversationsClosed
+    ) -> None:
+        """Handle closing the conversations dialog without selection."""
+        await self._switch_to_input_app()
+
+    async def on_scoped_models_app_scopes_saved(
+        self, message: ScopedModelsApp.ScopesSaved
+    ) -> None:
+        scopes = list(message.scopes)
+        VibeConfig.save_updates({"enabled_models": scopes})
+        self.config.enabled_models = scopes
+        scope_count = len(self.config.models_in_scope())
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Model scope saved: {scope_count} model(s) selectable.")
+        )
+        await self._switch_to_input_app()
+
+    async def on_fork_app_message_selected(
+        self, message: ForkApp.MessageSelected
+    ) -> None:
+        try:
+            if self.agent is None:
+                raise RuntimeError("Agent is not initialized")
+            filepath = self.agent.interaction_logger.filepath
+            if filepath is None:
+                raise RuntimeError("No session file to fork")
+            store = JsonlSessionStore(self.config.session_logging)
+            forked_path = store.fork(
+                filepath, message.entry_id, workdir=Path(self.config.effective_workdir)
+            )
+            view = store.read(forked_path)
+            await self.agent.switch_session(
+                session_id=view.header.id,
+                filepath=forked_path,
+                messages=view.messages(),
+                stats=view.stats(),
+            )
+            await self._finalize_current_streaming_message()
+            await self._reset_ui_messages()
+            await self._restore_ui_from_messages(view.messages())
+            await self._mount_and_scroll(
+                AssistantMessage(f"Forked into session `{view.header.id[:8]}`.")
+            )
+        except Exception as e:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Failed to fork session: {e}", collapsed=self._tools_collapsed
+                )
+            )
+
+        await self._switch_to_input_app()
+
+    async def on_fork_app_fork_closed(self, message: ForkApp.ForkClosed) -> None:
+        await self._switch_to_input_app()
+
+    async def _load_session_file(self, filepath: Path) -> None:
         try:
             # Load the selected session
-            loaded_messages, metadata = InteractionLogger.load_session(message.filepath)
+            loaded_messages, metadata = InteractionLogger.load_session(filepath)
 
             # Clear current messages area
             messages_area = self.query_one("#messages")
@@ -362,9 +462,10 @@ class VibeApp(App):
 
             # Show session continuation message
             session_time = metadata.get("start_time", "unknown time")
+            session_id = str(metadata.get("session_id", "unknown"))
             await self._mount_and_scroll(
                 AssistantMessage(
-                    f"Continuing session `{message.session_id}` from {session_time}"
+                    f"Continuing session `{session_id[:8]}` from {session_time}"
                 )
             )
 
@@ -375,44 +476,31 @@ class VibeApp(App):
             if not self.agent:
                 await self._initialize_agent()
 
-            # Load messages into agent (skip system messages)
             if self.agent:
-                non_system_messages = [
-                    msg for msg in loaded_messages if msg.role != Role.system
-                ]
-                # Reset agent messages to just system prompt, then add loaded
-                self.agent.messages = self.agent.messages[:1]
-                self.agent.messages.extend(non_system_messages)
+                self._restore_additional_directory_contexts(metadata)
 
-                # Restore additional directory contexts if they exist in the metadata
-                additional_contexts = metadata.get("additional_directory_contexts", [])
-                if additional_contexts:
-                    for context_path_str in additional_contexts:
-                        try:
-                            context_path = Path(context_path_str)
-                            if context_path.exists() and context_path.is_dir():
-                                self.agent.add_additional_directory_context(
-                                    context_path
-                                )
-                        except Exception:
-                            # Skip invalid paths
-                            continue
-                    # Regenerate system prompt with restored contexts
-                    self.agent._regenerate_system_prompt_with_additional_contexts()
+                if self.config.session_logging.enabled:
+                    await self.agent.switch_session(
+                        session_id=session_id,
+                        filepath=filepath,
+                        messages=loaded_messages,
+                        stats=_stats_from_metadata(metadata),
+                    )
+                else:
+                    non_system_messages = [
+                        msg for msg in loaded_messages if msg.role != Role.system
+                    ]
+                    self.agent.messages = self.agent.messages[:1]
+                    self.agent.messages.extend(non_system_messages)
 
+                await self._apply_session_preferences(metadata)
                 logger.info(
                     "Loaded %d messages from session %s",
-                    len(non_system_messages),
-                    message.session_id,
+                    len(loaded_messages),
+                    session_id,
                 )
 
-            # Update context progress
-            if self._context_progress and self.agent:
-                current_state = self._context_progress.tokens
-                self._context_progress.tokens = TokenState(
-                    max_tokens=current_state.max_tokens,
-                    current_tokens=self.agent.stats.context_tokens,
-                )
+            self._update_context_progress()
 
         except Exception as e:
             await self._mount_and_scroll(
@@ -421,13 +509,49 @@ class VibeApp(App):
                 )
             )
 
-        await self._switch_to_input_app()
+    def _restore_additional_directory_contexts(self, metadata: dict[str, Any]) -> None:
+        if not self.agent:
+            return
 
-    async def on_conversations_app_conversations_closed(
-        self, message: ConversationsApp.ConversationsClosed
-    ) -> None:
-        """Handle closing the conversations dialog without selection."""
-        await self._switch_to_input_app()
+        additional_contexts = metadata.get("additional_directory_contexts", [])
+        if not additional_contexts:
+            return
+
+        for context_path_str in additional_contexts:
+            try:
+                context_path = Path(context_path_str)
+                if context_path.exists() and context_path.is_dir():
+                    self.agent.add_additional_directory_context(context_path)
+            except Exception:
+                # Skip invalid paths
+                continue
+        self.agent._regenerate_system_prompt_with_additional_contexts()
+
+    async def _apply_session_preferences(self, metadata: dict[str, Any]) -> None:
+        custom = metadata.get("custom")
+        if not isinstance(custom, dict):
+            custom = {}
+
+        model_entry = custom.get("model")
+        if isinstance(model_entry, dict) and isinstance(model_entry.get("alias"), str):
+            await self._set_model_alias(model_entry["alias"], announce=False)
+
+        raw_level: str | None = None
+        level_entry = custom.get("thinking_level")
+        if isinstance(level_entry, dict) and isinstance(level_entry.get("level"), str):
+            raw_level = level_entry["level"]
+        elif isinstance(metadata.get("thinking_level"), str):
+            raw_level = metadata["thinking_level"]
+        if raw_level is not None:
+            try:
+                level: ThinkingLevel | None = ThinkingLevel(raw_level)
+            except ValueError:
+                level = None
+            await self._set_thinking_level(level, announce=False)
+
+        name_entry = custom.get("name")
+        if isinstance(name_entry, dict) and isinstance(name_entry.get("name"), str):
+            self._session_name = name_entry["name"]
 
     async def _restore_ui_from_messages(
         self, messages: list[LLMMessage], max_messages: int = 15
@@ -536,6 +660,12 @@ class VibeApp(App):
         for skill in self.skill_manager.get_available_skills():
             if f"skill:{skill.name}" not in self.commands.commands:
                 self.commands.register_skill(skill)
+
+        self._refresh_chat_completions()
+
+    def _refresh_chat_completions(self) -> None:
+        if self._chat_input_container is not None:
+            self._chat_input_container.refresh_commands()
 
     async def _handle_command(self, user_input: str) -> bool:
         # Check if this is a command with arguments (e.g., /add-dir <path>)
@@ -736,6 +866,11 @@ class VibeApp(App):
                 logger.info(
                     "Loaded %d messages from previous session", len(non_system_messages)
                 )
+
+            if self._initial_thinking_level is not None:
+                agent.set_thinking_level(self._initial_thinking_level)
+            if self._session_name:
+                agent.record_custom("name", {"name": self._session_name})
 
             self.agent = agent
             self.skill_manager = agent.skill_manager
@@ -1045,6 +1180,448 @@ class VibeApp(App):
                 )
             )
 
+    def _update_context_progress(self) -> None:
+        if not self._context_progress:
+            return
+        context_limit = self.config.get_context_limit_for_active_model()
+        current_tokens = self.agent.stats.context_tokens if self.agent else 0
+        if context_limit > 0:
+            self._context_progress.tokens = TokenState(
+                max_tokens=context_limit, current_tokens=current_tokens
+            )
+        else:
+            self._context_progress.tokens = TokenState()
+
+    def _reasoning_capability(self) -> str:
+        try:
+            supported = self.config.get_active_model().capabilities.reasoning
+        except ValueError:
+            return ""
+        if supported:
+            return " This model supports reasoning."
+        return " This model does not advertise reasoning support."
+
+    async def _set_model_alias(self, alias: str, *, announce: bool = True) -> bool:
+        if not self.config.is_model_in_scope(alias):
+            if announce:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Model '{alias}' is not in scope. "
+                        "Use /scoped-models to change the scope.",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+            return False
+
+        try:
+            model = self.config.get_model_by_alias(alias)
+        except ValueError as exc:
+            if announce:
+                await self._mount_and_scroll(
+                    ErrorMessage(str(exc), collapsed=self._tools_collapsed)
+                )
+            return False
+
+        if self.agent is not None:
+            self.agent.set_model(alias)
+        else:
+            self.config.active_model = alias
+
+        self._update_context_progress()
+        if announce:
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Switched to model `{alias}` "
+                    f"({model.provider}, {model.context_window:,} token context)."
+                )
+            )
+        return True
+
+    async def _show_model_selector(self, user_input: str) -> None:
+        parts = user_input.split(maxsplit=1)
+        if len(parts) > 1 and (alias := parts[1].strip()):
+            await self._set_model_alias(alias)
+            return
+        await self._switch_to_config_app(focus_key="active_model")
+
+    async def _show_scoped_models(self) -> None:
+        await self._switch_to_scoped_models_app()
+
+    async def _cycle_model(self, direction: int) -> None:
+        aliases = [model.alias for model in self.config.models_in_scope()]
+        if not aliases:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "No models are in scope. Use /scoped-models to enable some.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        current = self.config.active_model
+        index = aliases.index(current) if current in aliases else -1
+        target = aliases[(index + direction) % len(aliases)]
+        await self._set_model_alias(target)
+
+    async def _set_thinking_level(
+        self, level: ThinkingLevel | None, *, announce: bool = True
+    ) -> None:
+        if self.agent is None:
+            self._initial_thinking_level = level
+        else:
+            self.agent.set_thinking_level(level, record=True)
+
+        if announce:
+            label = level.value if level is not None else "default"
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Thinking level set to `{label}`.{self._reasoning_capability()}"
+                )
+            )
+
+    async def _set_thinking(self, user_input: str) -> None:
+        parts = user_input.split(maxsplit=1)
+        if len(parts) == 1:
+            current = (
+                self.agent.thinking_level
+                if self.agent
+                else self._initial_thinking_level
+            )
+            label = current.value if current is not None else "default"
+            valid = ", ".join(level.value for level in THINKING_LEVELS)
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Thinking level: `{label}`.{self._reasoning_capability()}\n\n"
+                    f"Valid levels: {valid}, or `default`."
+                )
+            )
+            return
+
+        raw_level = parts[1].strip().lower()
+        match raw_level:
+            case "default" | "none" | "auto" | "":
+                level: ThinkingLevel | None = None
+            case "off":
+                level = ThinkingLevel.OFF
+            case raw:
+                try:
+                    level = ThinkingLevel(raw)
+                except ValueError:
+                    valid = ", ".join(entry.value for entry in THINKING_LEVELS)
+                    await self._mount_and_scroll(
+                        ErrorMessage(
+                            f"Invalid thinking level '{raw}'. "
+                            f"Valid levels: {valid}, or default.",
+                            collapsed=self._tools_collapsed,
+                        )
+                    )
+                    return
+        await self._set_thinking_level(level)
+
+    async def _cycle_thinking(self) -> None:
+        current = (
+            self.agent.thinking_level if self.agent else self._initial_thinking_level
+        )
+        levels = list(THINKING_LEVELS)
+        current_index = next(
+            (index for index, level in enumerate(levels) if level == current), -1
+        )
+        target = levels[(current_index + 1) % len(levels)]
+        await self._set_thinking_level(target)
+
+    async def _new_session(self) -> None:
+        if self.agent is None:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Agent not initialized yet. Send a message first.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        await self.agent.clear_history()
+        await self._finalize_current_streaming_message()
+        messages_area = self.query_one("#messages")
+        await messages_area.remove_children()
+        self._session_name = None
+        self._update_context_progress()
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Started a new session `{self.agent.session_id[:8]}`.")
+        )
+
+    async def _resume_session(self, user_input: str) -> None:
+        if not self.config.session_logging.enabled:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Session logging is disabled. Enable it in config to resume.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        parts = user_input.split(maxsplit=1)
+        if len(parts) > 1 and (session_id := parts[1].strip()):
+            filepath = InteractionLogger.find_session_by_id(
+                session_id, self.config.session_logging
+            )
+            if filepath is None:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Session '{session_id}' not found.",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            await self._load_session_file(filepath)
+            return
+
+        await self._switch_to_conversations_app()
+
+    async def _set_session_name(self, user_input: str) -> None:
+        parts = user_input.split(maxsplit=1)
+        name = parts[1].strip() if len(parts) > 1 else ""
+        if not name:
+            current = self._session_name or "(unnamed)"
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Session name: {current}\n\nUse `/name <name>` to rename."
+                )
+            )
+            return
+
+        self._session_name = name
+        if self.agent is not None:
+            self.agent.record_custom("name", {"name": name})
+        await self._mount_and_scroll(UserCommandMessage(f"Session named `{name}`."))
+
+    async def _show_session_info(self) -> None:
+        if self.agent is None:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Agent not initialized yet. Send a message first.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        stats = self.agent.stats
+        session_file: str | None = None
+        entry_count: int | None = None
+        filepath = self.agent.interaction_logger.filepath
+        if self.config.session_logging.enabled and filepath is not None:
+            session_file = str(filepath)
+            if filepath.suffix == ".jsonl":
+                try:
+                    view = JsonlSessionStore(self.config.session_logging).read(filepath)
+                    entry_count = len(view.entries) + 1
+                except OSError:
+                    entry_count = None
+
+        lines = [
+            "## Session Info",
+            "",
+            f"- **ID**: `{self.agent.session_id[:8]}`",
+            f"- **Name**: {self._session_name or '(unnamed)'}",
+            f"- **Model**: `{self.config.active_model}`",
+            f"- **Context**: {stats.context_percent:.0f}% "
+            f"({stats.context_tokens:,}/{stats.context_window:,} tokens)",
+            f"- **Cost**: ${stats.session_cost:.6f}",
+            f"- **Messages**: {max(0, len(self.agent.messages) - 1)}",
+            f"- **Entries**: {entry_count if entry_count is not None else 'n/a'}",
+            f"- **Session file**: `{session_file or 'disabled'}`",
+        ]
+        await self._mount_and_scroll(UserCommandMessage("\n".join(lines)))
+
+    async def _export_session(self, user_input: str) -> None:
+        if self.agent is None:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Agent not initialized yet. Send a message first.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        parts = user_input.split(maxsplit=1)
+        workdir = Path(self.config.effective_workdir)
+        if len(parts) > 1 and (raw_path := parts[1].strip()):
+            target = Path(raw_path).expanduser()
+            if not target.is_absolute():
+                target = workdir / target
+        else:
+            target = workdir / f"session_{self.agent.session_id[:8]}.md"
+
+        metadata = {
+            "session_id": self.agent.session_id,
+            "model": self.config.active_model,
+        }
+        try:
+            export_session(
+                target,
+                source=self.agent.interaction_logger.filepath,
+                messages=self.agent.messages,
+                metadata=metadata,
+            )
+        except OSError as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Failed to export session: {exc}", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Exported session to `{target}`.")
+        )
+
+    async def _import_session(self, user_input: str) -> None:
+        parts = user_input.split(maxsplit=1)
+        if len(parts) == 1 or not (raw_path := parts[1].strip()):
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Usage: /import <path-to-.jsonl-or-.json>",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        if self.agent is None:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Agent not initialized yet. Send a message first.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        source = Path(raw_path).expanduser()
+        try:
+            imported = import_session(
+                source,
+                store=JsonlSessionStore(self.config.session_logging),
+                workdir=Path(self.config.effective_workdir),
+                persist=self.config.session_logging.enabled,
+            )
+        except (ValueError, OSError) as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Failed to import session: {exc}", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        await self.agent.switch_session(
+            session_id=imported.session_id,
+            filepath=imported.path,
+            messages=imported.messages,
+            stats=imported.stats,
+        )
+        await self._finalize_current_streaming_message()
+        await self._reset_ui_messages()
+        await self._restore_ui_from_messages(imported.messages)
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Imported session `{imported.session_id[:8]}` "
+                f"({len(imported.messages)} messages)."
+            )
+        )
+
+    async def _reset_ui_messages(self) -> None:
+        messages_area = self.query_one("#messages")
+        await messages_area.remove_children()
+        self._update_context_progress()
+        chat = self.query_one("#chat", VerticalScroll)
+        chat.scroll_home(animate=False)
+
+    async def _fork_session(self) -> None:
+        if self.agent is None:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Agent not initialized yet. Send a message first.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        if not self.config.session_logging.enabled:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Session logging is disabled. Enable it in config to fork.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        filepath = self.agent.interaction_logger.filepath
+        if filepath is None or filepath.suffix != ".jsonl":
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "No JSONL session to fork yet.", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        try:
+            view = JsonlSessionStore(self.config.session_logging).read(filepath)
+        except OSError as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Failed to read session: {exc}", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        candidates = [
+            (entry.id, entry.message.content or "")
+            for entry in view.entries
+            if isinstance(entry, MessageEntry)
+            and entry.message.role is Role.user
+            and (entry.message.content or "").strip()
+        ][-20:]
+        if not candidates:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "No user messages to fork from.", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        await self._switch_to_fork_app(candidates)
+
+    async def _copy_last_message(self) -> None:
+        if self.agent is None:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Agent not initialized yet. Send a message first.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        content = next(
+            (
+                message.content
+                for message in reversed(self.agent.messages)
+                if message.role is Role.assistant and (message.content or "").strip()
+            ),
+            None,
+        )
+        if not content:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "No assistant message to copy yet.", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        copied = copy_text_to_clipboard(
+            self, content, f"Copied last assistant message ({len(content)} chars)."
+        )
+        if not copied:
+            await self._mount_and_scroll(
+                ErrorMessage("Clipboard unavailable.", collapsed=self._tools_collapsed)
+            )
+
     async def _show_conversations(self) -> None:
         """Show the conversations browser to select a past session."""
         if not self.config.session_logging.enabled:
@@ -1193,7 +1770,7 @@ class VibeApp(App):
                 )
             )
 
-    async def _switch_to_config_app(self) -> None:
+    async def _switch_to_config_app(self, focus_key: str | None = None) -> None:
         if self._current_bottom_app == BottomApp.Config:
             return
 
@@ -1209,11 +1786,53 @@ class VibeApp(App):
         if self._mode_indicator:
             self._mode_indicator.display = False
 
-        config_app = ConfigApp(self.config)
+        config_app = ConfigApp(self.config, focus_key=focus_key)
         await bottom_container.mount(config_app)
         self._current_bottom_app = BottomApp.Config
 
         self.call_after_refresh(config_app.focus)
+
+    async def _switch_to_scoped_models_app(self) -> None:
+        if self._current_bottom_app == BottomApp.ScopedModels:
+            return
+
+        bottom_container = self.query_one("#bottom-app-container")
+
+        try:
+            chat_input_container = self.query_one(ChatInputContainer)
+            await chat_input_container.remove()
+        except Exception:
+            pass
+
+        if self._mode_indicator:
+            self._mode_indicator.display = False
+
+        scoped_app = ScopedModelsApp(self.config)
+        await bottom_container.mount(scoped_app)
+        self._current_bottom_app = BottomApp.ScopedModels
+
+        self.call_after_refresh(scoped_app.focus)
+
+    async def _switch_to_fork_app(self, candidates: list[tuple[str, str]]) -> None:
+        if self._current_bottom_app == BottomApp.Fork:
+            return
+
+        bottom_container = self.query_one("#bottom-app-container")
+
+        try:
+            chat_input_container = self.query_one(ChatInputContainer)
+            await chat_input_container.remove()
+        except Exception:
+            pass
+
+        if self._mode_indicator:
+            self._mode_indicator.display = False
+
+        fork_app = ForkApp(candidates)
+        await bottom_container.mount(fork_app)
+        self._current_bottom_app = BottomApp.Fork
+
+        self.call_after_refresh(fork_app.focus)
 
     async def _switch_to_conversations_app(self) -> None:
         if self._current_bottom_app == BottomApp.Conversations:
@@ -1292,6 +1911,18 @@ class VibeApp(App):
         except Exception:
             pass
 
+        try:
+            scoped_app = self.query_one("#scoped-models-app")
+            await scoped_app.remove()
+        except Exception:
+            pass
+
+        try:
+            fork_app = self.query_one("#fork-app")
+            await fork_app.remove()
+        except Exception:
+            pass
+
         if self._mode_indicator:
             self._mode_indicator.display = True
 
@@ -1330,6 +1961,10 @@ class VibeApp(App):
                     self.query_one(ApprovalApp).focus()
                 case BottomApp.PlanApproval:
                     self.query_one(PlanApprovalWidget).focus()
+                case BottomApp.ScopedModels:
+                    self.query_one(ScopedModelsApp).focus()
+                case BottomApp.Fork:
+                    self.query_one(ForkApp).focus()
                 case app:
                     assert_never(app)
         except Exception:
@@ -1348,6 +1983,22 @@ class VibeApp(App):
             try:
                 conversations_app = self.query_one(ConversationsApp)
                 conversations_app.action_close()
+            except Exception:
+                pass
+            return
+
+        if self._current_bottom_app == BottomApp.ScopedModels:
+            try:
+                scoped_app = self.query_one(ScopedModelsApp)
+                scoped_app.action_close()
+            except Exception:
+                pass
+            return
+
+        if self._current_bottom_app == BottomApp.Fork:
+            try:
+                fork_app = self.query_one(ForkApp)
+                fork_app.action_close()
             except Exception:
                 pass
             return
@@ -1392,6 +2043,21 @@ class VibeApp(App):
                 error_msg.set_collapsed(self._tools_collapsed)
         except Exception:
             pass
+
+    async def action_cycle_model(self) -> None:
+        if self._current_bottom_app != BottomApp.Input:
+            return
+        await self._cycle_model(1)
+
+    async def action_cycle_model_previous(self) -> None:
+        if self._current_bottom_app != BottomApp.Input:
+            return
+        await self._cycle_model(-1)
+
+    async def action_cycle_thinking(self) -> None:
+        if self._current_bottom_app != BottomApp.Input:
+            return
+        await self._cycle_thinking()
 
     def action_cycle_mode(self) -> None:
         if self._current_bottom_app != BottomApp.Input:
@@ -1577,6 +2243,7 @@ def run_textual_ui(
     session_info: ResumeSessionInfo | None = None,
     additional_directory_contexts: list[Path] | None = None,
     prompt_template_dirs: list[Path] | None = None,
+    resume: UISessionOptions | None = None,
 ) -> None:
     update_notifier = GitHubVersionUpdateGateway(
         owner="qnguyen3", repository="qqcode", token=os.getenv("GITHUB_TOKEN")
@@ -1591,5 +2258,6 @@ def run_textual_ui(
         version_update_notifier=update_notifier,
         additional_directory_contexts=additional_directory_contexts,
         prompt_template_dirs=prompt_template_dirs,
+        resume=resume,
     )
     app.run()

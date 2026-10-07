@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from vibe.core.config import ThinkingLevel, VibeConfig
+from vibe.core.config import ModelConfig, ThinkingLevel, VibeConfig
 from vibe.core.context.compactor import Compactor
 from vibe.core.context.overflow import is_context_overflow
 from vibe.core.context.tokens import estimate_context_tokens
@@ -235,6 +235,9 @@ class Agent:
         self._overflow_recovered = False
         self._thinking_level: ThinkingLevel | None = None
         self.compactor = Compactor(self)
+        self._steering: asyncio.Queue[str] = asyncio.Queue()
+        self._abort_event = asyncio.Event()
+        self._active_task: asyncio.Task[Any] | None = None
 
         self.approval_callback: ApprovalCallback | None = None
         self.plan_approval_callback: Callable[[str], Any] | None = (
@@ -300,13 +303,78 @@ class Agent:
             honor_retry_after=self.config.retry.honor_retry_after,
         )
 
-    def set_thinking_level(self, level: ThinkingLevel | None) -> None:
-        """Set the session thinking level override (None clears it)."""
+    def set_thinking_level(
+        self, level: ThinkingLevel | None, *, record: bool = False
+    ) -> None:
+        """Set the session thinking level override (None clears it).
+
+        When ``record`` is true a ``thinking_level_change`` entry and a matching
+        custom entry are appended so resume can restore the choice.
+        """
         self._thinking_level = level
+        if record:
+            value = level.value if level is not None else None
+            self._recorder.on_thinking_level_change(value)
+            self.record_custom("thinking_level", {"level": value})
 
     @property
     def thinking_level(self) -> ThinkingLevel | None:
         return self._thinking_level
+
+    def record_custom(self, key: str, value: dict[str, Any]) -> None:
+        """Persist an arbitrary ``CustomEntry`` on the session store."""
+        self._recorder.on_custom(key, value)
+
+    def set_model(self, alias: str) -> ModelConfig:
+        """Switch the active model and rebuild the backend.
+
+        Records a ``ModelChangeEntry`` plus a ``model`` custom entry so the
+        choice can be restored on resume.
+
+        Raises:
+            ValueError: If ``alias`` is not a configured model.
+        """
+        model = self.config.get_model_by_alias(alias)
+        if self.config.active_model == alias:
+            return model
+
+        self.config.active_model = alias
+        self.stats.update_pricing(model.pricing)
+        self.stats.context_window = model.context_window
+        self.backend = self.backend_factory()
+        self._recorder.on_model_change(alias, model.provider)
+        self.record_custom("model", {"alias": alias, "provider": model.provider})
+
+        if self.config.include_model_info:
+            self._prompt_sections.set(
+                PromptSection(
+                    "model_info", f"Your model name is: `{alias}`", tagged=False
+                )
+            )
+            self._apply_prompt_sections()
+        return model
+
+    def steer(self, text: str) -> None:
+        """Queue a user message to continue the turn without waiting for input."""
+        if text.strip():
+            self._steering.put_nowait(text)
+
+    def abort(self) -> None:
+        """Cancel the running turn as soon as possible."""
+        self._abort_event.set()
+        task = self._active_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    @property
+    def aborted(self) -> bool:
+        return self._abort_event.is_set()
+
+    def _drain_steering(self) -> list[str]:
+        messages: list[str] = []
+        while not self._steering.empty():
+            messages.append(self._steering.get_nowait())
+        return messages
 
     def add_message(self, message: LLMMessage) -> None:
         self._append_message(message)
@@ -328,8 +396,13 @@ class Agent:
 
     async def act(self, msg: str) -> AsyncGenerator[BaseEvent]:
         self._clean_message_history()
-        async for event in self._conversation_loop(msg):
-            yield event
+        self._abort_event.clear()
+        self._active_task = asyncio.current_task()
+        try:
+            async for event in self._conversation_loop(msg):
+                yield event
+        finally:
+            self._active_task = None
 
     def _setup_middleware(self, max_turns: int | None, max_price: float | None) -> None:
         self.middleware_pipeline.clear()
@@ -441,6 +514,10 @@ class Agent:
 
         should_break_loop = False
         while not should_break_loop:
+            if self._abort_event.is_set():
+                self._flush_new_messages()
+                await self._recorder.flush()
+                return
             try:
                 self._refresh_context_stats()
                 result = await self.middleware_pipeline.run_before_turn(
@@ -489,6 +566,11 @@ class Agent:
                     self._flush_new_messages()
                     yield self._context_usage_event()
                     return
+
+                if steering := self._drain_steering():
+                    for text in steering:
+                        self._append_message(LLMMessage(role=Role.user, content=text))
+                    should_break_loop = False
 
                 self._flush_new_messages()
                 await self._recorder.flush()
@@ -548,13 +630,15 @@ class Agent:
     def _create_assistant_event(
         self, content: str, chunk: LLMChunk | None, reasoning_content: str | None = None
     ) -> AssistantEvent:
+        usage = chunk.usage if chunk else None
         return AssistantEvent(
             content=content,
             reasoning_content=reasoning_content,
-            prompt_tokens=chunk.usage.prompt_tokens if chunk and chunk.usage else 0,
-            completion_tokens=chunk.usage.completion_tokens
-            if chunk and chunk.usage
-            else 0,
+            prompt_tokens=usage.prompt_tokens if usage else 0,
+            completion_tokens=usage.completion_tokens if usage else 0,
+            cache_read_tokens=usage.cache_read_tokens if usage else 0,
+            cache_write_tokens=usage.cache_write_tokens if usage else 0,
+            cost_usd=self.stats.usage_cost(usage) if usage else 0.0,
             session_total_tokens=self.stats.session_total_llm_tokens,
             last_turn_duration=self.stats.last_turn_duration,
             tokens_per_second=self.stats.tokens_per_second,
@@ -670,6 +754,9 @@ class Agent:
             content=assistant_msg.content or "",
             prompt_tokens=llm_result.usage.prompt_tokens,
             completion_tokens=llm_result.usage.completion_tokens,
+            cache_read_tokens=llm_result.usage.cache_read_tokens,
+            cache_write_tokens=llm_result.usage.cache_write_tokens,
+            cost_usd=self.stats.usage_cost(llm_result.usage),
             session_total_tokens=self.stats.session_total_llm_tokens,
             last_turn_duration=self.stats.last_turn_duration,
             tokens_per_second=self.stats.tokens_per_second,
@@ -1388,6 +1475,57 @@ class Agent:
         self.middleware_pipeline.reset()
         self.tool_manager.reset_all()
         self._reset_session()
+
+    async def switch_session(
+        self,
+        *,
+        session_id: str,
+        filepath: Path | None,
+        messages: list[LLMMessage],
+        stats: AgentStats | None = None,
+    ) -> None:
+        """Point the agent at ``filepath`` and load ``messages`` as its history.
+
+        Used by ``/resume``, ``/fork`` and ``/import``. Subsequent turns append
+        to the given session file instead of starting a new one.
+        """
+        await self._recorder.flush()
+        system_messages = [msg for msg in self.messages if msg.role is Role.system]
+        non_system_messages = [msg for msg in messages if msg.role is not Role.system]
+
+        self.session_id = session_id
+        self.interaction_logger = InteractionLogger(
+            self.config.session_logging,
+            session_id,
+            self._mode == AgentMode.AUTO_APPROVE,
+            self.config.effective_workdir,
+            existing_filepath=(
+                filepath
+                if filepath is not None and self.config.session_logging.enabled
+                else None
+            ),
+        )
+        self._recorder = SessionRecorder(self.interaction_logger, agent=self)
+        self.messages = [*system_messages[:1], *non_system_messages]
+
+        if stats is not None:
+            self.stats = stats
+        try:
+            active_model = self.config.get_active_model()
+            self.stats.update_pricing(active_model.pricing)
+            self.stats.context_window = active_model.context_window
+        except ValueError:
+            pass
+
+        self._last_usage = None
+        self.compactor.reset()
+        self.middleware_pipeline.reset()
+        self.tool_manager.reset_all()
+
+        if self.message_observer:
+            for msg in self.messages:
+                self.message_observer(msg)
+            self._last_observed_message_index = len(self.messages)
 
     async def compact(self, instructions: str | None = None) -> str:
         try:

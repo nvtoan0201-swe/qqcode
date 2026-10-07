@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
+import sys
 
 import pytest
 
 from tests.mock.mock_backend_factory import mock_backend_factory
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
+from vibe.cli.entrypoint import _parse_tool_flags, apply_runtime_flags, parse_arguments
 from vibe.core import run_programmatic
 from vibe.core.config import Backend, SessionLoggingConfig, VibeConfig
 from vibe.core.sessions.entries import UsageEntry
@@ -181,3 +184,125 @@ def test_run_programmatic_persists_jsonl_session(tmp_path: Path) -> None:
         "persisted answer",
     ]
     assert any(isinstance(entry, UsageEntry) for entry in view.entries)
+
+
+def test_enabled_tools_is_an_alias_of_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qqcode",
+            "--enabled-tools",
+            "bash",
+            "--tools",
+            "grep",
+            "--tools",
+            "read_file",
+        ],
+    )
+
+    args = parse_arguments()
+
+    assert args.tools == ["bash", "grep", "read_file"]
+
+
+def test_parse_tool_flags_supports_include_exclude_and_bare_values() -> None:
+    enabled, disabled = _parse_tool_flags(
+        ["+bash*", "-rm", "read_file"], bare="enabled"
+    )
+    assert enabled == ["bash*", "read_file"]
+    assert disabled == ["rm"]
+
+    excluded_enabled, excluded_disabled = _parse_tool_flags(
+        ["+grep", "write_file"], bare="disabled"
+    )
+    assert excluded_enabled == ["grep"]
+    assert excluded_disabled == ["write_file"]
+
+
+def test_apply_runtime_flags_wires_new_options(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "system.md"
+    prompt_file.write_text("custom system prompt", encoding="utf-8")
+    template_dir = tmp_path / "templates"
+    template_dir.mkdir()
+    session_dir = tmp_path / "sessions"
+
+    config = VibeConfig(
+        session_logging=SessionLoggingConfig(
+            enabled=True, save_dir=str(tmp_path / "legacy")
+        ),
+        include_context_files=True,
+        enable_update_checks=False,
+    )
+    args = argparse.Namespace(
+        system_prompt=str(prompt_file),
+        append_system_prompt=["be terse"],
+        no_context_files=True,
+        session_dir=str(session_dir),
+        no_session=True,
+        tools=["+bash", "-edit"],
+        exclude_tools=["+grep", "rm"],
+        prompt_template=[str(template_dir)],
+    )
+
+    dirs = apply_runtime_flags(config, args)
+
+    assert config.system_prompt_override == "custom system prompt"
+    assert config.append_system_prompt == ["be terse"]
+    assert config.include_context_files is False
+    assert config.session_logging.enabled is False
+    assert config.session_logging.sessions_dir == str(session_dir)
+    assert config.enabled_tools == ["bash", "grep"]
+    assert config.disabled_tools == ["edit", "rm"]
+    assert dirs == [template_dir]
+
+
+def test_apply_runtime_flags_reads_literal_prompt_text(tmp_path: Path) -> None:
+    config = VibeConfig(
+        session_logging=SessionLoggingConfig(enabled=False), enable_update_checks=False
+    )
+    args = argparse.Namespace(
+        system_prompt="literal prompt",
+        append_system_prompt=None,
+        no_context_files=False,
+        session_dir=None,
+        no_session=False,
+        tools=None,
+        exclude_tools=None,
+        prompt_template=None,
+    )
+
+    apply_runtime_flags(config, args)
+
+    assert config.system_prompt_override == "literal prompt"
+    assert config.enabled_tools == []
+    assert config.disabled_tools == []
+
+
+def test_new_flags_do_not_break_programmatic_flow() -> None:
+    with mock_backend_factory(
+        Backend.MISTRAL,
+        lambda provider, **kwargs: FakeBackend([
+            mock_llm_chunk(content="still works", finish_reason="stop")
+        ]),
+    ):
+        cfg = VibeConfig(
+            session_logging=SessionLoggingConfig(enabled=False),
+            system_prompt_id="tests",
+            system_prompt_override="You are a test agent.",
+            append_system_prompt=["Answer briefly."],
+            include_context_files=False,
+            include_project_context=False,
+            include_prompt_detail=False,
+            include_model_info=False,
+            include_commit_signature=False,
+        )
+
+        result = run_programmatic(
+            config=cfg,
+            prompt="hello",
+            output_format=OutputFormat.TEXT,
+            mode="auto-approve",
+        )
+
+    assert result == "still works"

@@ -283,6 +283,9 @@ class AssistantEvent(BaseEvent):
     reasoning_content: str | None = None  # For thinking/reasoning tokens
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: float = 0.0
     session_total_tokens: int = 0
     last_turn_duration: float = 0.0
     tokens_per_second: float = 0.0
@@ -341,6 +344,7 @@ class OutputFormat(StrEnum):
     JSON = auto()
     STREAMING = auto()
     VSCODE = auto()  # Structured streaming events for VSCode extension
+    EVENTS = auto()  # Versioned JSONL event stream (documented in docs/cli-events.md)
 
 
 class StreamEventType(StrEnum):
@@ -361,6 +365,9 @@ class StreamEventType(StrEnum):
     THINKING_STARTED = "thinking.started"
     THINKING_UPDATED = "thinking.updated"
     THINKING_COMPLETED = "thinking.completed"
+    SESSION_STARTED = "session.started"
+    MESSAGE_DELTA = "message.delta"
+    SESSION_COMPACTED = "session.compacted"
 
 
 class StreamEvent(BaseModel):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vibe.core.context.compactor import CompactionResult
 from vibe.core.types import LLMMessage, LLMUsage
@@ -31,6 +31,12 @@ class SessionRecorder:
 
     def on_model_change(self, alias: str, provider: str) -> None:
         self._logger.append_model_change(alias, provider)
+
+    def on_custom(self, key: str, value: dict[str, Any]) -> None:
+        self._logger.append_custom(key, value)
+
+    def on_thinking_level_change(self, level: str | None) -> None:
+        self._logger.append_thinking_level(level)
 
     def on_compaction(
         self, result: CompactionResult, first_kept_id: str | None = None

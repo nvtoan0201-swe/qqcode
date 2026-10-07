@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum, auto
+import fnmatch
 import logging
 import os
 from pathlib import Path
@@ -616,6 +617,23 @@ class ToolRuntimeConfig(BaseModel):
 
 class VibeConfig(BaseSettings):
     active_model: str = "devstral-2"
+    enabled_models: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Glob patterns restricting which model aliases are selectable "
+            "(e.g. ['claude-*', 'zai/*']). Empty means every model is in scope."
+        ),
+    )
+    system_prompt_override: str | None = Field(
+        default=None,
+        exclude=True,
+        description="Replace the preamble system prompt (CLI --system-prompt).",
+    )
+    append_system_prompt: list[str] = Field(
+        default_factory=list,
+        exclude=True,
+        description="Extra text appended to the system prompt (CLI --append-system-prompt).",
+    )
     vim_keybindings: bool = False
     disable_welcome_banner_animation: bool = False
     displayed_workdir: str = ""
@@ -700,6 +718,27 @@ class VibeConfig(BaseSettings):
         raise ValueError(
             f"Active model '{self.active_model}' not found in configuration."
         )
+
+    def get_model_by_alias(self, alias: str) -> ModelConfig:
+        """Return the model with ``alias``.
+
+        Raises:
+            ValueError: If no configured model matches ``alias``.
+        """
+        for model in self.models:
+            if model.alias == alias:
+                return model
+        raise ValueError(f"Model '{alias}' not found in configuration.")
+
+    def is_model_in_scope(self, alias: str) -> bool:
+        """Whether ``alias`` is selectable under ``enabled_models``."""
+        if not self.enabled_models:
+            return True
+        return any(fnmatch.fnmatch(alias, pattern) for pattern in self.enabled_models)
+
+    def models_in_scope(self) -> list[ModelConfig]:
+        """Configured models selectable under ``enabled_models``."""
+        return [model for model in self.models if self.is_model_in_scope(model.alias)]
 
     def get_context_limit_for_active_model(self) -> int:
         """Return the context limit for the active model.
@@ -948,7 +987,8 @@ class VibeConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _check_system_prompt(self) -> VibeConfig:
-        _ = self.system_prompt
+        if self.system_prompt_override is None:
+            _ = self.system_prompt
         return self
 
     @classmethod
@@ -969,7 +1009,7 @@ class VibeConfig(BaseSettings):
                     and isinstance(target.get(key), list)
                     and isinstance(value, list)
                 ):
-                    if key in {"providers", "models"}:
+                    if key in {"providers", "models", "enabled_models"}:
                         target[key] = value
                     else:
                         target[key] = list(set(value + target[key]))

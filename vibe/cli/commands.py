@@ -22,7 +22,11 @@ class Command:
 
 
 class CommandRegistry:
-    def __init__(self, excluded_commands: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        excluded_commands: list[str] | None = None,
+        dynamic_commands: list[Command] | None = None,
+    ) -> None:
         if excluded_commands is None:
             excluded_commands = []
         self.commands = {
@@ -37,9 +41,64 @@ class CommandRegistry:
                 handler="_show_status",
             ),
             "config": Command(
-                aliases=frozenset(["/config", "/cfg", "/theme", "/model"]),
+                aliases=frozenset(["/config", "/cfg", "/theme"]),
                 description="Edit config settings",
                 handler="_show_config",
+            ),
+            "model": Command(
+                aliases=frozenset(["/model"]),
+                description="Switch model or open the model selector (Ctrl+P cycles)",
+                handler="_show_model_selector",
+            ),
+            "scoped_models": Command(
+                aliases=frozenset(["/scoped-models", "/models"]),
+                description="Choose which models are selectable in this scope",
+                handler="_show_scoped_models",
+            ),
+            "thinking": Command(
+                aliases=frozenset(["/thinking"]),
+                description="Set thinking level, or show the current one (Ctrl+Y cycles)",
+                handler="_set_thinking",
+            ),
+            "new": Command(
+                aliases=frozenset(["/new"]),
+                description="Start a new session, keeping the current config",
+                handler="_new_session",
+            ),
+            "resume": Command(
+                aliases=frozenset(["/resume"]),
+                description="Resume a session: pick one, or pass an id",
+                handler="_resume_session",
+            ),
+            "name": Command(
+                aliases=frozenset(["/name"]),
+                description="Set or show the session name",
+                handler="_set_session_name",
+            ),
+            "session": Command(
+                aliases=frozenset(["/session"]),
+                description="Show current session info (id, model, context, cost)",
+                handler="_show_session_info",
+            ),
+            "export": Command(
+                aliases=frozenset(["/export"]),
+                description="Export the session as markdown, .jsonl or .html",
+                handler="_export_session",
+            ),
+            "import": Command(
+                aliases=frozenset(["/import"]),
+                description="Replace the current session with a .jsonl/.json file",
+                handler="_import_session",
+            ),
+            "fork": Command(
+                aliases=frozenset(["/fork"]),
+                description="Fork the session from a recent user message",
+                handler="_fork_session",
+            ),
+            "copy": Command(
+                aliases=frozenset(["/copy"]),
+                description="Copy the last assistant message to the clipboard",
+                handler="_copy_last_message",
             ),
             "reload": Command(
                 aliases=frozenset(["/reload", "/r"]),
@@ -81,6 +140,16 @@ class CommandRegistry:
 
         for command in excluded_commands:
             self.commands.pop(command, None)
+
+        for index, command in enumerate(dynamic_commands or []):
+            match command:
+                case Command(template=template) if template:
+                    key = f"template:{template}"
+                case Command(skill=skill) if skill:
+                    key = f"skill:{skill}"
+                case _:
+                    key = f"dynamic:{index}"
+            self.register_command(key, command)
 
         self._alias_map = {}
         for cmd_name, cmd in self.commands.items():
@@ -136,6 +205,14 @@ class CommandRegistry:
         cmd_name = self._alias_map.get(user_input.lower().strip())
         return self.commands.get(cmd_name) if cmd_name else None
 
+    def command_entries(self) -> list[tuple[str, str]]:
+        """(alias, description) pairs for autocompletion, sorted by alias."""
+        return [
+            (alias, command.description)
+            for command in self.commands.values()
+            for alias in sorted(command.aliases)
+        ]
+
     def get_help_text(self) -> str:
         lines: list[str] = [
             "### Keyboard Shortcuts",
@@ -146,6 +223,9 @@ class CommandRegistry:
             "- `Ctrl+C` Quit (or clear input if text present)",
             "- `Ctrl+O` Toggle tool output view",
             "- `Ctrl+T` Toggle todo view",
+            "- `Ctrl+P` Cycle to the next model in scope",
+            "- `Shift+Ctrl+P` Cycle to the previous model in scope",
+            "- `Ctrl+Y` Cycle the thinking level",
             "- `Shift+Tab` Toggle auto-approve mode",
             "",
             "### Special Features",

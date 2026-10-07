@@ -10,7 +10,7 @@ from typing import Any
 from rich import print as rprint
 from rich.table import Table
 
-from vibe.cli.textual_ui.app import run_textual_ui
+from vibe.cli.textual_ui.app import UISessionOptions, run_textual_ui
 from vibe.core.config import (
     CONFIG_FILE,
     HISTORY_FILE,
@@ -18,6 +18,7 @@ from vibe.core.config import (
     MissingAPIKeyError,
     MissingPromptFileError,
     ModelConfig,
+    ThinkingLevel,
     VibeConfig,
     load_api_keys_from_env,
 )
@@ -84,23 +85,77 @@ def parse_arguments() -> argparse.Namespace:
         "Session will be interrupted if cost exceeds this limit.",
     )
     parser.add_argument(
+        "--tools",
         "--enabled-tools",
+        dest="tools",
         action="append",
         metavar="TOOL",
-        help="Enable specific tools. In programmatic mode (-p), this disables "
-        "all other tools. "
-        "Can use exact names, glob patterns (e.g., 'bash*'), or "
+        help="Enable specific tools (alias: --enabled-tools). In programmatic "
+        "mode (-p), this disables all other tools. Supports '+name' to include, "
+        "'-name' to exclude, exact names, glob patterns (e.g., 'bash*'), or "
         "regex with 're:' prefix. Can be specified multiple times.",
+    )
+    parser.add_argument(
+        "--exclude-tools",
+        action="append",
+        metavar="TOOL",
+        help="Disable specific tools (supports '+name'/'-name' and glob patterns). "
+        "Ignored when --tools selects an explicit allowlist. Can be specified "
+        "multiple times.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        metavar="TEXT|FILE",
+        help="Replace the system prompt. The value is read from a file when it "
+        "points to an existing path, otherwise used as literal text.",
+    )
+    parser.add_argument(
+        "--append-system-prompt",
+        action="append",
+        metavar="TEXT|FILE",
+        help="Append text to the system prompt (repeatable; file paths are read).",
+    )
+    parser.add_argument(
+        "--no-context-files",
+        action="store_true",
+        default=False,
+        help="Do not load context files (AGENTS.md, QQCODE.md) into the prompt.",
+    )
+    parser.add_argument(
+        "--session-dir", metavar="DIR", help="Override the session storage directory."
+    )
+    parser.add_argument(
+        "--name", metavar="NAME", help="Give the session a human readable name."
+    )
+    parser.add_argument(
+        "--no-session",
+        action="store_true",
+        default=False,
+        help="Disable session logging for this run.",
+    )
+    parser.add_argument(
+        "--fork",
+        nargs="?",
+        const="",
+        metavar="SESSION_ID",
+        help="Fork the latest session (or SESSION_ID) and open the copy.",
+    )
+    parser.add_argument(
+        "--prompt-template",
+        action="append",
+        metavar="DIR",
+        help="Additional prompt template directory (repeatable).",
     )
     parser.add_argument(
         "--output",
         type=str,
-        choices=["text", "json", "streaming", "vscode"],
+        choices=["text", "json", "streaming", "vscode", "events"],
         default="text",
         help="Output format for programmatic mode (-p): 'text' "
         "for human-readable (default), 'json' for all messages at end, "
         "'streaming' for newline-delimited JSON per message, "
-        "'vscode' for structured streaming events (VSCode extension).",
+        "'vscode' for structured streaming events (VSCode extension), "
+        "'events' for the versioned JSONL event stream (see docs/cli-events.md).",
     )
     parser.add_argument(
         "--agent",
@@ -172,6 +227,104 @@ def get_prompt_from_stdin() -> str | None:
         return None
 
     return None
+
+
+def _resolve_prompt_value(value: str) -> str:
+    """Read prompt text from an existing file path, else use the literal value."""
+    path = Path(value).expanduser()
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    return value
+
+
+def _parse_tool_flags(values: list[str], *, bare: str) -> tuple[list[str], list[str]]:
+    """Split ``+name``/``-name`` tool flags into (enabled, disabled) patterns.
+
+    Bare values go to the bucket named by ``bare`` (``"enabled"`` or
+    ``"disabled"``).
+    """
+    enabled: list[str] = []
+    disabled: list[str] = []
+    for raw in values:
+        value = raw.strip()
+        if not value:
+            continue
+        match value[:1]:
+            case "+" if len(value) > 1:
+                enabled.append(value[1:])
+            case "-" if len(value) > 1:
+                disabled.append(value[1:])
+            case _:
+                target = enabled if bare == "enabled" else disabled
+                target.append(value)
+    return enabled, disabled
+
+
+def apply_runtime_flags(config: VibeConfig, args: argparse.Namespace) -> list[Path]:
+    """Apply runtime CLI flags to ``config``.
+
+    Returns the prompt template directories requested on the command line.
+    """
+    if args.system_prompt:
+        config.system_prompt_override = _resolve_prompt_value(args.system_prompt)
+    if args.append_system_prompt:
+        config.append_system_prompt = [
+            _resolve_prompt_value(value) for value in args.append_system_prompt
+        ]
+    if args.no_context_files:
+        config.include_context_files = False
+    if args.session_dir:
+        session_dir = str(Path(args.session_dir).expanduser().resolve())
+        config.session_logging.sessions_dir = session_dir
+        config.session_logging.save_dir = session_dir
+    if args.no_session:
+        config.session_logging.enabled = False
+
+    enabled, disabled = _parse_tool_flags(args.tools or [], bare="enabled")
+    extra_enabled, extra_disabled = _parse_tool_flags(
+        args.exclude_tools or [], bare="disabled"
+    )
+    enabled.extend(extra_enabled)
+    disabled.extend(extra_disabled)
+    if enabled:
+        config.enabled_tools = enabled
+    if disabled:
+        config.disabled_tools = disabled
+
+    return [Path(directory).expanduser() for directory in args.prompt_template or []]
+
+
+def _restore_session_preferences(
+    config: VibeConfig, metadata: dict[str, Any]
+) -> tuple[ThinkingLevel | None, str | None]:
+    """Restore model, thinking level and name persisted in a session."""
+    custom = metadata.get("custom")
+    if not isinstance(custom, dict):
+        custom = {}
+
+    model_value = custom.get("model")
+    if isinstance(model_value, dict) and isinstance(model_value.get("alias"), str):
+        alias = model_value["alias"]
+        if any(model.alias == alias for model in config.models):
+            config.active_model = alias
+
+    raw_level: str | None = None
+    level_value = custom.get("thinking_level")
+    if isinstance(level_value, dict) and isinstance(level_value.get("level"), str):
+        raw_level = level_value["level"]
+    elif isinstance(metadata.get("thinking_level"), str):
+        raw_level = metadata["thinking_level"]
+
+    level: ThinkingLevel | None = None
+    if raw_level is not None:
+        try:
+            level = ThinkingLevel(raw_level)
+        except ValueError:
+            level = None
+
+    name_value = custom.get("name")
+    name = name_value.get("name") if isinstance(name_value, dict) else None
+    return level, name if isinstance(name, str) else None
 
 
 def load_config_or_exit(agent: str | None = None) -> VibeConfig:
@@ -399,9 +552,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 rprint(f"[yellow]Could not create history file: {e}[/]")
 
         config = load_config_or_exit(args.agent)
-
-        if args.enabled_tools:
-            config.enabled_tools = args.enabled_tools
+        prompt_template_dirs = apply_runtime_flags(config, args)
 
         # Handle model override from environment variable
         if "QQCODE_MODEL_OVERRIDE" in os.environ:
@@ -504,6 +655,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         session_info = None
         full_session_id = None
         additional_directory_contexts = None
+        initial_thinking_level: ThinkingLevel | None = None
+        resumed_name: str | None = None
 
         if args.continue_session or args.resume:
             if not config.session_logging.enabled:
@@ -560,9 +713,57 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                     session_id=session_id_display,
                     session_time=session_time,
                 )
+                initial_thinking_level, resumed_name = _restore_session_preferences(
+                    config, metadata
+                )
             except Exception as e:
                 rprint(f"[red]Failed to load session: {e}[/]")
                 sys.exit(1)
+
+        if args.fork is not None:
+            if not config.session_logging.enabled:
+                rprint(
+                    "[red]Session logging is disabled. "
+                    "Enable it in config to use --fork[/]"
+                )
+                sys.exit(1)
+
+            store = JsonlSessionStore(config.session_logging)
+            fork_source = (
+                InteractionLogger.find_session_by_id(args.fork, config.session_logging)
+                if args.fork
+                else InteractionLogger.find_latest_session(config.session_logging)
+            )
+            if fork_source is None:
+                rprint("[red]No session found to fork[/]")
+                sys.exit(1)
+            if fork_source.suffix != ".jsonl":
+                rprint("[red]Only .jsonl sessions can be forked[/]")
+                sys.exit(1)
+
+            try:
+                view = store.read(fork_source)
+                if not view.entries:
+                    rprint("[red]Cannot fork an empty session[/]")
+                    sys.exit(1)
+                forked_path = store.fork(
+                    fork_source, view.entries[-1].id, workdir=config.effective_workdir
+                )
+                loaded_messages, metadata = InteractionLogger.load_session(forked_path)
+            except Exception as e:
+                rprint(f"[red]Failed to fork session: {e}[/]")
+                sys.exit(1)
+
+            forked_id = str(metadata.get("session_id", "unknown"))
+            session_info = ResumeSessionInfo(
+                type="resume",
+                session_id=forked_id[:8],
+                session_time=str(metadata.get("start_time", "unknown time")),
+            )
+            full_session_id = metadata.get("session_id")
+            initial_thinking_level, resumed_name = _restore_session_preferences(
+                config, metadata
+            )
 
         # Only try to read from stdin if --prompt flag is used but empty,
         # or for interactive mode. Don't block on stdin.read() when prompt is provided.
@@ -597,6 +798,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                     previous_messages=loaded_messages,
                     mode=execution_mode,
                     session_id=full_session_id,
+                    session_name=args.name,
                 )
                 if final_response:
                     print(final_response)
@@ -618,6 +820,11 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 loaded_messages=loaded_messages,
                 session_info=session_info,
                 additional_directory_contexts=additional_directory_contexts,
+                prompt_template_dirs=prompt_template_dirs,
+                resume=UISessionOptions(
+                    name=args.name or resumed_name,
+                    thinking_level=initial_thinking_level,
+                ),
             )
 
     except (KeyboardInterrupt, EOFError):

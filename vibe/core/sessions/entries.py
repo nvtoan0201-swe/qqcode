@@ -87,6 +87,11 @@ class ModelChangeEntry(SessionEntryBase):
     provider: str
 
 
+class ThinkingLevelChangeEntry(SessionEntryBase):
+    type: Literal["thinking_level_change"] = "thinking_level_change"
+    level: str | None = None
+
+
 class UsageEntry(SessionEntryBase):
     type: Literal["usage"] = "usage"
     prompt_tokens: int
@@ -107,6 +112,7 @@ SessionEntry = Annotated[
     | MessageEntry
     | CompactionEntry
     | ModelChangeEntry
+    | ThinkingLevelChangeEntry
     | UsageEntry
     | CustomEntry,
     Field(discriminator="type"),

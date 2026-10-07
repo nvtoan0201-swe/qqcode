@@ -12,10 +12,12 @@ import aiofiles
 from vibe.core.llm.format import get_active_tool_classes
 from vibe.core.sessions.entries import (
     CompactionEntry,
+    CustomEntry,
     MessageEntry,
     ModelChangeEntry,
     SessionEntry,
     SessionHeader,
+    ThinkingLevelChangeEntry,
     UsageEntry,
     new_entry_id,
     now_iso,
@@ -216,6 +218,31 @@ class InteractionLogger:
             timestamp=now_iso(),
             model_alias=alias,
             provider=provider,
+        )
+        return self._append_entry(entry)
+
+    def append_thinking_level(self, level: str | None) -> str | None:
+        if self._write_format != "jsonl":
+            return None
+        self._ensure_session_file()
+        entry = ThinkingLevelChangeEntry(
+            id=new_entry_id(),
+            parent_id=self._last_entry_id,
+            timestamp=now_iso(),
+            level=level,
+        )
+        return self._append_entry(entry)
+
+    def append_custom(self, key: str, value: dict[str, Any]) -> str | None:
+        if self._write_format != "jsonl":
+            return None
+        self._ensure_session_file()
+        entry = CustomEntry(
+            id=new_entry_id(),
+            parent_id=self._last_entry_id,
+            timestamp=now_iso(),
+            key=key,
+            value=value,
         )
         return self._append_entry(entry)
 
@@ -580,6 +607,20 @@ class InteractionLogger:
             store = JsonlSessionStore(root=filepath.parent)
             view = store.read(filepath)
             messages = view.messages()
+            custom: dict[str, Any] = {
+                entry.key: entry.value
+                for entry in view.entries
+                if isinstance(entry, CustomEntry)
+            }
+            last_model = view.last_model()
+            last_thinking = next(
+                (
+                    entry.level
+                    for entry in reversed(view.entries)
+                    if isinstance(entry, ThinkingLevelChangeEntry)
+                ),
+                None,
+            )
             metadata: dict[str, Any] = {
                 "session_id": view.header.id,
                 "start_time": view.header.timestamp,
@@ -595,6 +636,9 @@ class InteractionLogger:
                 "total_messages": len(messages),
                 "stats": view.stats().model_dump(mode="json"),
                 "truncated_at": view.truncated_at,
+                "custom": custom,
+                "model": last_model.model_alias if last_model else None,
+                "thinking_level": last_thinking,
             }
             return messages, metadata
 
