@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 
 from rich import print as rprint
@@ -19,13 +20,18 @@ from vibe.core.config import (
 )
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.programmatic import run_programmatic
+from vibe.core.sessions.migrate import migrate_directory
+from vibe.core.sessions.store import JsonlSessionStore
 from vibe.core.types import OutputFormat, ResumeSessionInfo
 from vibe.core.utils import ConversationLimitException
 from vibe.setup.onboarding import run_onboarding
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the QQcode interactive CLI")
+    parser = argparse.ArgumentParser(
+        description="Run the QQcode interactive CLI",
+        epilog="Use 'qqcode sessions [list|repair|migrate]' to manage saved sessions.",
+    )
     parser.add_argument(
         "initial_prompt",
         nargs="?",
@@ -175,8 +181,102 @@ def load_config_or_exit(agent: str | None = None) -> VibeConfig:
         sys.exit(1)
 
 
+def _build_sessions_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="qqcode sessions", description="Manage saved QQcode sessions"
+    )
+    subparsers = parser.add_subparsers(dest="sessions_command", required=True)
+    subparsers.add_parser("list", help="List recent sessions (outputs JSON)")
+    repair = subparsers.add_parser(
+        "repair", help="Truncate a damaged session file at its last valid line"
+    )
+    repair.add_argument("session_id", metavar="SESSION_ID")
+    migrate = subparsers.add_parser(
+        "migrate", help="Convert legacy .json sessions to .jsonl"
+    )
+    migrate.add_argument(
+        "--dir",
+        dest="directory",
+        metavar="DIR",
+        default=None,
+        help="Directory containing legacy .json sessions (defaults to save_dir)",
+    )
+    return parser
+
+
+def run_sessions_command(argv: list[str]) -> int:
+    args = _build_sessions_parser().parse_args(argv)
+    config = load_config_or_exit()
+    session_config = config.session_logging
+    store = JsonlSessionStore(session_config)
+
+    match args.sessions_command:
+        case "list":
+            sessions = InteractionLogger.list_sessions(session_config, limit=50)
+            print(
+                json.dumps([
+                    {
+                        "session_id": summary.get("session_id", ""),
+                        "end_time": summary.get("end_time", ""),
+                        "last_user_message": summary.get("last_user_message", ""),
+                    }
+                    for _, summary in sessions
+                ])
+            )
+            return 0
+        case "repair":
+            path = InteractionLogger.find_session_by_id(args.session_id, session_config)
+            if path is None:
+                print(
+                    json.dumps({"error": f"Session '{args.session_id}' not found"}),
+                    file=sys.stderr,
+                )
+                return 1
+            if path.suffix != ".jsonl":
+                print(
+                    json.dumps({"error": "Only .jsonl sessions can be repaired"}),
+                    file=sys.stderr,
+                )
+                return 1
+            result = store.repair(path)
+            print(
+                json.dumps({
+                    "path": str(result.path),
+                    "kept_entries": result.kept_entries,
+                    "removed_bytes": result.removed_bytes,
+                    "backup_path": (
+                        str(result.backup_path) if result.backup_path else None
+                    ),
+                })
+            )
+            return 0
+        case "migrate":
+            directory = (
+                Path(args.directory)
+                if args.directory
+                else Path(session_config.save_dir)
+            )
+            results = migrate_directory(directory, store)
+            print(
+                json.dumps([
+                    {
+                        "source": str(result.source),
+                        "target": str(result.target) if result.target else None,
+                        "backup": str(result.backup) if result.backup else None,
+                        "error": result.error,
+                    }
+                    for result in results
+                ])
+            )
+            return 0
+
+    return 1
+
+
 def main() -> None:  # noqa: PLR0912, PLR0915
     load_api_keys_from_env()
+    if sys.argv[1:2] == ["sessions"]:
+        sys.exit(run_sessions_command(sys.argv[2:]))
     args = parse_arguments()
 
     if args.setup:
@@ -220,9 +320,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             config.enabled_tools = args.enabled_tools
 
         # Handle model override from environment variable
-        if 'QQCODE_MODEL_OVERRIDE' in os.environ:
+        if "QQCODE_MODEL_OVERRIDE" in os.environ:
             # Validate model exists
-            override_model = os.environ['QQCODE_MODEL_OVERRIDE']
+            override_model = os.environ["QQCODE_MODEL_OVERRIDE"]
             model_exists = any(model.alias == override_model for model in config.models)
             if not model_exists:
                 rprint(f"[red]Model '{override_model}' not found in configuration[/]")
@@ -243,7 +343,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 {
                     "session_id": summary.get("session_id", ""),
                     "end_time": summary.get("end_time", ""),
-                    "last_user_message": summary.get("last_user_message", "")
+                    "last_user_message": summary.get("last_user_message", ""),
                 }
                 for _, summary in sessions
             ]
@@ -257,7 +357,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 print(json.dumps(error_msg), file=sys.stderr)
                 sys.exit(1)
 
-            session_path = InteractionLogger.find_session_by_id(args.get_session, config.session_logging)
+            session_path = InteractionLogger.find_session_by_id(
+                args.get_session, config.session_logging
+            )
             if not session_path:
                 error_msg = {"error": f"Session '{args.get_session}' not found"}
                 print(json.dumps(error_msg), file=sys.stderr)
@@ -267,7 +369,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 messages, metadata = InteractionLogger.load_session(session_path)
                 result = {
                     "metadata": metadata,
-                    "messages": [msg.model_dump(mode="json") for msg in messages]
+                    "messages": [msg.model_dump(mode="json") for msg in messages],
                 }
                 print(json.dumps(result))
                 sys.exit(0)
@@ -288,19 +390,17 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                         "context_limit": model.context_limit,
                         "input_price": model.input_price,
                         "output_price": model.output_price,
-                        "extra_body": model.extra_body
+                        "extra_body": model.extra_body,
                     }
                     for model in config.models
-                ]
+                ],
             }
             print(json.dumps(result))
             sys.exit(0)
 
         # Handle --get-model flag
         if args.get_model:
-            result = {
-                "current_model": config.active_model
-            }
+            result = {"current_model": config.active_model}
             print(json.dumps(result))
             sys.exit(0)
 
@@ -314,12 +414,12 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 sys.exit(1)
 
             # Set environment variable for temporary override
-            os.environ['QQCODE_MODEL_OVERRIDE'] = args.model
+            os.environ["QQCODE_MODEL_OVERRIDE"] = args.model
 
         # Handle model override from environment variable (set by --model flag or passed directly)
-        if 'QQCODE_MODEL_OVERRIDE' in os.environ:
+        if "QQCODE_MODEL_OVERRIDE" in os.environ:
             # Validate model exists
-            override_model = os.environ['QQCODE_MODEL_OVERRIDE']
+            override_model = os.environ["QQCODE_MODEL_OVERRIDE"]
             model_exists = any(model.alias == override_model for model in config.models)
             if not model_exists:
                 rprint(f"[red]Model '{override_model}' not found in configuration[/]")

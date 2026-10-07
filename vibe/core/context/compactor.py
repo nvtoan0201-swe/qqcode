@@ -146,8 +146,18 @@ class Compactor:
         conversation: list[LLMMessage],
         summary: str,
         cut_index: int,
-    ) -> None:
+        *,
+        cut: CutResult,
+        tokens_before: int,
+        usage: LLMUsage | None,
+        is_update: bool,
+    ) -> CompactionResult:
         agent = self._agent
+        first_kept_id = (
+            agent._recorder.entry_id_for(conversation[cut_index])
+            if cut_index < len(conversation)
+            else None
+        )
         summary_message = LLMMessage(
             role=Role.user, content=f"<{SUMMARY_TAG}>\n{summary}\n</{SUMMARY_TAG}>"
         )
@@ -155,16 +165,18 @@ class Compactor:
         agent._last_usage = None
         agent.stats.last_usage_message_index = -1
         agent._refresh_context_stats()
-
-        agent._reset_session()
-        await agent.interaction_logger.save_interaction(
-            agent.messages,
-            agent.stats,
-            agent.config,
-            agent.tool_manager,
-            agent._additional_directory_contexts,
-        )
         agent.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
+
+        result = CompactionResult(
+            summary=summary,
+            cut=CutResult(first_kept_index=cut_index, is_split_turn=cut.is_split_turn),
+            tokens_before=tokens_before,
+            tokens_after_estimate=agent.stats.context_tokens,
+            usage=usage,
+            is_update=is_update,
+        )
+        agent._recorder.on_compaction(result, first_kept_id)
+        return result
 
     async def compact(
         self, *, instructions: str | None = None, force: bool = False
@@ -177,13 +189,7 @@ class Compactor:
             return self._skipped_result(tokens_before)
 
         agent._clean_message_history()
-        await agent.interaction_logger.save_interaction(
-            agent.messages,
-            agent.stats,
-            config,
-            agent.tool_manager,
-            agent._additional_directory_contexts,
-        )
+        await agent._recorder.flush()
 
         system_message = agent.messages[0]
         conversation = agent.messages[1:]
@@ -222,14 +228,16 @@ class Compactor:
         if cut_index == len(conversation):
             summary = self._with_last_user_message(summary, conversation)
 
-        await self._install_summary(system_message, conversation, summary, cut_index)
-        self._previous_summary = summary
-
-        return CompactionResult(
-            summary=summary,
-            cut=CutResult(first_kept_index=cut_index, is_split_turn=cut.is_split_turn),
+        result = await self._install_summary(
+            system_message,
+            conversation,
+            summary,
+            cut_index,
+            cut=cut,
             tokens_before=tokens_before,
-            tokens_after_estimate=agent.stats.context_tokens,
             usage=summary_result.usage,
             is_update=use_update,
         )
+        self._previous_summary = summary
+        await agent._recorder.flush()
+        return result

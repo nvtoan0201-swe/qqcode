@@ -134,6 +134,9 @@ class SessionLoggingConfig(BaseSettings):
     save_dir: str = ""
     session_prefix: str = "session"
     enabled: bool = True
+    format: Literal["jsonl", "json"] = "jsonl"
+    fsync: bool = True
+    sessions_dir: str = ""
 
     @field_validator("save_dir", mode="before")
     @classmethod
@@ -145,6 +148,18 @@ class SessionLoggingConfig(BaseSettings):
     @field_validator("save_dir", mode="after")
     @classmethod
     def expand_save_dir(cls, v: str) -> str:
+        return str(Path(v).expanduser().resolve())
+
+    @field_validator("sessions_dir", mode="before")
+    @classmethod
+    def set_default_sessions_dir(cls, v: str) -> str:
+        if not v:
+            return str(get_vibe_home() / "sessions")
+        return v
+
+    @field_validator("sessions_dir", mode="after")
+    @classmethod
+    def expand_sessions_dir(cls, v: str) -> str:
         return str(Path(v).expanduser().resolve())
 
 

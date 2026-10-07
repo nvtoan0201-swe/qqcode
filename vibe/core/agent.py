@@ -28,6 +28,7 @@ from vibe.core.middleware import (
     PriceLimitMiddleware,
     TurnLimitMiddleware,
 )
+from vibe.core.sessions.recorder import SessionRecorder
 from vibe.core.skills.manager import SkillManager
 from vibe.core.system_prompt import get_universal_system_prompt
 from vibe.core.tools.base import (
@@ -204,6 +205,7 @@ class Agent:
             config.effective_workdir,
             existing_filepath=existing_filepath,
         )
+        self._recorder = SessionRecorder(self.interaction_logger, agent=self)
 
         self._last_chunk: LLMChunk | None = None
 
@@ -239,7 +241,11 @@ class Agent:
         return BACKEND_FACTORY[provider.backend](provider=provider, timeout=timeout)
 
     def add_message(self, message: LLMMessage) -> None:
+        self._append_message(message)
+
+    def _append_message(self, message: LLMMessage) -> None:
         self.messages.append(message)
+        self._recorder.on_message_added(message)
 
     def _flush_new_messages(self) -> None:
         if not self.message_observer:
@@ -290,13 +296,7 @@ class Agent:
                     tokens_per_second=0,
                     stopped_by_middleware=True,
                 )
-                await self.interaction_logger.save_interaction(
-                    self.messages,
-                    self.stats,
-                    self.config,
-                    self.tool_manager,
-                    self._additional_directory_contexts,
-                )
+                await self._recorder.flush()
 
             case MiddlewareAction.INJECT_MESSAGE:
                 if result.message and len(self.messages) > 0:
@@ -366,7 +366,7 @@ class Agent:
             ) from compact_exc
 
     async def _conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
-        self.messages.append(LLMMessage(role=Role.user, content=user_msg))
+        self._append_message(LLMMessage(role=Role.user, content=user_msg))
         self.stats.steps += 1
         self._overflow_recovered = False
         self.middleware_pipeline.reset()
@@ -402,19 +402,11 @@ class Agent:
                 )
 
                 self._flush_new_messages()
-                await self.interaction_logger.save_interaction(
-                    self.messages,
-                    self.stats,
-                    self.config,
-                    self.tool_manager,
-                    self._additional_directory_contexts,
-                )
+                await self._recorder.flush()
 
                 if user_cancelled:
                     self._flush_new_messages()
-                    await self.interaction_logger.save_interaction(
-                        self.messages, self.stats, self.config, self.tool_manager
-                    )
+                    await self._recorder.flush()
                     yield self._context_usage_event()
                     return
 
@@ -431,13 +423,7 @@ class Agent:
                     return
 
                 self._flush_new_messages()
-                await self.interaction_logger.save_interaction(
-                    self.messages,
-                    self.stats,
-                    self.config,
-                    self.tool_manager,
-                    self._additional_directory_contexts,
-                )
+                await self._recorder.flush()
 
             except Exception as exc:
                 if is_context_overflow(exc) and not self._overflow_recovered:
@@ -447,13 +433,7 @@ class Agent:
                     continue
 
                 self._flush_new_messages()
-                await self.interaction_logger.save_interaction(
-                    self.messages,
-                    self.stats,
-                    self.config,
-                    self.tool_manager,
-                    self._additional_directory_contexts,
-                )
+                await self._recorder.flush()
                 raise
 
         self._flush_new_messages()
@@ -582,7 +562,7 @@ class Agent:
             thinking_signature=full_thinking_signature or None,
             tool_calls=full_tool_calls,
         )
-        self.messages.append(last_message)
+        self._append_message(last_message)
         finish_reason = next(
             (c.finish_reason for c in chunks if c.finish_reason is not None), None
         )
@@ -596,6 +576,15 @@ class Agent:
         )
         self.stats.last_usage_message_index = len(self.messages) - 1
         self._refresh_context_stats()
+        if usage is not None:
+            self._record_usage(usage)
+
+    def _record_usage(self, usage: LLMUsage) -> None:
+        cost = (
+            usage.prompt_tokens * self.stats.input_price_per_million
+            + usage.completion_tokens * self.stats.output_price_per_million
+        ) / 1_000_000
+        self._recorder.on_usage(usage, cost)
 
     async def _get_assistant_event(self) -> AssistantEvent:
         llm_result = await self._chat()
@@ -605,7 +594,7 @@ class Agent:
             )
         self._last_chunk = llm_result
         assistant_msg = llm_result.message
-        self.messages.append(assistant_msg)
+        self._append_message(assistant_msg)
         self._finalize_assistant_stats(
             assistant_msg, llm_result.usage, llm_result.finish_reason
         )
@@ -632,7 +621,7 @@ class Agent:
             )
 
             self.stats.tool_calls_failed += 1
-            self.messages.append(
+            self._append_message(
                 self.format_handler.create_failed_tool_response_message(
                     failed, error_msg
                 )
@@ -658,7 +647,7 @@ class Agent:
                     error=error_msg,
                     tool_call_id=tool_call_id,
                 )
-                self.messages.append(
+                self._append_message(
                     LLMMessage.model_validate(
                         self.format_handler.create_tool_response_message(
                             tool_call, error_msg
@@ -687,7 +676,7 @@ class Agent:
                     tool_call_id=tool_call_id,
                 )
 
-                self.messages.append(
+                self._append_message(
                     LLMMessage.model_validate(
                         self.format_handler.create_tool_response_message(
                             tool_call, skip_reason
@@ -732,7 +721,7 @@ class Agent:
                     f"{k}: {v}" for k, v in result_model.model_dump().items()
                 )
 
-                self.messages.append(
+                self._append_message(
                     LLMMessage.model_validate(
                         self.format_handler.create_tool_response_message(
                             tool_call, text
@@ -782,20 +771,14 @@ class Agent:
                     error=cancel,
                     tool_call_id=tool_call_id,
                 )
-                self.messages.append(
+                self._append_message(
                     LLMMessage.model_validate(
                         self.format_handler.create_tool_response_message(
                             tool_call, cancel
                         )
                     )
                 )
-                await self.interaction_logger.save_interaction(
-                    self.messages,
-                    self.stats,
-                    self.config,
-                    self.tool_manager,
-                    self._additional_directory_contexts,
-                )
+                await self._recorder.flush()
                 raise
 
             except KeyboardInterrupt:
@@ -808,20 +791,14 @@ class Agent:
                     error=cancel,
                     tool_call_id=tool_call_id,
                 )
-                self.messages.append(
+                self._append_message(
                     LLMMessage.model_validate(
                         self.format_handler.create_tool_response_message(
                             tool_call, cancel
                         )
                     )
                 )
-                await self.interaction_logger.save_interaction(
-                    self.messages,
-                    self.stats,
-                    self.config,
-                    self.tool_manager,
-                    self._additional_directory_contexts,
-                )
+                await self._recorder.flush()
                 raise
 
             except (ToolError, ToolPermissionError) as exc:
@@ -839,7 +816,7 @@ class Agent:
                     self.stats.tool_calls_rejected += 1
                 else:
                     self.stats.tool_calls_failed += 1
-                self.messages.append(
+                self._append_message(
                     LLMMessage.model_validate(
                         self.format_handler.create_tool_response_message(
                             tool_call, error_msg
@@ -1132,6 +1109,7 @@ class Agent:
                             )
 
                             self.messages.insert(insertion_point, empty_response)
+                            self._recorder.on_message_added(empty_response)
                             insertion_point += 1
 
                     i = i + 1 + expected_responses
@@ -1147,7 +1125,7 @@ class Agent:
         last_msg = self.messages[-1]
         if last_msg.role is Role.tool:
             empty_assistant_msg = LLMMessage(role=Role.assistant, content="Understood.")
-            self.messages.append(empty_assistant_msg)
+            self._append_message(empty_assistant_msg)
 
     def _reset_session(self) -> None:
         self.session_id = str(uuid4())
@@ -1157,13 +1135,7 @@ class Agent:
         self.approval_callback = callback
 
     async def clear_history(self) -> None:
-        await self.interaction_logger.save_interaction(
-            self.messages,
-            self.stats,
-            self.config,
-            self.tool_manager,
-            self._additional_directory_contexts,
-        )
+        await self._recorder.flush()
         self.messages = self.messages[:1]
 
         self.stats = AgentStats()
@@ -1188,13 +1160,7 @@ class Agent:
             result = await self.compactor.compact(instructions=instructions, force=True)
             return result.summary
         except Exception:
-            await self.interaction_logger.save_interaction(
-                self.messages,
-                self.stats,
-                self.config,
-                self.tool_manager,
-                self._additional_directory_contexts,
-            )
+            await self._recorder.flush()
             raise
 
     def _regenerate_system_prompt_for_mode(self) -> None:
@@ -1247,20 +1213,26 @@ class Agent:
         max_turns: int | None = None,
         max_price: float | None = None,
     ) -> None:
-        await self.interaction_logger.save_interaction(
-            self.messages,
-            self.stats,
-            self.config,
-            self.tool_manager,
-            self._additional_directory_contexts,
-        )
+        await self._recorder.flush()
 
         preserved_messages = self.messages[1:] if len(self.messages) > 1 else []
         old_system_prompt = self.messages[0].content if len(self.messages) > 0 else ""
+        previous_model_alias = self._active_model_alias()
 
         if config is not None:
             self.config = config
             self.backend = self.backend_factory()
+
+        new_model_alias = self._active_model_alias()
+        if new_model_alias is not None and new_model_alias != previous_model_alias:
+            try:
+                active_model = self.config.get_active_model()
+            except ValueError:
+                pass
+            else:
+                self._recorder.on_model_change(
+                    active_model.alias, active_model.provider
+                )
 
         # Recreate skill manager and tool manager with updated config
         self.skill_manager = SkillManager(self.config)
@@ -1303,10 +1275,10 @@ class Agent:
 
         self.tool_manager.reset_all()
 
-        await self.interaction_logger.save_interaction(
-            self.messages,
-            self.stats,
-            self.config,
-            self.tool_manager,
-            self._additional_directory_contexts,
-        )
+        await self._recorder.flush()
+
+    def _active_model_alias(self) -> str | None:
+        try:
+            return self.config.get_active_model().alias
+        except ValueError:
+            return None

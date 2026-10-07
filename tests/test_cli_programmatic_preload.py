@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tests.mock.mock_backend_factory import mock_backend_factory
@@ -7,6 +9,8 @@ from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.core import run_programmatic
 from vibe.core.config import Backend, SessionLoggingConfig, VibeConfig
+from vibe.core.sessions.entries import UsageEntry
+from vibe.core.sessions.store import JsonlSessionStore
 from vibe.core.types import LLMMessage, OutputFormat, Role
 
 
@@ -138,3 +142,42 @@ def test_run_programmatic_ignores_system_messages_in_previous(
         assert spy.emitted[1][1] == "Continue our previous discussion."
         assert spy.emitted[2][1] == "Let's move on to practical examples."
         assert spy.emitted[3][1] == "Understood."
+
+
+def test_run_programmatic_persists_jsonl_session(tmp_path: Path) -> None:
+    with mock_backend_factory(
+        Backend.MISTRAL,
+        lambda provider, **kwargs: FakeBackend([
+            mock_llm_chunk(content="persisted answer", finish_reason="stop")
+        ]),
+    ):
+        cfg = VibeConfig(
+            session_logging=SessionLoggingConfig(
+                enabled=True,
+                fsync=False,
+                sessions_dir=str(tmp_path),
+                save_dir=str(tmp_path / "legacy"),
+            ),
+            system_prompt_id="tests",
+            include_project_context=False,
+            include_prompt_detail=False,
+            include_model_info=False,
+            include_commit_signature=False,
+        )
+
+        run_programmatic(
+            config=cfg,
+            prompt="persist this",
+            output_format=OutputFormat.TEXT,
+            mode="auto-approve",
+        )
+
+    store = JsonlSessionStore(cfg.session_logging)
+    summaries = store.list(workdir=None, limit=10)
+    assert len(summaries) == 1
+    view = store.read(summaries[0].path)
+    assert [message.content for message in view.messages()] == [
+        "persist this",
+        "persisted answer",
+    ]
+    assert any(isinstance(entry, UsageEntry) for entry in view.entries)

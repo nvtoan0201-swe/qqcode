@@ -15,6 +15,8 @@ from vibe.core.config import (
     VibeConfig,
 )
 from vibe.core.context.tokens import estimate_context_tokens
+from vibe.core.sessions.entries import CompactionEntry
+from vibe.core.sessions.store import JsonlSessionStore
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.types import (
     AgentStats,
@@ -481,12 +483,15 @@ class TestCompactStatsHandling:
         assert agent.stats.tool_calls_succeeded == 1
 
     @pytest.mark.asyncio
-    async def test_compact_resets_session_id(self) -> None:
+    async def test_compact_keeps_session_and_records_entry(self, tmp_path) -> None:
         backend = FakeBackend([
             mock_llm_chunk(content="Long response " * 100, finish_reason="stop"),
             mock_llm_chunk(content="<summary>", finish_reason="stop"),
         ])
-        agent = Agent(make_config(disable_logging=False), backend=backend)
+        config = make_config(disable_logging=False)
+        config.session_logging.sessions_dir = str(tmp_path)
+        config.session_logging.fsync = False
+        agent = Agent(config, backend=backend)
 
         original_session_id = agent.session_id
         original_logger_session_id = agent.interaction_logger.session_id
@@ -498,8 +503,14 @@ class TestCompactStatsHandling:
 
         await agent.compact()
 
-        assert agent.session_id != original_session_id
+        assert agent.session_id == original_session_id
         assert agent.session_id == agent.interaction_logger.session_id
+
+        store = JsonlSessionStore(config.session_logging)
+        path = store.find(agent.session_id)
+        assert path is not None
+        view = store.read(path)
+        assert any(isinstance(entry, CompactionEntry) for entry in view.entries)
 
 
 class TestAutoCompactIntegration:
