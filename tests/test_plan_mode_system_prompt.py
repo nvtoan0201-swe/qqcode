@@ -11,7 +11,14 @@ from tests.stubs.fake_backend import FakeBackend
 from vibe.core.agent import Agent
 from vibe.core.config import VibeConfig
 from vibe.core.prompts import UtilityPrompt
-from vibe.core.types import AgentMode, LLMChunk, LLMMessage, LLMUsage, Role
+from vibe.core.types import (
+    AgentMode,
+    LLMChunk,
+    LLMMessage,
+    LLMUsage,
+    Role,
+    SystemPromptChangedEvent,
+)
 
 
 @pytest.fixture
@@ -164,3 +171,63 @@ class TestPlanModeSystemPrompt:
         # PLAN -> INTERACTIVE (plan mode text removed)
         agent.mode = AgentMode.INTERACTIVE
         assert "PLAN MODE" not in agent.messages[0].content
+
+    def test_mode_change_keeps_prefix_before_mode_stable(
+        self, backend: FakeBackend, config: VibeConfig
+    ) -> None:
+        """Entering/leaving plan mode must not change sections before `mode`."""
+        agent = Agent(config=config, backend=backend, mode=AgentMode.INTERACTIVE)
+
+        before = agent.messages[0].content
+        assert before is not None
+        os_env_marker = "The operating system is"
+        prefix = before[: before.index(os_env_marker)]
+
+        agent.mode = AgentMode.PLAN
+        after = agent.messages[0].content
+        assert after is not None
+        plan_instructions = UtilityPrompt.PLAN_MODE.read()
+        assert after[: after.index(plan_instructions)] == prefix
+
+        agent.mode = AgentMode.INTERACTIVE
+        assert agent.messages[0].content == before
+
+    def test_only_mode_section_changes_between_modes(
+        self, backend: FakeBackend, config: VibeConfig
+    ) -> None:
+        agent = Agent(config=config, backend=backend, mode=AgentMode.INTERACTIVE)
+
+        def snapshot(sections) -> dict[str, str]:
+            return {
+                name: section.content
+                for name in sections.names()
+                if (section := sections.get(name)) is not None
+            }
+
+        before = snapshot(agent._prompt_sections)
+
+        agent.mode = AgentMode.PLAN
+        after = snapshot(agent._prompt_sections)
+
+        assert set(after) - set(before) == {"mode"}
+        for name, content in before.items():
+            assert after[name] == content
+
+    def test_mode_regeneration_emits_event_when_prompt_changes(
+        self, backend: FakeBackend, config: VibeConfig
+    ) -> None:
+        agent = Agent(config=config, backend=backend, mode=AgentMode.INTERACTIVE)
+        agent._mode = AgentMode.PLAN
+
+        event = agent._regenerate_system_prompt_for_mode()
+
+        assert isinstance(event, SystemPromptChangedEvent)
+        assert "PLAN MODE" in event.content
+        assert event.content == agent.messages[0].content
+
+    def test_mode_regeneration_returns_none_when_render_unchanged(
+        self, backend: FakeBackend, config: VibeConfig
+    ) -> None:
+        agent = Agent(config=config, backend=backend, mode=AgentMode.PLAN)
+
+        assert agent._regenerate_system_prompt_for_mode() is None

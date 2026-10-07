@@ -467,6 +467,7 @@ class VibeConfig(BaseSettings):
     include_commit_signature: bool = True
     include_model_info: bool = True
     include_project_context: bool = True
+    include_context_files: bool = True
     include_prompt_detail: bool = True
     enable_update_checks: bool = True
     api_timeout: float = 720.0

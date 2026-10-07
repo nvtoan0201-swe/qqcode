@@ -153,6 +153,10 @@ Example skill structure:
 
 Skills can provide specialized workflows, context, and best practices for specific domains like frontend development, data analysis, or testing.
 
+Skills are also discovered from `.agents/skills/` (searching up from the current directory) and `~/.agents/skills/`. When the same skill name exists in multiple locations, `.qqcode/skills/` wins.
+
+Add `disable-model-invocation: true` to a skill's frontmatter to hide it from the model-facing skill list; hidden skills can still be invoked explicitly with `/skill:<name> [args]`.
+
 ## Configuration
 
 QQcode is configured via a `config.toml` file. It looks for this file first in `./.qqcode/config.toml` and then falls back to `~/.qqcode/config.toml`.
@@ -199,6 +203,24 @@ system_prompt_id = "my_custom_prompt"
 ```
 
 This will load the prompt from `~/.qqcode/prompts/my_custom_prompt.md`.
+
+### Prompt Templates
+
+Prompt templates turn markdown files into slash commands with arguments. Place
+them in `.qqcode/prompts/commands/` (project) or `~/.qqcode/prompts/commands/`
+(global); each `*.md` file registers `/<name>`.
+
+```markdown
+---
+description: Create a pull request
+---
+
+Open a pull request for `$1` targeting `${2:-main}`.
+```
+
+Then run `/pr "feature branch"` to expand the placeholders and send the result
+as a user message. See [docs/prompt-templates.md](docs/prompt-templates.md) for
+the full placeholder reference.
 
 ### Custom Agent Configurations
 

@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from logging import getLogger
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vibe.core.prompts.templates import PromptTemplate
+    from vibe.core.skills.manager import SkillInfo
+
+logger = getLogger("vibe")
 
 
 @dataclass
@@ -9,6 +17,8 @@ class Command:
     description: str
     handler: str
     exits: bool = False
+    template: str | None = None
+    skill: str | None = None
 
 
 class CommandRegistry:
@@ -76,6 +86,51 @@ class CommandRegistry:
         for cmd_name, cmd in self.commands.items():
             for alias in cmd.aliases:
                 self._alias_map[alias] = cmd_name
+
+    def register_command(self, key: str, command: Command) -> bool:
+        """Register a dynamic command, rejecting duplicate names or aliases."""
+        if key in self.commands:
+            logger.warning("Command '%s' is already registered; ignoring", key)
+            return False
+
+        for alias in command.aliases:
+            if alias in self._alias_map:
+                logger.warning(
+                    "Command alias '%s' is already registered; ignoring '%s'",
+                    alias,
+                    key,
+                )
+                return False
+
+        self.commands[key] = command
+        for alias in command.aliases:
+            self._alias_map[alias] = key
+        return True
+
+    def register_template(self, template: PromptTemplate) -> bool:
+        """Register a prompt template as ``/<name>``; built-ins win collisions."""
+        return self.register_command(
+            f"template:{template.name}",
+            Command(
+                aliases=frozenset([f"/{template.name}"]),
+                description=template.description
+                or f"Run prompt template '{template.name}'",
+                handler="_run_prompt_template",
+                template=template.name,
+            ),
+        )
+
+    def register_skill(self, skill: SkillInfo) -> bool:
+        """Register a skill as ``/skill:<name>``."""
+        return self.register_command(
+            f"skill:{skill.name}",
+            Command(
+                aliases=frozenset([f"/skill:{skill.name}"]),
+                description=skill.description or f"Invoke skill '{skill.name}'",
+                handler="_run_skill_command",
+                skill=skill.name,
+            ),
+        )
 
     def find_command(self, user_input: str) -> Command | None:
         cmd_name = self._alias_map.get(user_input.lower().strip())

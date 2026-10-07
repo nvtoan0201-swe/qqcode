@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 from enum import StrEnum, auto
 import os
-import subprocess
 from pathlib import Path
+import subprocess
 from typing import Any, ClassVar, assert_never
 
 from textual.app import App, ComposeResult
@@ -51,16 +51,20 @@ from vibe.cli.update_notifier.version_update_gateway import VersionUpdateGateway
 from vibe.core import __version__ as CORE_VERSION
 from vibe.core.agent import Agent
 from vibe.core.autocompletion.path_prompt_adapter import render_path_prompt
-from vibe.core.config import HISTORY_FILE, VibeConfig
+from vibe.core.config import HISTORY_FILE, VibeConfig, get_vibe_home
 from vibe.core.interaction_logger import InteractionLogger
+from vibe.core.prompts.templates import load_templates, render_template
+from vibe.core.skills.manager import SkillManager, SkillNotFoundError
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.types import (
     AgentMode,
+    BaseEvent,
     ContextUsageEvent,
     LLMMessage,
     ModeChangedEvent,
     ResumeSessionInfo,
     Role,
+    SystemPromptChangedEvent,
 )
 from vibe.core.utils import (
     ApprovalResponse,
@@ -102,6 +106,7 @@ class VibeApp(App):
         version_update_notifier: VersionUpdateGateway | None = None,
         current_version: str = CORE_VERSION,
         additional_directory_contexts: list[Path] | None = None,
+        prompt_template_dirs: list[Path] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -125,6 +130,12 @@ class VibeApp(App):
 
         self.event_handler: EventHandler | None = None
         self.commands = CommandRegistry()
+        self._prompt_template_dirs = list(prompt_template_dirs or [])
+        self.skill_manager = SkillManager(config)
+        self.prompt_templates = load_templates(
+            self._default_template_dirs(self._prompt_template_dirs)
+        )
+        self._register_dynamic_commands()
 
         self._chat_input_container: ChatInputContainer | None = None
         self._mode_indicator: ModeIndicator | None = None
@@ -503,6 +514,29 @@ class VibeApp(App):
         if updates:
             VibeConfig.save_updates(updates)
 
+    def _default_template_dirs(self, extra_dirs: list[Path]) -> list[Path]:
+        dirs: list[Path] = list(extra_dirs)
+        cwd = self.config.effective_workdir
+        for directory in (cwd, *cwd.parents):
+            candidate = directory / ".qqcode" / "prompts" / "commands"
+            if candidate.is_dir():
+                dirs.append(candidate)
+                break
+
+        global_dir = get_vibe_home() / "prompts" / "commands"
+        if global_dir.is_dir():
+            dirs.append(global_dir)
+        return dirs
+
+    def _register_dynamic_commands(self) -> None:
+        for template in self.prompt_templates.values():
+            if f"template:{template.name}" not in self.commands.commands:
+                self.commands.register_template(template)
+
+        for skill in self.skill_manager.get_available_skills():
+            if f"skill:{skill.name}" not in self.commands.commands:
+                self.commands.register_skill(skill)
+
     async def _handle_command(self, user_input: str) -> bool:
         # Check if this is a command with arguments (e.g., /add-dir <path>)
         command_word = user_input.split()[0] if user_input else ""
@@ -519,13 +553,63 @@ class VibeApp(App):
                     await handler(user_input)
                 else:
                     await handler()
+            elif accepts_input:
+                handler(user_input)
             else:
-                if accepts_input:
-                    handler(user_input)
-                else:
-                    handler()
+                handler()
+            return True
+
+        if command_word.startswith("/skill:"):
+            await self._run_skill_command(user_input)
             return True
         return False
+
+    async def _run_prompt_template(self, user_input: str) -> None:
+        command_word = user_input.split(maxsplit=1)[0] if user_input else ""
+        command = self.commands.find_command(command_word)
+        if command is None or command.template is None:
+            return
+
+        template = self.prompt_templates.get(command.template)
+        if template is None:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Prompt template '{command.template}' not found.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        raw_args = user_input[len(command_word) :].strip()
+        await self._handle_user_message(render_template(template, raw_args).strip())
+
+    async def _run_skill_command(self, user_input: str) -> None:
+        command_word = user_input.split(maxsplit=1)[0] if user_input else ""
+        command = self.commands.find_command(command_word)
+        skill_name = (
+            command.skill
+            if command and command.skill
+            else command_word.removeprefix("/skill:")
+        )
+        raw_args = user_input[len(command_word) :].strip()
+        if not skill_name:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "No skill name provided. Use: /skill:<name> [args]",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        try:
+            message = self.skill_manager.render_skill_invocation(skill_name, raw_args)
+        except (SkillNotFoundError, OSError) as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(str(exc), collapsed=self._tools_collapsed)
+            )
+            return
+
+        await self._handle_user_message(message)
 
     async def _handle_bash_command(self, command: str) -> None:
         if not command:
@@ -654,6 +738,8 @@ class VibeApp(App):
                 )
 
             self.agent = agent
+            self.skill_manager = agent.skill_manager
+            self._register_dynamic_commands()
         except asyncio.CancelledError:
             self.agent = None
             return
@@ -703,6 +789,38 @@ class VibeApp(App):
         self._pending_plan_content = None
         return result
 
+    async def _handle_agent_event(self, event: BaseEvent) -> None:
+        if isinstance(event, ContextUsageEvent):
+            if self._context_progress:
+                self._context_progress.tokens = TokenState(
+                    max_tokens=event.context_window, current_tokens=event.context_tokens
+                )
+            return
+
+        if self._context_progress and self.agent:
+            current_state = self._context_progress.tokens
+            self._context_progress.tokens = TokenState(
+                max_tokens=current_state.max_tokens,
+                current_tokens=self.agent.stats.context_tokens,
+            )
+
+        # Handle mode change events (legacy, for backward compatibility)
+        if isinstance(event, ModeChangedEvent):
+            self.agent_mode = event.new_mode
+            # Use call_after_refresh to ensure ChatInputContainer children are composed
+            self.call_after_refresh(self._sync_mode_to_ui)
+            return
+
+        if isinstance(event, SystemPromptChangedEvent):
+            return
+
+        if self.event_handler:
+            await self.event_handler.handle_event(
+                event,
+                loading_active=self._loading_widget is not None,
+                loading_widget=self._loading_widget,
+            )
+
     async def _handle_agent_turn(self, prompt: str) -> None:
         if not self.agent:
             return
@@ -720,34 +838,7 @@ class VibeApp(App):
                 prompt, base_dir=self.config.effective_workdir
             )
             async for event in self.agent.act(rendered_prompt):
-                if isinstance(event, ContextUsageEvent):
-                    if self._context_progress:
-                        self._context_progress.tokens = TokenState(
-                            max_tokens=event.context_window,
-                            current_tokens=event.context_tokens,
-                        )
-                    continue
-
-                if self._context_progress and self.agent:
-                    current_state = self._context_progress.tokens
-                    self._context_progress.tokens = TokenState(
-                        max_tokens=current_state.max_tokens,
-                        current_tokens=self.agent.stats.context_tokens,
-                    )
-
-                # Handle mode change events (legacy, for backward compatibility)
-                if isinstance(event, ModeChangedEvent):
-                    self.agent_mode = event.new_mode
-                    # Use call_after_refresh to ensure ChatInputContainer children are composed
-                    self.call_after_refresh(self._sync_mode_to_ui)
-                    continue
-
-                if self.event_handler:
-                    await self.event_handler.handle_event(
-                        event,
-                        loading_active=self._loading_widget is not None,
-                        loading_widget=self._loading_widget,
-                    )
+                await self._handle_agent_event(event)
 
         except asyncio.CancelledError:
             if self._loading_widget and self._loading_widget.parent:
@@ -856,6 +947,11 @@ class VibeApp(App):
                 await self.agent.reload_with_initial_messages(config=new_config)
 
             self.config = new_config
+            self.skill_manager = SkillManager(new_config)
+            self.prompt_templates = load_templates(
+                self._default_template_dirs(self._prompt_template_dirs)
+            )
+            self._register_dynamic_commands()
             if self._context_progress:
                 context_limit = self.config.get_context_limit_for_active_model()
                 if context_limit > 0:
@@ -1478,6 +1574,7 @@ def run_textual_ui(
     loaded_messages: list[LLMMessage] | None = None,
     session_info: ResumeSessionInfo | None = None,
     additional_directory_contexts: list[Path] | None = None,
+    prompt_template_dirs: list[Path] | None = None,
 ) -> None:
     update_notifier = GitHubVersionUpdateGateway(
         owner="qnguyen3", repository="qqcode", token=os.getenv("GITHUB_TOKEN")
@@ -1491,5 +1588,6 @@ def run_textual_ui(
         session_info=session_info,
         version_update_notifier=update_notifier,
         additional_directory_contexts=additional_directory_contexts,
+        prompt_template_dirs=prompt_template_dirs,
     )
     app.run()

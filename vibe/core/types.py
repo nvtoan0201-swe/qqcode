@@ -296,6 +296,12 @@ class ModeChangedEvent(BaseEvent):
     new_mode: AgentMode
 
 
+class SystemPromptChangedEvent(BaseEvent):
+    """Emitted when the rendered system prompt content changes."""
+
+    content: str
+
+
 class OutputFormat(StrEnum):
     TEXT = auto()
     JSON = auto()

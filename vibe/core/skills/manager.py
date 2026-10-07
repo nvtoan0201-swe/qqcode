@@ -18,7 +18,10 @@ logger = getLogger("vibe")
 FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
 # Regex to extract key-value pairs from frontmatter
-KEY_VALUE_PATTERN = re.compile(r"^(\w+):\s*(.+)$", re.MULTILINE)
+KEY_VALUE_PATTERN = re.compile(r"^([\w-]+):\s*(.+)$", re.MULTILINE)
+
+DISABLE_MODEL_INVOCATION_VALUES = frozenset({"true", "yes", "1"})
+ALLOWED_TOOLS_SEPARATOR_PATTERN = re.compile(r"[,\s]+")
 
 
 class SkillInfo(BaseModel):
@@ -28,11 +31,15 @@ class SkillInfo(BaseModel):
         name: The unique name of the skill.
         description: A description of when and how to use the skill.
         path: The path to the SKILL.md file.
+        disable_model_invocation: Hide the skill from the model-facing listing.
+        allowed_tools: Tools the skill is allowed to use, if declared.
     """
 
     name: str
     description: str
     path: Path
+    disable_model_invocation: bool = False
+    allowed_tools: list[str] | None = None
 
 
 class SkillNotFoundError(Exception):
@@ -66,25 +73,32 @@ class SkillManager:
         """Compute the list of directories to search for skills.
 
         Priority order:
-        1. Project-local: ./.qqcode/skills/
-        2. Global: ~/.qqcode/skills/
+        1. Project-local: ./.qqcode/skills/ (cwd up to root)
+        2. Project-local: ./.agents/skills/ (cwd up to root)
+        3. Global: ~/.qqcode/skills/
+        4. Global: ~/.agents/skills/
         """
         paths: list[Path] = []
 
-        # Project-local skills directory
         cwd = config.effective_workdir
-        for directory in (cwd, *cwd.parents):
-            skills_dir = directory / ".qqcode" / "skills"
-            if skills_dir.is_dir():
-                paths.append(skills_dir)
-                break
+        for root in (".qqcode", ".agents"):
+            for directory in (cwd, *cwd.parents):
+                skills_dir = directory / root / "skills"
+                if skills_dir.is_dir():
+                    paths.append(skills_dir)
+                    break
 
-        # Global skills directory
-        global_skills = get_vibe_home() / "skills"
-        if global_skills.is_dir():
-            paths.append(global_skills)
+        global_paths = (get_vibe_home() / "skills", Path.home() / ".agents" / "skills")
+        paths.extend(path for path in global_paths if path.is_dir())
 
-        return paths
+        unique: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                unique.append(resolved)
+        return unique
 
     @staticmethod
     def _parse_frontmatter(content: str) -> dict[str, str]:
@@ -114,6 +128,11 @@ class SkillManager:
             result[key] = value
 
         return result
+
+    @staticmethod
+    def strip_frontmatter(content: str) -> str:
+        """Remove the YAML frontmatter block from SKILL.md content."""
+        return FRONTMATTER_PATTERN.sub("", content, count=1)
 
     def _discover_skills(self) -> None:
         """Discover all available skills from search paths."""
@@ -162,8 +181,25 @@ class SkillManager:
                         continue
 
                     seen_names.add(name)
+                    allowed_tools_raw = frontmatter.get("allowed-tools", "").strip()
+                    allowed_tools = [
+                        tool
+                        for tool in ALLOWED_TOOLS_SEPARATOR_PATTERN.split(
+                            allowed_tools_raw
+                        )
+                        if tool
+                    ]
                     self._skills[name] = SkillInfo(
-                        name=name, description=description, path=skill_file
+                        name=name,
+                        description=description,
+                        path=skill_file,
+                        disable_model_invocation=frontmatter.get(
+                            "disable-model-invocation", ""
+                        )
+                        .strip()
+                        .lower()
+                        in DISABLE_MODEL_INVOCATION_VALUES,
+                        allowed_tools=allowed_tools or None,
                     )
                     logger.info("Discovered skill: %s from %s", name, skill_file)
 
@@ -208,20 +244,60 @@ class SkillManager:
     def get_skills_prompt_section(self) -> str:
         """Generate the <available_skills> XML section for the system prompt.
 
+        Skills declaring ``disable-model-invocation`` are hidden from the
+        listing; they remain callable through ``/skill:<name>``.
+
         Returns:
-            An XML string listing all available skills, or empty string if no skills.
+            An XML string listing all available skills, or empty string if none.
         """
-        if not self._skills:
+        visible_skills = [
+            skill
+            for skill in self._skills.values()
+            if not skill.disable_model_invocation
+        ]
+        if not visible_skills:
             return ""
 
         lines = ["<available_skills>"]
-        for skill in self._skills.values():
-            lines.append(f"- name: {skill.name}")
-            lines.append(f"  description: {skill.description}")
-            lines.append("")
+        for skill in visible_skills:
+            lines.extend([
+                "  <skill>",
+                f"    <name>{skill.name}</name>",
+                f"    <description>{skill.description}</description>",
+                f"    <location>{skill.path.resolve()}</location>",
+                "  </skill>",
+            ])
         lines.append("</available_skills>")
+        lines.append("")
+        lines.append(
+            "When a task matches a skill's description, read the file at "
+            "location when the task matches to load its full instructions. "
+            "Relative paths inside a skill resolve against its directory."
+        )
 
         return "\n".join(lines)
+
+    def render_skill_invocation(self, name: str, raw_args: str = "") -> str:
+        """Render a skill as a user message for explicit ``/skill:<name>`` calls.
+
+        The frontmatter is stripped and the body is wrapped in a
+        ``<skill name="..." location="...">`` tag, with ``raw_args`` appended.
+
+        Raises:
+            SkillNotFoundError: If the skill is not found.
+        """
+        skill = self._skills.get(name)
+        if skill is None:
+            raise SkillNotFoundError(name, list(self._skills.keys()))
+
+        body = self.strip_frontmatter(skill.path.read_text(encoding="utf-8")).strip()
+        args = raw_args.strip()
+        content = f"{body}\n\n{args}" if args else body
+        return (
+            f'<skill name="{skill.name}" location="{skill.path.resolve()}">\n'
+            f"{content}\n"
+            "</skill>"
+        )
 
     def has_skills(self) -> bool:
         """Check if any skills are available."""

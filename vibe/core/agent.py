@@ -5,6 +5,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from enum import StrEnum, auto
+from pathlib import Path
 import time
 from typing import Any, cast
 from uuid import uuid4
@@ -34,9 +35,15 @@ from vibe.core.middleware import (
     PriceLimitMiddleware,
     TurnLimitMiddleware,
 )
+from vibe.core.prompts import UtilityPrompt
+from vibe.core.prompts.sections import PromptSection
 from vibe.core.sessions.recorder import SessionRecorder
 from vibe.core.skills.manager import SkillManager
-from vibe.core.system_prompt import get_universal_system_prompt
+from vibe.core.system_prompt import (
+    build_additional_contexts,
+    build_prompt_sections,
+    collect_tool_prompts,
+)
 from vibe.core.tools.base import (
     BaseTool,
     ToolError,
@@ -59,6 +66,7 @@ from vibe.core.types import (
     ModeChangedEvent,
     Role,
     SyncApprovalCallback,
+    SystemPromptChangedEvent,
     ToolCall,
     ToolCallEvent,
     ToolResultEvent,
@@ -194,23 +202,25 @@ class Agent:
         else:
             self._mode = AgentMode.INTERACTIVE
 
-        system_prompt = get_universal_system_prompt(
+        self._additional_directory_contexts: list[Path] = list(
+            additional_directory_contexts or []
+        )
+
+        self._prompt_sections = build_prompt_sections(
             self.tool_manager,
             config,
             skill_manager=self.skill_manager,
             mode=self._mode.value,
+            additional_directory_contexts=self._additional_directory_contexts,
         )
 
-        self.messages = [LLMMessage(role=Role.system, content=system_prompt)]
+        self.messages = [
+            LLMMessage(role=Role.system, content=self._prompt_sections.render())
+        ]
 
         if self.message_observer:
             self.message_observer(self.messages[0])
             self._last_observed_message_index = 1
-
-        # Store additional directory contexts
-        self._additional_directory_contexts: list[Path] = (
-            additional_directory_contexts or []
-        )
 
         self.stats = AgentStats()
         try:
@@ -483,7 +493,11 @@ class Agent:
     async def _perform_llm_turn(
         self,
     ) -> AsyncGenerator[
-        AssistantEvent | ToolCallEvent | ToolResultEvent | ModeChangedEvent
+        AssistantEvent
+        | ToolCallEvent
+        | ToolResultEvent
+        | ModeChangedEvent
+        | SystemPromptChangedEvent
     ]:
         if self.enable_streaming:
             async for event in self._stream_assistant_events():
@@ -650,7 +664,9 @@ class Agent:
 
     async def _handle_tool_calls(
         self, resolved: ResolvedMessage
-    ) -> AsyncGenerator[ToolCallEvent | ToolResultEvent | ModeChangedEvent]:
+    ) -> AsyncGenerator[
+        ToolCallEvent | ToolResultEvent | ModeChangedEvent | SystemPromptChangedEvent
+    ]:
         async for event in self._emit_failed_tool_calls(resolved.failed_calls):
             yield event
 
@@ -821,7 +837,7 @@ class Agent:
         self,
         prepared: list[_PreparedCall],
         outcomes: list[BaseModel | BaseException | None],
-    ) -> AsyncGenerator[ToolResultEvent | ModeChangedEvent]:
+    ) -> AsyncGenerator[ToolResultEvent | ModeChangedEvent | SystemPromptChangedEvent]:
         for item, outcome in zip(prepared, outcomes, strict=True):
             match item:
                 case _SkippedCall():
@@ -865,7 +881,7 @@ class Agent:
 
     async def _commit_approved_call(
         self, call: _ApprovedCall, outcome: BaseModel | BaseException | None
-    ) -> AsyncGenerator[ToolResultEvent | ModeChangedEvent]:
+    ) -> AsyncGenerator[ToolResultEvent | ModeChangedEvent | SystemPromptChangedEvent]:
         self.stats.tool_calls_agreed += 1
 
         if isinstance(outcome, (asyncio.CancelledError, KeyboardInterrupt)):
@@ -973,12 +989,14 @@ class Agent:
             new_mode = _mode_string_to_agent_mode(cast(str, execution_mode))
             if new_mode and new_mode != self._mode:
                 self._mode = new_mode
-                self._regenerate_system_prompt_for_mode()
+                if prompt_event := self._regenerate_system_prompt_for_mode():
+                    yield prompt_event
                 yield ModeChangedEvent(new_mode=new_mode)
 
         if getattr(result_model, "mode_change", None) == "plan":
             self._mode = AgentMode.PLAN
-            self._regenerate_system_prompt_for_mode()
+            if prompt_event := self._regenerate_system_prompt_for_mode():
+                yield prompt_event
             yield ModeChangedEvent(new_mode=AgentMode.PLAN)
 
     def _apply_plan_approval(
@@ -1127,7 +1145,7 @@ class Agent:
         """Get a tool instance, using plan mode configuration for bash if in plan mode."""
         # In plan mode, use special configuration for bash tool
         if self._mode == AgentMode.PLAN and tool_name == "bash":
-            from vibe.core.tools.builtins.bash import Bash, BashPlanModeConfig
+            from vibe.core.tools.builtins.bash import BashPlanModeConfig
 
             # Get the tool class
             tool_class = self.tool_manager._available.get(tool_name)
@@ -1339,21 +1357,47 @@ class Agent:
             await self._recorder.flush()
             raise
 
-    def _regenerate_system_prompt_for_mode(self) -> None:
-        """Regenerate the system prompt when mode changes."""
-        new_system_prompt = get_universal_system_prompt(
-            self.tool_manager,
-            self.config,
-            skill_manager=self.skill_manager,
-            mode=self._mode.value,
-            additional_directory_contexts=self._additional_directory_contexts,
-        )
-        if len(self.messages) > 0:
-            self.messages[0] = LLMMessage(role=Role.system, content=new_system_prompt)
-        else:
-            self.messages.insert(
-                0, LLMMessage(role=Role.system, content=new_system_prompt)
+    def _regenerate_system_prompt_for_mode(self) -> SystemPromptChangedEvent | None:
+        """Update only the mode section, keeping the cacheable prefix stable."""
+        if self._mode == AgentMode.PLAN:
+            self._prompt_sections.set(
+                PromptSection(
+                    "mode",
+                    UtilityPrompt.PLAN_MODE.read(),
+                    tagged=False,
+                    cache_stable=False,
+                )
             )
+        else:
+            self._prompt_sections.remove("mode")
+
+        self._refresh_tool_sections()
+        return self._apply_prompt_sections()
+
+    def _refresh_tool_sections(self) -> None:
+        if tool_prompts := collect_tool_prompts(self.tool_manager, self.config):
+            self._prompt_sections.set(
+                PromptSection("tool_prompts", tool_prompts, tagged=False)
+            )
+        else:
+            self._prompt_sections.remove("tool_prompts")
+
+        if skills := self.skill_manager.get_skills_prompt_section():
+            self._prompt_sections.set(PromptSection("skills", skills, tagged=False))
+        else:
+            self._prompt_sections.remove("skills")
+
+    def _apply_prompt_sections(self) -> SystemPromptChangedEvent | None:
+        content = self._prompt_sections.render()
+        if self.messages and self.messages[0].content == content:
+            return None
+
+        if self.messages:
+            self.messages[0] = LLMMessage(role=Role.system, content=content)
+        else:
+            self.messages.insert(0, LLMMessage(role=Role.system, content=content))
+
+        return SystemPromptChangedEvent(content=content)
 
     def add_additional_directory_context(self, directory_path: Path) -> None:
         """Add an additional directory context to the agent."""
@@ -1369,19 +1413,16 @@ class Agent:
 
     def _regenerate_system_prompt_with_additional_contexts(self) -> None:
         """Regenerate the system prompt with additional directory contexts."""
-        new_system_prompt = get_universal_system_prompt(
-            self.tool_manager,
-            self.config,
-            skill_manager=self.skill_manager,
-            mode=self._mode.value,
-            additional_directory_contexts=self._additional_directory_contexts,
-        )
-        if len(self.messages) > 0:
-            self.messages[0] = LLMMessage(role=Role.system, content=new_system_prompt)
-        else:
-            self.messages.insert(
-                0, LLMMessage(role=Role.system, content=new_system_prompt)
+        if additional := build_additional_contexts(
+            self.config, self._additional_directory_contexts
+        ):
+            self._prompt_sections.set(
+                PromptSection("additional_context", additional, tagged=False)
             )
+        else:
+            self._prompt_sections.remove("additional_context")
+
+        self._apply_prompt_sections()
 
     async def reload_with_initial_messages(
         self,
@@ -1414,13 +1455,14 @@ class Agent:
         self.skill_manager = SkillManager(self.config)
         self.tool_manager = ToolManager(self.config, skill_manager=self.skill_manager)
 
-        new_system_prompt = get_universal_system_prompt(
+        self._prompt_sections = build_prompt_sections(
             self.tool_manager,
             self.config,
             skill_manager=self.skill_manager,
             mode=self._mode.value,
             additional_directory_contexts=self._additional_directory_contexts,
         )
+        new_system_prompt = self._prompt_sections.render()
         self.messages = [LLMMessage(role=Role.system, content=new_system_prompt)]
         did_system_prompt_change = old_system_prompt != new_system_prompt
 
