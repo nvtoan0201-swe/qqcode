@@ -10,7 +10,7 @@ from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_connection import FakeAgentSideConnection
 from vibe.acp.acp_agent import VibeAcpAgent
 from vibe.core.agent import Agent
-from vibe.core.config import ModelConfig, VibeConfig
+from vibe.core.config import ModelConfig, ModelPricing, VibeConfig
 from vibe.core.types import LLMChunk, LLMMessage, LLMUsage, Role
 
 
@@ -37,15 +37,13 @@ def acp_agent(backend: FakeBackend) -> VibeAcpAgent:
                 name="devstral-latest",
                 provider="mistral",
                 alias="devstral-latest",
-                input_price=0.4,
-                output_price=2.0,
+                pricing=ModelPricing(input_per_million=0.4, output_per_million=2.0),
             ),
             ModelConfig(
                 name="devstral-small",
                 provider="mistral",
                 alias="devstral-small",
-                input_price=0.1,
-                output_price=0.3,
+                pricing=ModelPricing(input_per_million=0.1, output_per_million=0.3),
             ),
         ],
     )

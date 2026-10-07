@@ -18,6 +18,7 @@ from vibe.core.context.overflow import is_context_overflow
 from vibe.core.context.tokens import estimate_context_tokens
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
+from vibe.core.llm.cache import CachePlan, build_cache_plan
 from vibe.core.llm.format import (
     APIToolFormatHandler,
     FailedToolCall,
@@ -225,9 +226,8 @@ class Agent:
         self.stats = AgentStats()
         try:
             active_model = config.get_active_model()
-            self.stats.input_price_per_million = active_model.input_price
-            self.stats.output_price_per_million = active_model.output_price
-            self.stats.context_window = active_model.context_limit
+            self.stats.update_pricing(active_model.pricing)
+            self.stats.context_window = active_model.context_window
         except ValueError:
             pass
 
@@ -288,7 +288,11 @@ class Agent:
     def _select_backend(self) -> BackendLike:
         active_model = self.config.get_active_model()
         provider = self.config.get_provider_for_model(active_model)
-        timeout = self.config.api_timeout
+        timeout = (
+            provider.timeout
+            if provider.timeout is not None
+            else self.config.api_timeout
+        )
         return BACKEND_FACTORY[provider.backend](provider=provider, timeout=timeout)
 
     def add_message(self, message: LLMMessage) -> None:
@@ -635,11 +639,7 @@ class Agent:
             self._record_usage(usage)
 
     def _record_usage(self, usage: LLMUsage) -> None:
-        cost = (
-            usage.prompt_tokens * self.stats.input_price_per_million
-            + usage.completion_tokens * self.stats.output_price_per_million
-        ) / 1_000_000
-        self._recorder.on_usage(usage, cost)
+        self._recorder.on_usage(usage, self.stats.usage_cost(usage))
 
     async def _get_assistant_event(self) -> AssistantEvent:
         llm_result = await self._chat()
@@ -801,7 +801,12 @@ class Agent:
     def _is_sequential_call(self, call: _ApprovedCall) -> bool:
         if call.tool_instance.execution_mode == "sequential":
             return True
-        return call.tool_call.tool_name in self.config.tool_runtime.sequential
+        if call.tool_call.tool_name in self.config.tool_runtime.sequential:
+            return True
+        try:
+            return not self.config.get_active_model().capabilities.parallel_tool_calls
+        except ValueError:
+            return False
 
     async def _invoke_tool_call(
         self, call: _ApprovedCall, semaphore: asyncio.Semaphore
@@ -1025,17 +1030,25 @@ class Agent:
         *,
         messages: list[LLMMessage] | None = None,
         include_tools: bool = True,
+        cache_plan: CachePlan | None = None,
     ) -> LLMChunk:
         active_model = self.config.get_active_model()
         provider = self.config.get_provider_for_model(active_model)
         request_messages = messages if messages is not None else self.messages
+        if cache_plan is None:
+            cache_plan = build_cache_plan(provider, active_model, self.session_id)
 
+        send_tools = include_tools and active_model.capabilities.tools
         available_tools = (
             self.format_handler.get_available_tools(self.tool_manager, self.config)
-            if include_tools
+            if send_tools
             else None
         )
-        tool_choice = self.format_handler.get_tool_choice() if include_tools else None
+        tool_choice = (
+            self.format_handler.get_tool_choice()
+            if send_tools and active_model.capabilities.tool_choice
+            else None
+        )
 
         try:
             start_time = time.perf_counter()
@@ -1052,6 +1065,7 @@ class Agent:
                         "x-affinity": self.session_id,
                     },
                     max_tokens=max_tokens,
+                    cache_plan=cache_plan,
                 )
 
             end_time = time.perf_counter()
@@ -1065,6 +1079,8 @@ class Agent:
             self.stats.last_turn_completion_tokens = result.usage.completion_tokens
             self.stats.session_prompt_tokens += result.usage.prompt_tokens
             self.stats.session_completion_tokens += result.usage.completion_tokens
+            self.stats.cache_read_tokens += result.usage.cache_read_tokens
+            self.stats.cache_write_tokens += result.usage.cache_write_tokens
             self._last_usage = result.usage
             if messages is None:
                 self.stats.last_usage_message_index = len(self.messages) - 1
@@ -1089,11 +1105,19 @@ class Agent:
     ) -> AsyncGenerator[LLMChunk]:
         active_model = self.config.get_active_model()
         provider = self.config.get_provider_for_model(active_model)
+        cache_plan = build_cache_plan(provider, active_model, self.session_id)
 
-        available_tools = self.format_handler.get_available_tools(
-            self.tool_manager, self.config
+        send_tools = active_model.capabilities.tools
+        available_tools = (
+            self.format_handler.get_available_tools(self.tool_manager, self.config)
+            if send_tools
+            else None
         )
-        tool_choice = self.format_handler.get_tool_choice()
+        tool_choice = (
+            self.format_handler.get_tool_choice()
+            if send_tools and active_model.capabilities.tool_choice
+            else None
+        )
         try:
             start_time = time.perf_counter()
             last_chunk = None
@@ -1110,6 +1134,7 @@ class Agent:
                         "x-affinity": self.session_id,
                     },
                     max_tokens=max_tokens,
+                    cache_plan=cache_plan,
                 ):
                     last_chunk = chunk
                     processed_message = (
@@ -1134,6 +1159,8 @@ class Agent:
             self.stats.last_turn_completion_tokens = last_chunk.usage.completion_tokens
             self.stats.session_prompt_tokens += last_chunk.usage.prompt_tokens
             self.stats.session_completion_tokens += last_chunk.usage.completion_tokens
+            self.stats.cache_read_tokens += last_chunk.usage.cache_read_tokens
+            self.stats.cache_write_tokens += last_chunk.usage.cache_write_tokens
             self._last_usage = last_chunk.usage
 
         except Exception as e:
@@ -1336,10 +1363,8 @@ class Agent:
 
         try:
             active_model = self.config.get_active_model()
-            self.stats.update_pricing(
-                active_model.input_price, active_model.output_price
-            )
-            self.stats.context_window = active_model.context_limit
+            self.stats.update_pricing(active_model.pricing)
+            self.stats.context_window = active_model.context_window
         except ValueError:
             pass
 
@@ -1475,10 +1500,8 @@ class Agent:
 
         try:
             active_model = self.config.get_active_model()
-            self.stats.update_pricing(
-                active_model.input_price, active_model.output_price
-            )
-            self.stats.context_window = active_model.context_limit
+            self.stats.update_pricing(active_model.pricing)
+            self.stats.context_window = active_model.context_window
         except ValueError:
             pass
 

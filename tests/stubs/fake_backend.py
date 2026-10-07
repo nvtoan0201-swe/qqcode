@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable, Iterable
 
 from tests.mock.utils import mock_llm_chunk
+from vibe.core.llm.cache import CachePlan
 from vibe.core.types import LLMChunk, LLMMessage
 
 
@@ -24,6 +25,7 @@ class FakeBackend:
         self._chunks = list(results or [])
         self._requests_messages: list[list[LLMMessage]] = []
         self._requests_extra_headers: list[dict[str, str] | None] = []
+        self._requests_cache_plans: list[CachePlan | None] = []
         self._count_tokens_calls: list[list[LLMMessage]] = []
         self._token_counter = token_counter or self._default_token_counter
         self._exception_to_raise = exception_to_raise
@@ -46,6 +48,10 @@ class FakeBackend:
     def requests_extra_headers(self) -> list[dict[str, str] | None]:
         return self._requests_extra_headers
 
+    @property
+    def requests_cache_plans(self) -> list[CachePlan | None]:
+        return self._requests_cache_plans
+
     @staticmethod
     def _default_token_counter(messages: list[LLMMessage]) -> int:
         return 1
@@ -66,12 +72,14 @@ class FakeBackend:
         tool_choice,
         extra_headers,
         max_tokens,
+        cache_plan=None,
     ) -> LLMChunk:
         if (exception := self._next_exception()) is not None:
             raise exception
 
         self._requests_messages.append(messages)
         self._requests_extra_headers.append(extra_headers)
+        self._requests_cache_plans.append(cache_plan)
         if self._chunks:
             chunk = self._chunks.pop(0)
             if not self._chunks:
@@ -89,12 +97,14 @@ class FakeBackend:
         tool_choice,
         extra_headers,
         max_tokens,
+        cache_plan=None,
     ) -> AsyncGenerator[LLMChunk]:
         if (exception := self._next_exception()) is not None:
             raise exception
 
         self._requests_messages.append(messages)
         self._requests_extra_headers.append(extra_headers)
+        self._requests_cache_plans.append(cache_plan)
         has_final_chunk = False
         while self._chunks:
             chunk = self._chunks.pop(0)

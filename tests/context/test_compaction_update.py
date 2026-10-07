@@ -21,7 +21,7 @@ def make_agent(
     backend: FakeBackend, *, prompt: Literal["summary", "legacy"] = "summary"
 ) -> Agent:
     model = ModelConfig(
-        name="test-model", provider="mistral", alias="test-compact", context_limit=1
+        name="test-model", provider="mistral", alias="test-compact", context_window=1
     )
     config = VibeConfig(
         session_logging=SessionLoggingConfig(enabled=False),

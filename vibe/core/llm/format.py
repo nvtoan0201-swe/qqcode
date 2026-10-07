@@ -83,6 +83,14 @@ def get_active_tool_classes(
         tool_manager: ToolManager instance with discovered tools
         config: VibeConfig with enabled_tools/disabled_tools settings
     """
+    try:
+        active_model = config.get_active_model()
+    except ValueError:
+        active_model = None
+
+    if active_model is not None and not active_model.capabilities.tools:
+        return []
+
     all_tools = list(tool_manager.available_tools().values())
 
     if config.enabled_tools:

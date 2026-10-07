@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from vibe.core.context.cut import CutResult, select_cut
 from vibe.core.context.tokens import estimate_context_tokens
+from vibe.core.llm.cache import CachePlan
 from vibe.core.middleware import ResetReason
 from vibe.core.prompts import UtilityPrompt
 from vibe.core.types import LLMMessage, LLMUsage, Role
@@ -222,7 +223,9 @@ class Compactor:
 
         agent.stats.steps += 1
         summary_result = await agent._chat(
-            messages=request_messages, include_tools=False
+            messages=request_messages,
+            include_tools=False,
+            cache_plan=CachePlan(enabled=False),
         )
         summary = (summary_result.message.content or "").strip()
         if cut_index == len(conversation):

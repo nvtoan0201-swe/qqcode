@@ -65,7 +65,7 @@ async def test_no_warning_below_threshold() -> None:
 
 def make_config(*, context_warnings: bool) -> VibeConfig:
     model = ModelConfig(
-        name="test-model", provider="mistral", alias="test-warn", context_limit=10
+        name="test-model", provider="mistral", alias="test-warn", context_window=10
     )
     return VibeConfig(
         session_logging=SessionLoggingConfig(enabled=False),

@@ -50,7 +50,7 @@ def make_agent(backend: FakeBackend) -> Agent:
         name="test-model",
         provider="mistral",
         alias="test-overflow",
-        context_limit=200_000,
+        context_window=200_000,
     )
     config = VibeConfig(
         session_logging=SessionLoggingConfig(enabled=False),

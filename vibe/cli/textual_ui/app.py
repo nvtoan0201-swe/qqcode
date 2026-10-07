@@ -926,10 +926,12 @@ class VibeApp(App):
 - **Steps**: {stats.steps:,}
 - **Session Prompt Tokens**: {stats.session_prompt_tokens:,}
 - **Session Completion Tokens**: {stats.session_completion_tokens:,}
+- **Session Cache Read Tokens**: {stats.cache_read_tokens:,}
+- **Session Cache Write Tokens**: {stats.cache_write_tokens:,}
 - **Session Total LLM Tokens**: {stats.session_total_llm_tokens:,}
 - **Last Turn Tokens**: {stats.last_turn_total_tokens:,}
 - **Context**: {stats.context_percent:.0f}% ({stats.context_tokens:,}/{stats.context_window:,} tokens)
-- **Cost**: ${stats.session_cost:.4f}
+- **Cost**: ${stats.session_cost:.6f}
 """
         await self._mount_and_scroll(UserCommandMessage(status_text))
 

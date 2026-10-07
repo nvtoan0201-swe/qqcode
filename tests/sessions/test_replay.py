@@ -100,7 +100,7 @@ def test_include_compacted_returns_raw_history() -> None:
 
 def make_agent(tmp_path: Path) -> Agent:
     model = ModelConfig(
-        name="test-model", provider="mistral", alias="test-compact", context_limit=1
+        name="test-model", provider="mistral", alias="test-compact", context_window=1
     )
     config = VibeConfig(
         session_logging=SessionLoggingConfig(

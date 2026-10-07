@@ -7,7 +7,7 @@ import pytest
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.core.agent import Agent
-from vibe.core.config import ModelConfig, SessionLoggingConfig, VibeConfig
+from vibe.core.config import ModelConfig, ModelPricing, SessionLoggingConfig, VibeConfig
 from vibe.core.sessions.entries import MessageEntry, ModelChangeEntry, UsageEntry
 from vibe.core.sessions.store import JsonlSessionStore
 from vibe.core.types import Role
@@ -17,15 +17,13 @@ MODELS = [
         name="mistral-vibe-cli-latest",
         provider="mistral",
         alias="devstral-latest",
-        input_price=0.4,
-        output_price=2.0,
+        pricing=ModelPricing(input_per_million=0.4, output_per_million=2.0),
     ),
     ModelConfig(
         name="devstral-small-latest",
         provider="mistral",
         alias="devstral-small",
-        input_price=0.1,
-        output_price=0.3,
+        pricing=ModelPricing(input_per_million=0.1, output_per_million=0.3),
     ),
 ]
 

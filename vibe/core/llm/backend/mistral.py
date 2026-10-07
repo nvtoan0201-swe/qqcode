@@ -25,6 +25,7 @@ from vibe.core.types import (
 
 if TYPE_CHECKING:
     from vibe.core.config import ModelConfig, ProviderConfig
+    from vibe.core.llm.cache import CachePlan
 
 
 class MistralMapper:
@@ -170,7 +171,14 @@ class MistralBackend:
         max_tokens: int | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
+        cache_plan: CachePlan | None = None,
     ) -> LLMChunk:
+        if not model.capabilities.tools:
+            tools = None
+            tool_choice = None
+        elif not model.capabilities.tool_choice:
+            tool_choice = None
+
         try:
             response = await self._get_client().chat.complete_async(
                 model=model.name,
@@ -242,7 +250,14 @@ class MistralBackend:
         max_tokens: int | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
+        cache_plan: CachePlan | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
+        if not model.capabilities.tools:
+            tools = None
+            tool_choice = None
+        elif not model.capabilities.tool_choice:
+            tool_choice = None
+
         try:
             async for chunk in await self._get_client().chat.stream_async(
                 model=model.name,

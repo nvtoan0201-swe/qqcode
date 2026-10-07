@@ -8,7 +8,13 @@ import pytest
 import tomli_w
 
 from vibe.core import config
-from vibe.core.config import CompactionConfig, ModelConfig, VibeConfig
+from vibe.core.config import (
+    CompactionConfig,
+    ModelCapabilities,
+    ModelConfig,
+    ModelPricing,
+    VibeConfig,
+)
 
 
 def _restore_dump_config(config_file: Path):
@@ -97,10 +103,115 @@ def test_compaction_section_is_parsed() -> None:
 
 def test_get_compaction_threshold_reserves_tokens() -> None:
     model = ModelConfig(
-        name="test-model", provider="mistral", alias="test-model", context_limit=100_000
+        name="test-model",
+        provider="mistral",
+        alias="test-model",
+        context_window=100_000,
     )
     config = VibeConfig(active_model="test-model", models=[model])
 
     assert (
         config.get_compaction_threshold() == 100_000 - config.compaction.reserve_tokens
     )
+
+
+def test_get_compaction_threshold_uses_max_output_tokens_when_larger() -> None:
+    model = ModelConfig(
+        name="test-model",
+        provider="mistral",
+        alias="test-model",
+        context_window=100_000,
+        max_output_tokens=32_000,
+    )
+    config = VibeConfig(active_model="test-model", models=[model])
+
+    assert config.get_compaction_threshold() == 100_000 - 32_000
+
+
+def test_legacy_context_limit_maps_to_context_window() -> None:
+    model = ModelConfig.model_validate({
+        "name": "test-model",
+        "provider": "mistral",
+        "alias": "test-model",
+        "context_limit": 100_000,
+    })
+
+    assert model.context_window == 100_000
+    assert model.context_limit == 100_000
+
+
+def test_legacy_prices_map_to_pricing() -> None:
+    model = ModelConfig.model_validate({
+        "name": "test-model",
+        "provider": "mistral",
+        "alias": "test-model",
+        "input_price": 0.4,
+        "output_price": 2.0,
+    })
+
+    assert model.pricing.input_per_million == 0.4
+    assert model.pricing.output_per_million == 2.0
+    assert model.input_price == 0.4
+    assert model.output_price == 2.0
+
+
+def test_legacy_price_mapping_does_not_override_pricing_fields() -> None:
+    model = ModelConfig.model_validate({
+        "name": "test-model",
+        "provider": "mistral",
+        "alias": "test-model",
+        "input_price": 9.0,
+        "output_price": 9.0,
+        "pricing": ModelPricing(input_per_million=0.4, cache_read_per_million=0.04),
+    })
+
+    assert model.pricing.input_per_million == 0.4
+    assert model.pricing.output_per_million == 9.0
+    assert model.pricing.cache_read_per_million == 0.04
+
+
+def test_new_schema_fields_are_preserved() -> None:
+    model = ModelConfig(
+        name="test-model",
+        provider="mistral",
+        alias="test-model",
+        context_window=250_000,
+        max_output_tokens=64_000,
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="long"
+        ),
+        pricing=ModelPricing(
+            input_per_million=3.0,
+            output_per_million=15.0,
+            cache_read_per_million=0.3,
+            cache_write_per_million=3.75,
+        ),
+    )
+
+    assert model.context_window == 250_000
+    assert model.max_output_tokens == 64_000
+    assert model.capabilities.prompt_cache == "long"
+    assert model.capabilities.reasoning is True
+    assert model.pricing.cache_write_per_million == 3.75
+
+
+def test_config_with_legacy_model_dicts_still_loads() -> None:
+    config = VibeConfig.model_validate({
+        "active_model": "test-model",
+        "models": [
+            {
+                "name": "test-model",
+                "provider": "mistral",
+                "alias": "test-model",
+                "context_limit": 100_000,
+                "input_price": 0.4,
+                "output_price": 2.0,
+            }
+        ],
+    })
+
+    model = config.get_active_model()
+    assert model.context_window == 100_000
+    assert config.get_context_limit_for_active_model() == 100_000
+    assert model.pricing.input_per_million == 0.4
+    assert model.pricing.output_per_million == 2.0

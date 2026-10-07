@@ -185,6 +185,9 @@ class ProviderConfig(BaseModel):
     backend: Backend = Backend.GENERIC
     oauth_token: AnthropicOAuthToken | QwenOAuthToken | None = None
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    cache_retention: Literal["default", "none", "short", "long"] = "default"
+    timeout: float | None = None
+    models_path: str | None = None
 
 
 class _MCPBase(BaseModel):
@@ -269,23 +272,88 @@ MCPServer = Annotated[
 ]
 
 
+class ThinkingLevel(StrEnum):
+    OFF = "off"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class ModelCapabilities(BaseModel):
+    tools: bool = True
+    tool_choice: bool = True
+    reasoning: bool = False
+    vision: bool = False
+    prompt_cache: Literal["none", "short", "long"] = "none"
+    parallel_tool_calls: bool = True
+
+
+class ModelPricing(BaseModel):
+    input_per_million: float = 0.0
+    output_per_million: float = 0.0
+    cache_read_per_million: float = 0.0
+    cache_write_per_million: float = 0.0
+
+
 class ModelConfig(BaseModel):
     name: str
     provider: str
     alias: str
     temperature: float = 0.2
-    input_price: float = 0.0  # Price per million input tokens
-    output_price: float = 0.0  # Price per million output tokens
-    context_limit: int = 200_000  # Context window size in tokens
+    context_window: int = 200_000
+    max_output_tokens: int | None = None
+    capabilities: ModelCapabilities = Field(default_factory=ModelCapabilities)
+    pricing: ModelPricing = Field(default_factory=ModelPricing)
+    reasoning_level: ThinkingLevel | None = None
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
-    def _default_alias_to_name(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            if "alias" not in data or data["alias"] is None:
-                data["alias"] = data.get("name")
+    def _accept_legacy_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        data = dict(data)
+        if not data.get("alias"):
+            data["alias"] = data.get("name")
+
+        if "context_window" not in data:
+            context_limit = data.get("context_limit")
+            if context_limit is not None:
+                data["context_window"] = context_limit
+
+        if "input_price" not in data and "output_price" not in data:
+            return data
+
+        existing = data.get("pricing")
+        match existing:
+            case ModelPricing():
+                pricing = existing.model_dump(exclude_unset=True)
+            case dict():
+                pricing = dict(existing)
+            case _:
+                pricing = {}
+
+        if (input_price := data.get("input_price")) is not None:
+            pricing.setdefault("input_per_million", input_price)
+        if (output_price := data.get("output_price")) is not None:
+            pricing.setdefault("output_per_million", output_price)
+
+        data["pricing"] = pricing
         return data
+
+    @property
+    def context_limit(self) -> int:
+        return self.context_window
+
+    @property
+    def input_price(self) -> float:
+        return self.pricing.input_per_million
+
+    @property
+    def output_price(self) -> float:
+        return self.pricing.output_per_million
 
 
 DEFAULT_PROVIDERS = [
@@ -338,57 +406,64 @@ DEFAULT_MODELS = [
         name="mistral-vibe-cli-latest",
         provider="mistral",
         alias="devstral-2",
-        input_price=0.4,
-        output_price=2.0,
+        pricing=ModelPricing(input_per_million=0.4, output_per_million=2.0),
     ),
     ModelConfig(
         name="devstral-small-latest",
         provider="mistral",
         alias="devstral-small",
-        input_price=0.1,
-        output_price=0.3,
+        pricing=ModelPricing(input_per_million=0.1, output_per_million=0.3),
     ),
-    ModelConfig(
-        name="devstral",
-        provider="llamacpp",
-        alias="local",
-        input_price=0.0,
-        output_price=0.0,
-    ),
+    ModelConfig(name="devstral", provider="llamacpp", alias="local"),
     # OpenRouter GPT-5.2 models with reasoning effort levels
     ModelConfig(
         name="openai/gpt-5.2",
         provider="openrouter",
         alias="openrouter/gpt-5.2",
-        context_limit=400_000,
+        context_window=400_000,
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
         extra_body={"reasoning": {"effort": "none"}},
     ),
     ModelConfig(
         name="openai/gpt-5.2",
         provider="openrouter",
         alias="openrouter/gpt-5.2:low",
-        context_limit=400_000,
+        context_window=400_000,
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
         extra_body={"reasoning": {"effort": "low"}},
     ),
     ModelConfig(
         name="openai/gpt-5.2",
         provider="openrouter",
         alias="openrouter/gpt-5.2:medium",
-        context_limit=400_000,
+        context_window=400_000,
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
         extra_body={"reasoning": {"effort": "medium"}},
     ),
     ModelConfig(
         name="openai/gpt-5.2",
         provider="openrouter",
         alias="openrouter/gpt-5.2:high",
-        context_limit=400_000,
+        context_window=400_000,
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
         extra_body={"reasoning": {"effort": "high"}},
     ),
     ModelConfig(
         name="openai/gpt-5.2",
         provider="openrouter",
         alias="openrouter/gpt-5.2:xhigh",
-        context_limit=400_000,
+        context_window=400_000,
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
         extra_body={"reasoning": {"effort": "xhigh"}},
     ),
     # Anthropic Claude models (via Claude Max subscription OAuth)
@@ -396,38 +471,75 @@ DEFAULT_MODELS = [
         name="claude-sonnet-4-5-20250929",
         provider="anthropic",
         alias="claude-sonnet-4.5",
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
     ),
     ModelConfig(
         name="claude-sonnet-4-5-20250929",
         provider="anthropic",
         alias="claude-sonnet-4.5:thinking",
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
         extra_body={"thinking": {"type": "enabled", "budget_tokens": 2000}},
     ),
     ModelConfig(
-        name="claude-haiku-4-5-20251001", provider="anthropic", alias="claude-haiku-4.5"
+        name="claude-haiku-4-5-20251001",
+        provider="anthropic",
+        alias="claude-haiku-4.5",
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
     ),
     ModelConfig(
         name="claude-haiku-4-5-20251001",
         provider="anthropic",
         alias="claude-haiku-4.5:thinking",
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
         extra_body={"thinking": {"type": "enabled", "budget_tokens": 2000}},
     ),
     ModelConfig(
-        name="claude-opus-4-5-20251101", provider="anthropic", alias="claude-opus-4.5"
+        name="claude-opus-4-5-20251101",
+        provider="anthropic",
+        alias="claude-opus-4.5",
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
     ),
     ModelConfig(
         name="claude-opus-4-5-20251101",
         provider="anthropic",
         alias="claude-opus-4.5:thinking",
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
         extra_body={"thinking": {"type": "enabled", "budget_tokens": 2000}},
     ),
     # Z.ai GLM models (thinking enabled by default)
-    ModelConfig(name="glm-4.6", provider="zai", alias="zai/glm-4.6"),
+    ModelConfig(
+        name="glm-4.6",
+        provider="zai",
+        alias="zai/glm-4.6",
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
     ModelConfig(name="glm-4.5", provider="zai", alias="zai/glm-4.5"),
     ModelConfig(name="glm-4.5-air", provider="zai", alias="zai/glm-4.5-air"),
     # Qwen models (via Qwen OAuth or DashScope API key)
-    ModelConfig(name="qwen3-coder-plus", provider="qwen", alias="qwen-coder-plus"),
-    ModelConfig(name="qwen3-coder-flash", provider="qwen", alias="qwen-coder-flash"),
+    ModelConfig(
+        name="qwen3-coder-plus",
+        provider="qwen",
+        alias="qwen-coder-plus",
+        capabilities=ModelCapabilities(prompt_cache="short"),
+    ),
+    ModelConfig(
+        name="qwen3-coder-flash",
+        provider="qwen",
+        alias="qwen-coder-flash",
+        capabilities=ModelCapabilities(prompt_cache="short"),
+    ),
     # XiaomiMimo models
     # Note: thinking variant removed - MiMo returns tool calls as XML in reasoning content
     # which isn't compatible with our structured tool call handling
@@ -435,9 +547,8 @@ DEFAULT_MODELS = [
         name="mimo-v2-flash",
         provider="xiaomimimo",
         alias="mimo-v2-flash",
-        input_price=0.1,
-        output_price=0.3,
-        context_limit=256_000,
+        context_window=256_000,
+        pricing=ModelPricing(input_per_million=0.1, output_per_million=0.3),
     ),
 ]
 
@@ -545,7 +656,7 @@ class VibeConfig(BaseSettings):
         Falls back to auto_compact_threshold if the active model is not found.
         """
         try:
-            return self.get_active_model().context_limit
+            return self.get_active_model().context_window
         except ValueError:
             return self.auto_compact_threshold
 
@@ -554,14 +665,19 @@ class VibeConfig(BaseSettings):
 
         Reserves room for the next response and system prompt on top of the
         model context window, with a ratio fallback when the window is unknown.
+        The reserve grows to the model's max output tokens when those are larger.
         """
         try:
-            context_window = self.get_active_model().context_limit
+            active_model = self.get_active_model()
         except ValueError:
             return max(
                 1, int(self.auto_compact_threshold * self.compaction.threshold_ratio)
             )
-        return max(1, context_window - self.compaction.reserve_tokens)
+
+        reserve = self.compaction.reserve_tokens
+        if active_model.max_output_tokens is not None:
+            reserve = max(reserve, active_model.max_output_tokens)
+        return max(1, active_model.context_window - reserve)
 
     def get_provider_for_model(self, model: ModelConfig) -> ProviderConfig:
         for provider in self.providers:
@@ -613,12 +729,12 @@ class VibeConfig(BaseSettings):
         # Build a lookup of default models by alias
         default_by_alias = {m.alias: m for m in DEFAULT_MODELS}
 
-        # Update existing user models with context_limit from defaults if not explicitly set
+        # Update existing user models with context_window from defaults if not explicitly set
         for model in self.models:
             if default_model := default_by_alias.get(model.alias):
-                # If user model has default context_limit, use the one from DEFAULT_MODELS
-                if model.context_limit == 200_000:  # noqa: PLR2004
-                    model.context_limit = default_model.context_limit
+                # If user model has default context_window, use the one from DEFAULT_MODELS
+                if model.context_window == 200_000:  # noqa: PLR2004
+                    model.context_window = default_model.context_window
 
         # Get aliases from user-configured models
         user_aliases = {m.alias for m in self.models}
@@ -860,7 +976,25 @@ class VibeConfig(BaseSettings):
         cls._migrate()
         agent_config = cls._get_agent_config(agent)
         init_data = {**(agent_config or {}), **overrides}
-        return cls(**init_data)
+        config = cls(**init_data)
+
+        from vibe.core.models_overlay import (
+            default_overlay_paths,
+            load_model_overlay,
+            merge_model_overlays,
+        )
+
+        overlay_paths = default_overlay_paths()
+        overlay_paths.extend(
+            Path(provider.models_path).expanduser()
+            for provider in config.providers
+            if provider.models_path
+            and not provider.models_path.startswith(("http://", "https://"))
+        )
+        if overlay_models := load_model_overlay(overlay_paths):
+            config.models = merge_model_overlays(config.models, overlay_models)
+
+        return config
 
     @classmethod
     def create_default(cls) -> dict[str, Any]:

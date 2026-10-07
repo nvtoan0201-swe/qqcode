@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, TypeVar
 
 import httpx
 
+from vibe.core.llm.cache import CachePlan
 from vibe.core.llm.exceptions import BackendErrorBuilder
 from vibe.core.types import (
     AvailableTool,
@@ -45,6 +46,7 @@ class APIAdapter(Protocol):
         provider: ProviderConfig,
         api_key: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        cache_plan: CachePlan | None = None,
     ) -> PreparedRequest: ...
 
     def parse_response(self, data: dict[str, Any]) -> LLMChunk: ...
@@ -177,11 +179,12 @@ class OpenAIAdapter(APIAdapter):
         provider: ProviderConfig,
         api_key: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        cache_plan: CachePlan | None = None,
     ) -> PreparedRequest:
         converted_messages = [msg.model_dump(exclude_none=True) for msg in messages]
 
         # Enable explicit cache control for providers that support it (e.g., Qwen)
-        if provider.name == "qwen":
+        if provider.name == "qwen" and not (cache_plan and not cache_plan.enabled):
             converted_messages = self.add_cache_control_to_messages(converted_messages)
 
         payload = self.build_payload(
@@ -193,6 +196,13 @@ class OpenAIAdapter(APIAdapter):
             tool_choice,
             extra_body,
         )
+
+        if cache_plan and cache_plan.enabled:
+            extra = extra_body or {}
+            if "prompt_cache_key" not in extra and cache_plan.session_key:
+                payload["prompt_cache_key"] = cache_plan.session_key
+            if "prompt_cache_retention" not in extra and cache_plan.ttl == "1h":
+                payload["prompt_cache_retention"] = "24h"
 
         if enable_streaming:
             payload["stream"] = True
@@ -226,9 +236,25 @@ class OpenAIAdapter(APIAdapter):
             finish_reason = None
 
         usage_data = data.get("usage") or {}
+        prompt_details = usage_data.get("prompt_tokens_details") or {}
+        cache_read_tokens = (
+            prompt_details.get("cached_tokens")
+            or usage_data.get("cache_read_input_tokens")
+            or 0
+        )
+        cache_write_tokens = usage_data.get("cache_creation_input_tokens") or 0
+        if (prompt_tokens := usage_data.get("prompt_tokens")) is None:
+            prompt_tokens = (
+                usage_data.get("input_tokens", 0)
+                + cache_read_tokens
+                + cache_write_tokens
+            )
         usage = LLMUsage(
-            prompt_tokens=usage_data.get("prompt_tokens", 0),
-            completion_tokens=usage_data.get("completion_tokens", 0),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=usage_data.get("completion_tokens")
+            or usage_data.get("output_tokens", 0),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
 
         return LLMChunk(message=message, usage=usage, finish_reason=finish_reason)
@@ -240,6 +266,36 @@ class AnthropicAdapter(APIAdapter):
 
     endpoint: ClassVar[str] = "/messages"
 
+    @staticmethod
+    def _cache_control(ttl: str | None) -> dict[str, str]:
+        control = {"type": "ephemeral"}
+        if ttl == "1h":
+            control["ttl"] = "1h"
+        return control
+
+    def _apply_cache_control(self, payload: dict[str, Any], ttl: str | None) -> None:
+        cache_control = self._cache_control(ttl)
+        system = payload.get("system")
+        if system:
+            system[-1] = {**system[-1], "cache_control": cache_control}
+
+        messages = payload.get("messages") or []
+        if len(messages) <= 1:
+            return
+        target = messages[-2]
+        content = target.get("content")
+        if not isinstance(content, list):
+            return
+        for index in range(len(content) - 1, -1, -1):
+            block = content[index]
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") not in {"text", "tool_result"}:
+                continue
+            content[index] = {**block, "cache_control": cache_control}
+            messages[-2] = {**target, "content": content}
+            return
+
     def build_payload(
         self,
         model_name: str,
@@ -249,6 +305,7 @@ class AnthropicAdapter(APIAdapter):
         max_tokens: int | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_body: dict[str, Any] | None = None,
+        cache_plan: CachePlan | None = None,
     ) -> dict[str, Any]:
         # Convert OpenAI-style messages to Anthropic format
         system_content = ""
@@ -308,7 +365,9 @@ class AnthropicAdapter(APIAdapter):
                         last_content.append(tool_result)
                     else:
                         anthropic_messages[-1]["content"] = [
-                            {"type": "text", "text": last_content} if last_content else None,
+                            {"type": "text", "text": last_content}
+                            if last_content
+                            else None,
                             tool_result,
                         ]
                         anthropic_messages[-1]["content"] = [
@@ -350,6 +409,8 @@ class AnthropicAdapter(APIAdapter):
                     "name": tool_choice.function.name,
                 }
 
+        if cache_plan and cache_plan.enabled:
+            self._apply_cache_control(payload, cache_plan.ttl)
         if extra_body:
             payload.update(extra_body)
 
@@ -392,6 +453,7 @@ class AnthropicAdapter(APIAdapter):
         provider: ProviderConfig,
         api_key: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        cache_plan: CachePlan | None = None,
     ) -> PreparedRequest:
         # Check if OAuth is being used - need to inject Claude Code prefix
         is_oauth = provider.oauth_token is not None
@@ -418,6 +480,7 @@ class AnthropicAdapter(APIAdapter):
             max_tokens,
             tool_choice,
             extra_body,
+            cache_plan,
         )
 
         if enable_streaming:
@@ -492,15 +555,21 @@ class AnthropicAdapter(APIAdapter):
         )
 
         usage_data = data.get("usage", {})
+        cache_read_tokens = usage_data.get("cache_read_input_tokens") or 0
+        cache_write_tokens = usage_data.get("cache_creation_input_tokens") or 0
         usage = LLMUsage(
-            prompt_tokens=usage_data.get("input_tokens", 0),
+            prompt_tokens=(
+                usage_data.get("input_tokens", 0)
+                + cache_read_tokens
+                + cache_write_tokens
+            ),
             completion_tokens=usage_data.get("output_tokens", 0),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
         )
 
         return LLMChunk(
-            message=message,
-            usage=usage,
-            finish_reason=data.get("stop_reason"),
+            message=message, usage=usage, finish_reason=data.get("stop_reason")
         )
 
 
@@ -566,7 +635,10 @@ class GenericBackend:
             if self._provider.oauth_token.is_expired():
                 await self._refresh_oauth_token()
 
-            if self._provider.oauth_token and not self._provider.oauth_token.is_expired():
+            if (
+                self._provider.oauth_token
+                and not self._provider.oauth_token.is_expired()
+            ):
                 # OAuth token is valid - use Bearer auth
                 api_key = self._provider.oauth_token.access_token
                 # Add provider-specific OAuth headers
@@ -575,7 +647,9 @@ class GenericBackend:
                     extra_headers["anthropic-beta"] = "oauth-2025-04-20"
                 # Qwen OAuth: use resource_url as API base if available
                 elif self._provider.name == "qwen":
-                    resource_url = getattr(self._provider.oauth_token, "resource_url", None)
+                    resource_url = getattr(
+                        self._provider.oauth_token, "resource_url", None
+                    )
                     if resource_url:
                         # Ensure URL has https:// prefix and /v1 suffix
                         if not resource_url.startswith("http"):
@@ -604,9 +678,7 @@ class GenericBackend:
             if self._provider.name == "qwen":
                 from vibe.core.oauth.qwen import refresh_token as qwen_refresh
 
-                new_token = await qwen_refresh(
-                    self._provider.oauth_token.refresh_token
-                )
+                new_token = await qwen_refresh(self._provider.oauth_token.refresh_token)
             else:
                 from vibe.core.oauth.claude import refresh_token
 
@@ -631,6 +703,7 @@ class GenericBackend:
         max_tokens: int | None = None,
         tool_choice: StrToolChoice | AvailableTool | None = None,
         extra_headers: dict[str, str] | None = None,
+        cache_plan: CachePlan | None = None,
     ) -> LLMChunk:
         api_key, oauth_headers, api_base_override = await self._get_auth_info()
 
@@ -638,6 +711,11 @@ class GenericBackend:
         adapter = BACKEND_ADAPTERS[api_style]
 
         extra_body = getattr(model, "extra_body", None) or None
+        if not model.capabilities.tools:
+            tools = None
+            tool_choice = None
+        elif not model.capabilities.tool_choice:
+            tool_choice = None
 
         endpoint, headers, body = adapter.prepare_request(
             model_name=model.name,
@@ -650,6 +728,7 @@ class GenericBackend:
             provider=self._provider,
             api_key=api_key,
             extra_body=extra_body,
+            cache_plan=cache_plan,
         )
 
         # Apply OAuth headers first, then extra_headers can override
@@ -698,6 +777,7 @@ class GenericBackend:
         max_tokens: int | None = None,
         tool_choice: StrToolChoice | AvailableTool | None = None,
         extra_headers: dict[str, str] | None = None,
+        cache_plan: CachePlan | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
         api_key, oauth_headers, api_base_override = await self._get_auth_info()
 
@@ -705,6 +785,11 @@ class GenericBackend:
         adapter = BACKEND_ADAPTERS[api_style]
 
         extra_body = getattr(model, "extra_body", None) or None
+        if not model.capabilities.tools:
+            tools = None
+            tool_choice = None
+        elif not model.capabilities.tool_choice:
+            tool_choice = None
 
         endpoint, headers, body = adapter.prepare_request(
             model_name=model.name,
@@ -717,6 +802,7 @@ class GenericBackend:
             provider=self._provider,
             api_key=api_key,
             extra_body=extra_body,
+            cache_plan=cache_plan,
         )
 
         # Apply OAuth headers first, then extra_headers can override

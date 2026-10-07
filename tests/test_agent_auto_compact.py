@@ -34,7 +34,7 @@ async def test_auto_compact_triggers_and_keeps_recent_window() -> None:
     ])
     # Create a model with a low context_limit to trigger compaction
     test_model = ModelConfig(
-        name="test-model", provider="mistral", alias="test-compact", context_limit=1
+        name="test-model", provider="mistral", alias="test-compact", context_window=1
     )
     cfg = VibeConfig(
         session_logging=SessionLoggingConfig(enabled=False),

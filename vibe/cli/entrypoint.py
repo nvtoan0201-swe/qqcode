@@ -5,8 +5,10 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Any
 
 from rich import print as rprint
+from rich.table import Table
 
 from vibe.cli.textual_ui.app import run_textual_ui
 from vibe.core.config import (
@@ -15,10 +17,12 @@ from vibe.core.config import (
     INSTRUCTIONS_FILE,
     MissingAPIKeyError,
     MissingPromptFileError,
+    ModelConfig,
     VibeConfig,
     load_api_keys_from_env,
 )
 from vibe.core.interaction_logger import InteractionLogger
+from vibe.core.models_overlay import validate_models
 from vibe.core.programmatic import run_programmatic
 from vibe.core.sessions.migrate import migrate_directory
 from vibe.core.sessions.store import JsonlSessionStore
@@ -30,7 +34,10 @@ from vibe.setup.onboarding import run_onboarding
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the QQcode interactive CLI",
-        epilog="Use 'qqcode sessions [list|repair|migrate]' to manage saved sessions.",
+        epilog=(
+            "Use 'qqcode sessions [list|repair|migrate]' to manage saved sessions "
+            "or 'qqcode models [list|validate]' to inspect the model catalog."
+        ),
     )
     parser.add_argument(
         "initial_prompt",
@@ -273,10 +280,87 @@ def run_sessions_command(argv: list[str]) -> int:
     return 1
 
 
+def _build_models_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="qqcode models", description="Inspect the model catalog"
+    )
+    subparsers = parser.add_subparsers(dest="models_command", required=True)
+    list_parser = subparsers.add_parser("list", help="List available models")
+    list_parser.add_argument(
+        "--json", action="store_true", help="Output the catalog as JSON"
+    )
+    subparsers.add_parser(
+        "validate", help="Validate model aliases, capabilities and providers"
+    )
+    return parser
+
+
+def _model_catalog_entry(model: ModelConfig) -> dict[str, Any]:
+    return {
+        "alias": model.alias,
+        "name": model.name,
+        "provider": model.provider,
+        "context_limit": model.context_window,
+        "context_window": model.context_window,
+        "max_output_tokens": model.max_output_tokens,
+        "input_price": model.pricing.input_per_million,
+        "output_price": model.pricing.output_per_million,
+        "capabilities": model.capabilities.model_dump(),
+        "pricing": model.pricing.model_dump(),
+        "extra_body": model.extra_body,
+    }
+
+
+def run_models_command(argv: list[str]) -> int:
+    args = _build_models_parser().parse_args(argv)
+    config = load_config_or_exit()
+
+    match args.models_command:
+        case "list":
+            if args.json:
+                print(
+                    json.dumps({
+                        "current_model": config.active_model,
+                        "models": [
+                            _model_catalog_entry(model) for model in config.models
+                        ],
+                    })
+                )
+                return 0
+
+            table = Table(title="Model catalog")
+            table.add_column("alias")
+            table.add_column("provider")
+            table.add_column("context")
+            table.add_column("pricing (in/out)")
+            for model in config.models:
+                table.add_row(
+                    model.alias,
+                    model.provider,
+                    f"{model.context_window:,}",
+                    f"{model.pricing.input_per_million}/"
+                    f"{model.pricing.output_per_million}",
+                )
+            rprint(table)
+            return 0
+        case "validate":
+            errors = validate_models(config.models, config.providers)
+            for error in errors:
+                print(error, file=sys.stderr)
+            if errors:
+                return 1
+            print(f"Validated {len(config.models)} models: OK")
+            return 0
+
+    return 1
+
+
 def main() -> None:  # noqa: PLR0912, PLR0915
     load_api_keys_from_env()
     if sys.argv[1:2] == ["sessions"]:
         sys.exit(run_sessions_command(sys.argv[2:]))
+    if sys.argv[1:2] == ["models"]:
+        sys.exit(run_models_command(sys.argv[2:]))
     args = parse_arguments()
 
     if args.setup:
@@ -382,18 +466,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         if args.list_models:
             result = {
                 "current_model": config.active_model,
-                "models": [
-                    {
-                        "alias": model.alias,
-                        "name": model.name,
-                        "provider": model.provider,
-                        "context_limit": model.context_limit,
-                        "input_price": model.input_price,
-                        "output_price": model.output_price,
-                        "extra_body": model.extra_body,
-                    }
-                    for model in config.models
-                ],
+                "models": [_model_catalog_entry(model) for model in config.models],
             }
             print(json.dumps(result))
             sys.exit(0)

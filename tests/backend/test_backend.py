@@ -12,6 +12,8 @@ the tests will be. Always prefer real API data over manually constructed example
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -35,13 +37,21 @@ from tests.backend.data.zai import (
     STREAMED_TOOL_CONVERSATION_PARAMS as ZAI_STREAMED_TOOL_CONVERSATION_PARAMS,
     TOOL_CONVERSATION_PARAMS as ZAI_TOOL_CONVERSATION_PARAMS,
 )
-from vibe.core.config import Backend, ModelConfig, ProviderConfig
+from vibe.core.config import Backend, ModelCapabilities, ModelConfig, ProviderConfig
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.backend.generic import GenericBackend
 from vibe.core.llm.backend.mistral import MistralBackend
+from vibe.core.llm.cache import build_cache_plan
 from vibe.core.llm.exceptions import BackendError
 from vibe.core.llm.types import BackendLike
-from vibe.core.types import LLMChunk, LLMMessage, Role, ToolCall
+from vibe.core.types import (
+    AvailableFunction,
+    AvailableTool,
+    LLMChunk,
+    LLMMessage,
+    Role,
+    ToolCall,
+)
 from vibe.core.utils import get_user_agent
 
 
@@ -361,3 +371,154 @@ class TestBackend:
                 pass
 
             assert mock_api.calls.last.request.headers["user-agent"] == user_agent
+
+    @pytest.mark.asyncio
+    async def test_tools_disabled_by_capabilities_are_not_sent(self) -> None:
+        base_url = "https://api.example.com"
+        json_response = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "Hey"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        tools = [
+            AvailableTool(
+                function=AvailableFunction(
+                    name="some_tool",
+                    description="A tool",
+                    parameters={"type": "object", "properties": {}},
+                )
+            )
+        ]
+
+        with respx.mock(base_url=base_url) as mock_api:
+            route = mock_api.post("/v1/chat/completions").mock(
+                return_value=httpx.Response(status_code=200, json=json_response)
+            )
+            provider = ProviderConfig(
+                name="provider_name",
+                api_base=f"{base_url}/v1",
+                api_key_env_var="API_KEY",
+            )
+            backend = GenericBackend(provider=provider)
+            model = ModelConfig(
+                name="model_name",
+                provider="provider_name",
+                alias="model_alias",
+                capabilities=ModelCapabilities(tools=False),
+            )
+
+            await backend.complete(
+                model=model,
+                messages=[LLMMessage(role=Role.user, content="Just say hi")],
+                temperature=0.2,
+                tools=tools,
+                max_tokens=None,
+                tool_choice="auto",
+                extra_headers=None,
+            )
+
+            body = json.loads(route.calls.last.request.content)
+            assert "tools" not in body
+            assert "tool_choice" not in body
+
+    @pytest.mark.asyncio
+    async def test_tool_choice_disabled_by_capabilities_is_not_sent(self) -> None:
+        base_url = "https://api.example.com"
+        json_response = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "Hey"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        tools = [
+            AvailableTool(
+                function=AvailableFunction(
+                    name="some_tool",
+                    description="A tool",
+                    parameters={"type": "object", "properties": {}},
+                )
+            )
+        ]
+
+        with respx.mock(base_url=base_url) as mock_api:
+            route = mock_api.post("/v1/chat/completions").mock(
+                return_value=httpx.Response(status_code=200, json=json_response)
+            )
+            provider = ProviderConfig(
+                name="provider_name",
+                api_base=f"{base_url}/v1",
+                api_key_env_var="API_KEY",
+            )
+            backend = GenericBackend(provider=provider)
+            model = ModelConfig(
+                name="model_name",
+                provider="provider_name",
+                alias="model_alias",
+                capabilities=ModelCapabilities(tool_choice=False),
+            )
+
+            await backend.complete(
+                model=model,
+                messages=[LLMMessage(role=Role.user, content="Just say hi")],
+                temperature=0.2,
+                tools=tools,
+                max_tokens=None,
+                tool_choice="auto",
+                extra_headers=None,
+            )
+
+            body = json.loads(route.calls.last.request.content)
+            assert "tools" in body
+            assert "tool_choice" not in body
+
+    @pytest.mark.asyncio
+    async def test_cache_plan_adds_prompt_cache_key(self) -> None:
+        base_url = "https://api.example.com"
+        json_response = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "Hey"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        provider = ProviderConfig(
+            name="provider_name",
+            api_base=f"{base_url}/v1",
+            api_key_env_var="API_KEY",
+            cache_retention="short",
+        )
+        model = ModelConfig(
+            name="model_name",
+            provider="provider_name",
+            alias="model_alias",
+            capabilities=ModelCapabilities(prompt_cache="short"),
+        )
+
+        with respx.mock(base_url=base_url) as mock_api:
+            route = mock_api.post("/v1/chat/completions").mock(
+                return_value=httpx.Response(status_code=200, json=json_response)
+            )
+            backend = GenericBackend(provider=provider)
+
+            await backend.complete(
+                model=model,
+                messages=[LLMMessage(role=Role.user, content="Just say hi")],
+                temperature=0.2,
+                tools=None,
+                max_tokens=None,
+                tool_choice=None,
+                extra_headers=None,
+                cache_plan=build_cache_plan(provider, model, "s" * 70),
+            )
+
+            body = json.loads(route.calls.last.request.content)
+            assert body["prompt_cache_key"] == "s" * 64

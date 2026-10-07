@@ -22,7 +22,7 @@ RECENT_ASSISTANT = "recent answer " * 20
 
 def make_agent(backend: FakeBackend, *, keep_recent_tokens: int = 150) -> Agent:
     model = ModelConfig(
-        name="test-model", provider="mistral", alias="test-compact", context_limit=1
+        name="test-model", provider="mistral", alias="test-compact", context_window=1
     )
     config = VibeConfig(
         session_logging=SessionLoggingConfig(enabled=False),

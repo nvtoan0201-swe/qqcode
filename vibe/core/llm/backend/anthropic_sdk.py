@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import anthropic
 import httpx
 
+from vibe.core.llm.cache import CachePlan
 from vibe.core.llm.exceptions import BackendErrorBuilder
 from vibe.core.types import (
     AvailableTool,
@@ -97,10 +98,7 @@ class AnthropicMapper:
                                 "name": tc.function.name or "",
                                 "input": input_data,
                             })
-                    anthropic_messages.append({
-                        "role": "assistant",
-                        "content": content,
-                    })
+                    anthropic_messages.append({"role": "assistant", "content": content})
                 else:
                     anthropic_messages.append({
                         "role": "assistant",
@@ -120,7 +118,9 @@ class AnthropicMapper:
                         last_content.append(tool_result)  # type: ignore[arg-type]
                     else:
                         anthropic_messages[-1]["content"] = [  # type: ignore[typeddict-item]
-                            {"type": "text", "text": last_content} if last_content else {"type": "text", "text": ""},
+                            {"type": "text", "text": last_content}
+                            if last_content
+                            else {"type": "text", "text": ""},
                             tool_result,
                         ]
                 else:
@@ -131,8 +131,15 @@ class AnthropicMapper:
 
         return system_parts, anthropic_messages
 
+    @staticmethod
+    def _cache_control(ttl: str | None) -> anthropic.types.CacheControlEphemeralParam:
+        control: anthropic.types.CacheControlEphemeralParam = {"type": "ephemeral"}
+        if ttl == "1h":
+            control["ttl"] = "1h"
+        return control
+
     def add_cache_control_to_messages(
-        self, messages: list[anthropic.types.MessageParam]
+        self, messages: list[anthropic.types.MessageParam], ttl: str | None = None
     ) -> list[anthropic.types.MessageParam]:
         """Add cache_control to the last content block of the second-to-last message.
 
@@ -165,7 +172,7 @@ class AnthropicMapper:
                     {
                         "type": "text",
                         "text": content,
-                        "cache_control": {"type": "ephemeral"},
+                        "cache_control": self._cache_control(ttl),
                     }
                 ],
             }
@@ -182,28 +189,28 @@ class AnthropicMapper:
 
                 if block_type == "tool_result":
                     # tool_result supports cache_control
-                    block["cache_control"] = {"type": "ephemeral"}
+                    block["cache_control"] = self._cache_control(ttl)
                     content[i] = block  # type: ignore[call-overload]
                     cache_added = True
                     break
                 elif block_type == "text" and block.get("text"):
                     # Non-empty text block supports cache_control
-                    block["cache_control"] = {"type": "ephemeral"}
+                    block["cache_control"] = self._cache_control(ttl)
                     content[i] = block  # type: ignore[call-overload]
                     cache_added = True
                     break
                 # Skip tool_use, thinking, and empty text blocks
 
             if cache_added:
-                messages[target_idx] = {
-                    "role": target_msg["role"],
-                    "content": content,
-                }
+                messages[target_idx] = {"role": target_msg["role"], "content": content}
 
         return messages
 
     def prepare_system_blocks(
-        self, system_parts: list[str], enable_caching: bool = False
+        self,
+        system_parts: list[str],
+        enable_caching: bool = False,
+        ttl: str | None = None,
     ) -> list[anthropic.types.TextBlockParam]:
         """Convert system parts to text blocks for the system field.
 
@@ -215,7 +222,7 @@ class AnthropicMapper:
             block: anthropic.types.TextBlockParam = {"type": "text", "text": part}
             # Add cache control to the last system block
             if enable_caching and i == len(system_parts) - 1:
-                block["cache_control"] = {"type": "ephemeral"}  # type: ignore[typeddict-item]
+                block["cache_control"] = self._cache_control(ttl)  # type: ignore[typeddict-item]
             blocks.append(block)
         return blocks
 
@@ -259,16 +266,13 @@ class AnthropicMapper:
                     ToolCall(
                         id=block.id,
                         function=FunctionCall(
-                            name=block.name,
-                            arguments=json.dumps(block.input),
+                            name=block.name, arguments=json.dumps(block.input)
                         ),
                     )
                 )
         return tool_calls
 
-    def parse_text_content(
-        self, content: list[anthropic.types.ContentBlock]
-    ) -> str:
+    def parse_text_content(self, content: list[anthropic.types.ContentBlock]) -> str:
         """Extract text content from content blocks."""
         text_parts = []
         for block in content:
@@ -380,8 +384,17 @@ class AnthropicBackend:
         max_tokens: int | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
+        cache_plan: CachePlan | None = None,
     ) -> LLMChunk:
         await self._ensure_fresh_token()
+
+        if not model.capabilities.tools:
+            tools = None
+            tool_choice = None
+        elif not model.capabilities.tool_choice:
+            tool_choice = None
+
+        plan = cache_plan if cache_plan is not None else CachePlan(enabled=True)
 
         try:
             system_parts, anthropic_messages = self._mapper.prepare_messages(
@@ -389,9 +402,10 @@ class AnthropicBackend:
             )
 
             # Enable prompt caching for system prompt and conversation history
-            anthropic_messages = self._mapper.add_cache_control_to_messages(
-                anthropic_messages
-            )
+            if plan.enabled:
+                anthropic_messages = self._mapper.add_cache_control_to_messages(
+                    anthropic_messages, ttl=plan.ttl
+                )
 
             kwargs: dict = {
                 "model": model.name,
@@ -401,7 +415,7 @@ class AnthropicBackend:
 
             if system_parts:
                 kwargs["system"] = self._mapper.prepare_system_blocks(
-                    system_parts, enable_caching=True
+                    system_parts, enable_caching=plan.enabled, ttl=plan.ttl
                 )
             if temperature > 0:
                 kwargs["temperature"] = temperature
@@ -441,6 +455,8 @@ class AnthropicBackend:
 
             text_content = self._mapper.parse_text_content(response.content)
             tool_calls = self._mapper.parse_tool_calls(response.content)
+            cache_read_tokens = response.usage.cache_read_input_tokens or 0
+            cache_write_tokens = response.usage.cache_creation_input_tokens or 0
 
             return LLMChunk(
                 message=LLMMessage(
@@ -449,8 +465,14 @@ class AnthropicBackend:
                     tool_calls=tool_calls if tool_calls else None,
                 ),
                 usage=LLMUsage(
-                    prompt_tokens=response.usage.input_tokens,
+                    prompt_tokens=(
+                        response.usage.input_tokens
+                        + cache_read_tokens
+                        + cache_write_tokens
+                    ),
                     completion_tokens=response.usage.output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
                 ),
                 finish_reason=response.stop_reason,
             )
@@ -489,8 +511,17 @@ class AnthropicBackend:
         max_tokens: int | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
+        cache_plan: CachePlan | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
         await self._ensure_fresh_token()
+
+        if not model.capabilities.tools:
+            tools = None
+            tool_choice = None
+        elif not model.capabilities.tool_choice:
+            tool_choice = None
+
+        plan = cache_plan if cache_plan is not None else CachePlan(enabled=True)
 
         try:
             system_parts, anthropic_messages = self._mapper.prepare_messages(
@@ -498,9 +529,10 @@ class AnthropicBackend:
             )
 
             # Enable prompt caching for system prompt and conversation history
-            anthropic_messages = self._mapper.add_cache_control_to_messages(
-                anthropic_messages
-            )
+            if plan.enabled:
+                anthropic_messages = self._mapper.add_cache_control_to_messages(
+                    anthropic_messages, ttl=plan.ttl
+                )
 
             kwargs: dict = {
                 "model": model.name,
@@ -510,7 +542,7 @@ class AnthropicBackend:
 
             if system_parts:
                 kwargs["system"] = self._mapper.prepare_system_blocks(
-                    system_parts, enable_caching=True
+                    system_parts, enable_caching=plan.enabled, ttl=plan.ttl
                 )
             if temperature > 0:
                 kwargs["temperature"] = temperature
@@ -546,6 +578,8 @@ class AnthropicBackend:
             current_tool_calls: dict[int, dict] = {}
             total_input_tokens = 0
             total_output_tokens = 0
+            total_cache_read_tokens = 0
+            total_cache_write_tokens = 0
 
             async with self._get_client().messages.stream(
                 **kwargs,
@@ -555,6 +589,12 @@ class AnthropicBackend:
                     if event.type == "message_start":
                         if event.message.usage:
                             total_input_tokens = event.message.usage.input_tokens
+                            total_cache_read_tokens = (
+                                event.message.usage.cache_read_input_tokens or 0
+                            )
+                            total_cache_write_tokens = (
+                                event.message.usage.cache_creation_input_tokens or 0
+                            )
                     elif event.type == "content_block_start":
                         if event.content_block.type == "tool_use":
                             current_tool_calls[event.index] = {
@@ -566,13 +606,9 @@ class AnthropicBackend:
                         if event.delta.type == "text_delta":
                             yield LLMChunk(
                                 message=LLMMessage(
-                                    role=Role.assistant,
-                                    content=event.delta.text,
+                                    role=Role.assistant, content=event.delta.text
                                 ),
-                                usage=LLMUsage(
-                                    prompt_tokens=0,
-                                    completion_tokens=0,
-                                ),
+                                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
                                 finish_reason=None,
                             )
                         elif event.delta.type == "thinking_delta":
@@ -582,10 +618,7 @@ class AnthropicBackend:
                                     role=Role.assistant,
                                     reasoning_content=event.delta.thinking,
                                 ),
-                                usage=LLMUsage(
-                                    prompt_tokens=0,
-                                    completion_tokens=0,
-                                ),
+                                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
                                 finish_reason=None,
                             )
                         elif event.delta.type == "signature_delta":
@@ -595,15 +628,14 @@ class AnthropicBackend:
                                     role=Role.assistant,
                                     thinking_signature=event.delta.signature,
                                 ),
-                                usage=LLMUsage(
-                                    prompt_tokens=0,
-                                    completion_tokens=0,
-                                ),
+                                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
                                 finish_reason=None,
                             )
                         elif event.delta.type == "input_json_delta":
                             if event.index in current_tool_calls:
-                                current_tool_calls[event.index]["input"] += event.delta.partial_json
+                                current_tool_calls[event.index]["input"] += (
+                                    event.delta.partial_json
+                                )
                     elif event.type == "content_block_stop":
                         # When a tool use block completes, yield the tool call
                         if event.index in current_tool_calls:
@@ -623,10 +655,7 @@ class AnthropicBackend:
                                         )
                                     ],
                                 ),
-                                usage=LLMUsage(
-                                    prompt_tokens=0,
-                                    completion_tokens=0,
-                                ),
+                                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
                                 finish_reason=None,
                             )
                             del current_tool_calls[event.index]
@@ -634,13 +663,16 @@ class AnthropicBackend:
                         if event.usage:
                             total_output_tokens = event.usage.output_tokens
                         yield LLMChunk(
-                            message=LLMMessage(
-                                role=Role.assistant,
-                                content="",
-                            ),
+                            message=LLMMessage(role=Role.assistant, content=""),
                             usage=LLMUsage(
-                                prompt_tokens=total_input_tokens,
+                                prompt_tokens=(
+                                    total_input_tokens
+                                    + total_cache_read_tokens
+                                    + total_cache_write_tokens
+                                ),
                                 completion_tokens=total_output_tokens,
+                                cache_read_tokens=total_cache_read_tokens,
+                                cache_write_tokens=total_cache_write_tokens,
                             ),
                             finish_reason=event.delta.stop_reason,
                         )
