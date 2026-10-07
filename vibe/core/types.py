@@ -52,6 +52,8 @@ class AgentStats(BaseModel):
     tool_calls_succeeded: int = 0
 
     context_tokens: int = 0
+    context_window: int = 0
+    last_usage_message_index: int = -1
 
     last_turn_prompt_tokens: int = 0
     last_turn_completion_tokens: int = 0
@@ -60,6 +62,13 @@ class AgentStats(BaseModel):
 
     input_price_per_million: float = 0.0
     output_price_per_million: float = 0.0
+
+    @computed_field
+    @property
+    def context_percent(self) -> float:
+        if self.context_window <= 0:
+            return 0.0
+        return min(100.0, (self.context_tokens / self.context_window) * 100.0)
 
     @computed_field
     @property
@@ -106,6 +115,7 @@ class AgentStats(BaseModel):
         changes but we want to preserve session totals.
         """
         self.context_tokens = 0
+        self.last_usage_message_index = -1
         self.last_turn_prompt_tokens = 0
         self.last_turn_completion_tokens = 0
         self.last_turn_duration = 0.0
@@ -187,7 +197,9 @@ class LLMMessage(BaseModel):
     role: Role
     content: Content | None = None
     reasoning_content: str | None = None  # For thinking/reasoning tokens
-    thinking_signature: str | None = None  # Signature for thinking blocks (required by API)
+    thinking_signature: str | None = (
+        None  # Signature for thinking blocks (required by API)
+    )
     tool_calls: list[ToolCall] | None = None
     name: str | None = None
     tool_call_id: str | None = None
@@ -270,6 +282,12 @@ class CompactEndEvent(BaseEvent):
     old_context_tokens: int
     new_context_tokens: int
     summary_length: int
+
+
+class ContextUsageEvent(BaseEvent):
+    context_tokens: int
+    context_window: int
+    context_percent: float
 
 
 class ModeChangedEvent(BaseEvent):

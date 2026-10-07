@@ -148,6 +148,14 @@ class SessionLoggingConfig(BaseSettings):
         return str(Path(v).expanduser().resolve())
 
 
+class CompactionConfig(BaseSettings):
+    enabled: bool = True
+    reserve_tokens: int = 16_384
+    keep_recent_tokens: int = 20_000
+    threshold_ratio: float = 0.90
+    prompt: Literal["summary", "legacy"] = "summary"
+
+
 class Backend(StrEnum):
     MISTRAL = auto()
     GENERIC = auto()
@@ -403,16 +411,8 @@ DEFAULT_MODELS = [
     ModelConfig(name="glm-4.5", provider="zai", alias="zai/glm-4.5"),
     ModelConfig(name="glm-4.5-air", provider="zai", alias="zai/glm-4.5-air"),
     # Qwen models (via Qwen OAuth or DashScope API key)
-    ModelConfig(
-        name="qwen3-coder-plus",
-        provider="qwen",
-        alias="qwen-coder-plus",
-    ),
-    ModelConfig(
-        name="qwen3-coder-flash",
-        provider="qwen",
-        alias="qwen-coder-flash",
-    ),
+    ModelConfig(name="qwen3-coder-plus", provider="qwen", alias="qwen-coder-plus"),
+    ModelConfig(name="qwen3-coder-flash", provider="qwen", alias="qwen-coder-flash"),
     # XiaomiMimo models
     # Note: thinking variant removed - MiMo returns tool calls as XML in reasoning content
     # which isn't compatible with our structured tool call handling
@@ -433,7 +433,7 @@ class VibeConfig(BaseSettings):
     disable_welcome_banner_animation: bool = False
     displayed_workdir: str = ""
     auto_compact_threshold: int = 200_000
-    context_warnings: bool = False
+    context_warnings: bool = True
     textual_theme: str = "textual-dark"
     instructions: str = ""
     workdir: Path | None = Field(default=None, exclude=True)
@@ -451,6 +451,7 @@ class VibeConfig(BaseSettings):
 
     project_context: ProjectContextConfig = Field(default_factory=ProjectContextConfig)
     session_logging: SessionLoggingConfig = Field(default_factory=SessionLoggingConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     tools: dict[str, BaseToolConfig] = Field(default_factory=dict)
     tool_paths: list[str] = Field(
         default_factory=list,
@@ -519,6 +520,20 @@ class VibeConfig(BaseSettings):
             return self.get_active_model().context_limit
         except ValueError:
             return self.auto_compact_threshold
+
+    def get_compaction_threshold(self) -> int:
+        """Token threshold that triggers auto-compaction.
+
+        Reserves room for the next response and system prompt on top of the
+        model context window, with a ratio fallback when the window is unknown.
+        """
+        try:
+            context_window = self.get_active_model().context_limit
+        except ValueError:
+            return max(
+                1, int(self.auto_compact_threshold * self.compaction.threshold_ratio)
+            )
+        return max(1, context_window - self.compaction.reserve_tokens)
 
     def get_provider_for_model(self, model: ModelConfig) -> ProviderConfig:
         for provider in self.providers:

@@ -56,6 +56,7 @@ from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.types import (
     AgentMode,
+    ContextUsageEvent,
     LLMMessage,
     ModeChangedEvent,
     ResumeSessionInfo,
@@ -371,7 +372,7 @@ class VibeApp(App):
                 # Reset agent messages to just system prompt, then add loaded
                 self.agent.messages = self.agent.messages[:1]
                 self.agent.messages.extend(non_system_messages)
-                
+
                 # Restore additional directory contexts if they exist in the metadata
                 additional_contexts = metadata.get("additional_directory_contexts", [])
                 if additional_contexts:
@@ -379,13 +380,15 @@ class VibeApp(App):
                         try:
                             context_path = Path(context_path_str)
                             if context_path.exists() and context_path.is_dir():
-                                self.agent.add_additional_directory_context(context_path)
+                                self.agent.add_additional_directory_context(
+                                    context_path
+                                )
                         except Exception:
                             # Skip invalid paths
                             continue
                     # Regenerate system prompt with restored contexts
                     self.agent._regenerate_system_prompt_with_additional_contexts()
-                
+
                 logger.info(
                     "Loaded %d messages from session %s",
                     len(non_system_messages),
@@ -507,9 +510,10 @@ class VibeApp(App):
             handler = getattr(self, command.handler)
             # Check if handler accepts user_input parameter
             import inspect
+
             sig = inspect.signature(handler)
             accepts_input = len(sig.parameters) > 0
-            
+
             if asyncio.iscoroutinefunction(handler):
                 if accepts_input:
                     await handler(user_input)
@@ -689,9 +693,9 @@ class VibeApp(App):
 
     async def _plan_approval_callback(self, plan: str) -> tuple[bool, str | None]:
         """Callback invoked when agent calls submit_plan. Shows approval UI and waits."""
-        self._pending_plan_approval: asyncio.Future[
-            tuple[bool, str | None]
-        ] | None = asyncio.Future()
+        self._pending_plan_approval: asyncio.Future[tuple[bool, str | None]] | None = (
+            asyncio.Future()
+        )
         self._pending_plan_content: str | None = plan
         await self._switch_to_plan_approval()
         result = await self._pending_plan_approval
@@ -716,6 +720,14 @@ class VibeApp(App):
                 prompt, base_dir=self.config.effective_workdir
             )
             async for event in self.agent.act(rendered_prompt):
+                if isinstance(event, ContextUsageEvent):
+                    if self._context_progress:
+                        self._context_progress.tokens = TokenState(
+                            max_tokens=event.context_window,
+                            current_tokens=event.context_tokens,
+                        )
+                    continue
+
                 if self._context_progress and self.agent:
                     current_state = self._context_progress.tokens
                     self._context_progress.tokens = TokenState(
@@ -825,6 +837,7 @@ class VibeApp(App):
 - **Session Completion Tokens**: {stats.session_completion_tokens:,}
 - **Session Total LLM Tokens**: {stats.session_total_llm_tokens:,}
 - **Last Turn Tokens**: {stats.last_turn_total_tokens:,}
+- **Context**: {stats.context_percent:.0f}% ({stats.context_tokens:,}/{stats.context_window:,} tokens)
 - **Cost**: ${stats.session_cost:.4f}
 """
         await self._mount_and_scroll(UserCommandMessage(status_text))
@@ -850,8 +863,7 @@ class VibeApp(App):
                         self.agent.stats.context_tokens if self.agent else 0
                     )
                     self._context_progress.tokens = TokenState(
-                        max_tokens=context_limit,
-                        current_tokens=current_tokens,
+                        max_tokens=context_limit, current_tokens=current_tokens
                     )
                 else:
                     self._context_progress.tokens = TokenState()
@@ -951,7 +963,7 @@ class VibeApp(App):
 
         await self._switch_to_conversations_app()
 
-    async def _compact_history(self) -> None:
+    async def _compact_history(self, user_input: str) -> None:
         if self._agent_running:
             await self._mount_and_scroll(
                 ErrorMessage(
@@ -987,8 +999,11 @@ class VibeApp(App):
         self.event_handler.current_compact = compact_msg
         await self._mount_and_scroll(compact_msg)
 
+        parts = user_input.split(maxsplit=1)
+        instructions = parts[1].strip() if len(parts) > 1 else None
+
         try:
-            await self.agent.compact()
+            await self.agent.compact(instructions=instructions)
             new_tokens = self.agent.stats.context_tokens
             compact_msg.set_complete(old_tokens=old_tokens, new_tokens=new_tokens)
             self.event_handler.current_compact = None
@@ -1019,9 +1034,9 @@ class VibeApp(App):
         # Extract directory path from command
         command_text = user_input.strip()
         if command_text.startswith("/add-dir "):
-            dir_path_str = command_text[len("/add-dir "):].strip()
+            dir_path_str = command_text[len("/add-dir ") :].strip()
         elif command_text.startswith("/add-directory "):
-            dir_path_str = command_text[len("/add-directory "):].strip()
+            dir_path_str = command_text[len("/add-directory ") :].strip()
         else:
             await self._mount_and_scroll(
                 ErrorMessage(
@@ -1042,7 +1057,7 @@ class VibeApp(App):
 
         # Convert to Path object and resolve
         dir_path = Path(dir_path_str).expanduser().resolve()
-        
+
         # Validate directory exists
         if not dir_path.exists():
             await self._mount_and_scroll(
@@ -1065,10 +1080,10 @@ class VibeApp(App):
         try:
             # Add the directory to the agent's additional contexts
             self.agent.add_additional_directory_context(dir_path)
-            
+
             # Regenerate the system prompt with the new context
             self.agent._regenerate_system_prompt_with_additional_contexts()
-            
+
             await self._mount_and_scroll(
                 UserCommandMessage(f"Added directory context: {dir_path}")
             )

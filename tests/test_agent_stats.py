@@ -14,12 +14,14 @@ from vibe.core.config import (
     SessionLoggingConfig,
     VibeConfig,
 )
+from vibe.core.context.tokens import estimate_context_tokens
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.types import (
     AgentStats,
     AssistantEvent,
     CompactEndEvent,
     CompactStartEvent,
+    ContextUsageEvent,
     FunctionCall,
     LLMMessage,
     Role,
@@ -440,7 +442,10 @@ class TestCompactStatsHandling:
         async for _ in agent.act("Do something complex"):
             pass
 
-        context_before = agent.stats.context_tokens
+        tools = agent.format_handler.get_available_tools(
+            agent.tool_manager, agent.config
+        )
+        context_before = estimate_context_tokens(agent.messages, tools)
 
         await agent.compact()
 
@@ -511,10 +516,7 @@ class TestAutoCompactIntegration:
         ])
         # Create a model with low context_limit to trigger compaction
         test_model = ModelConfig(
-            name="test-model",
-            provider="mistral",
-            alias="test-compact",
-            context_limit=1,
+            name="test-model", provider="mistral", alias="test-compact", context_limit=1
         )
         cfg = VibeConfig(
             session_logging=SessionLoggingConfig(enabled=False),
@@ -526,18 +528,19 @@ class TestAutoCompactIntegration:
 
         events = [ev async for ev in agent.act("Hello")]
 
-        assert len(events) == 3
+        assert len(events) == 4
         assert isinstance(events[0], CompactStartEvent)
         assert isinstance(events[1], CompactEndEvent)
         assert isinstance(events[2], AssistantEvent)
+        assert isinstance(events[3], ContextUsageEvent)
 
         start: CompactStartEvent = events[0]
         end: CompactEndEvent = events[1]
         final: AssistantEvent = events[2]
 
-        assert start.current_context_tokens == 2
+        assert start.current_context_tokens > 0
         assert start.threshold == 1
-        assert end.old_context_tokens == 2
+        assert end.old_context_tokens == start.current_context_tokens
         assert end.new_context_tokens >= 1
         assert final.content == "<final>"
 

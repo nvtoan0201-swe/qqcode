@@ -11,6 +11,9 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from vibe.core.config import VibeConfig
+from vibe.core.context.compactor import Compactor
+from vibe.core.context.overflow import is_context_overflow
+from vibe.core.context.tokens import estimate_context_tokens
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.format import APIToolFormatHandler, ResolvedMessage
@@ -23,10 +26,8 @@ from vibe.core.middleware import (
     MiddlewarePipeline,
     MiddlewareResult,
     PriceLimitMiddleware,
-    ResetReason,
     TurnLimitMiddleware,
 )
-from vibe.core.prompts import UtilityPrompt
 from vibe.core.skills.manager import SkillManager
 from vibe.core.system_prompt import get_universal_system_prompt
 from vibe.core.tools.base import (
@@ -44,8 +45,10 @@ from vibe.core.types import (
     BaseEvent,
     CompactEndEvent,
     CompactStartEvent,
+    ContextUsageEvent,
     LLMChunk,
     LLMMessage,
+    LLMUsage,
     ModeChangedEvent,
     Role,
     SyncApprovalCallback,
@@ -66,9 +69,14 @@ from vibe.core.utils import (
 # Tools allowed in Plan Mode (read-only operations + plan submission)
 # Note: exit_plan_mode is NOT included because mode switching happens
 # automatically through submit_plan's approval callback
-PLAN_MODE_ALLOWED_TOOLS = frozenset(
-    {"read_file", "grep", "todo", "submit_plan", "bash", "skill"}
-)
+PLAN_MODE_ALLOWED_TOOLS = frozenset({
+    "read_file",
+    "grep",
+    "todo",
+    "submit_plan",
+    "bash",
+    "skill",
+})
 
 
 class ToolExecutionResponse(StrEnum):
@@ -145,7 +153,10 @@ class Agent:
             self._mode = AgentMode.INTERACTIVE
 
         system_prompt = get_universal_system_prompt(
-            self.tool_manager, config, skill_manager=self.skill_manager, mode=self._mode.value
+            self.tool_manager,
+            config,
+            skill_manager=self.skill_manager,
+            mode=self._mode.value,
         )
 
         self.messages = [LLMMessage(role=Role.system, content=system_prompt)]
@@ -155,20 +166,27 @@ class Agent:
             self._last_observed_message_index = 1
 
         # Store additional directory contexts
-        self._additional_directory_contexts: list[Path] = additional_directory_contexts or []
+        self._additional_directory_contexts: list[Path] = (
+            additional_directory_contexts or []
+        )
 
         self.stats = AgentStats()
         try:
             active_model = config.get_active_model()
             self.stats.input_price_per_million = active_model.input_price
             self.stats.output_price_per_million = active_model.output_price
+            self.stats.context_window = active_model.context_limit
         except ValueError:
             pass
 
+        self._last_usage: LLMUsage | None = None
+        self._overflow_recovered = False
+        self.compactor = Compactor(self)
+
         self.approval_callback: ApprovalCallback | None = None
-        self.plan_approval_callback: (
-            Callable[[str], Any] | None
-        ) = None  # Callback for submit_plan approval
+        self.plan_approval_callback: Callable[[str], Any] | None = (
+            None  # Callback for submit_plan approval
+        )
 
         self.session_id = session_id or str(uuid4())
 
@@ -249,12 +267,14 @@ class Agent:
             self.middleware_pipeline.add(PriceLimitMiddleware(max_price))
 
         context_limit = self.config.get_context_limit_for_active_model()
-        if context_limit > 0:
-            self.middleware_pipeline.add(AutoCompactMiddleware(context_limit))
-            if self.config.context_warnings:
-                self.middleware_pipeline.add(
-                    ContextWarningMiddleware(0.5, context_limit)
-                )
+        if context_limit > 0 and self.config.compaction.enabled:
+            self.middleware_pipeline.add(
+                AutoCompactMiddleware(self.config.get_compaction_threshold())
+            )
+        if context_limit > 0 and self.config.context_warnings:
+            self.middleware_pipeline.add(
+                ContextWarningMiddleware(max_context=context_limit)
+            )
 
     async def _handle_middleware_result(
         self, result: MiddlewareResult
@@ -271,7 +291,11 @@ class Agent:
                     stopped_by_middleware=True,
                 )
                 await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+                    self.messages,
+                    self.stats,
+                    self.config,
+                    self.tool_manager,
+                    self._additional_directory_contexts,
                 )
 
             case MiddlewareAction.INJECT_MESSAGE:
@@ -310,13 +334,47 @@ class Agent:
             messages=self.messages, stats=self.stats, config=self.config
         )
 
+    def _refresh_context_stats(self) -> None:
+        tools = self.format_handler.get_available_tools(self.tool_manager, self.config)
+        self.stats.context_tokens = estimate_context_tokens(
+            self.messages, tools, self._last_usage, self.stats.last_usage_message_index
+        )
+
+    def _context_usage_event(self) -> ContextUsageEvent:
+        return ContextUsageEvent(
+            context_tokens=self.stats.context_tokens,
+            context_window=self.stats.context_window,
+            context_percent=self.stats.context_percent,
+        )
+
+    async def _recover_from_context_overflow(
+        self, error: BaseException
+    ) -> AsyncGenerator[BaseEvent]:
+        metadata = {
+            "old_tokens": self.stats.context_tokens,
+            "threshold": self.config.get_compaction_threshold(),
+        }
+        try:
+            async for event in self._handle_middleware_result(
+                MiddlewareResult(action=MiddlewareAction.COMPACT, metadata=metadata)
+            ):
+                yield event
+        except Exception as compact_exc:
+            raise AgentError(
+                "Context overflow recovery failed: could not compact the conversation. "
+                f"Original error: {error}. Compaction error: {compact_exc}"
+            ) from compact_exc
+
     async def _conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
         self.messages.append(LLMMessage(role=Role.user, content=user_msg))
         self.stats.steps += 1
+        self._overflow_recovered = False
+        self.middleware_pipeline.reset()
 
-        try:
-            should_break_loop = False
-            while not should_break_loop:
+        should_break_loop = False
+        while not should_break_loop:
+            try:
+                self._refresh_context_stats()
                 result = await self.middleware_pipeline.run_before_turn(
                     self._get_context()
                 )
@@ -326,6 +384,7 @@ class Agent:
 
                 if result.action == MiddlewareAction.STOP:
                     self._flush_new_messages()
+                    yield self._context_usage_event()
                     return
 
                 self.stats.steps += 1
@@ -344,7 +403,11 @@ class Agent:
 
                 self._flush_new_messages()
                 await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+                    self.messages,
+                    self.stats,
+                    self.config,
+                    self.tool_manager,
+                    self._additional_directory_contexts,
                 )
 
                 if user_cancelled:
@@ -352,6 +415,7 @@ class Agent:
                     await self.interaction_logger.save_interaction(
                         self.messages, self.stats, self.config, self.tool_manager
                     )
+                    yield self._context_usage_event()
                     return
 
                 after_result = await self.middleware_pipeline.run_after_turn(
@@ -363,23 +427,43 @@ class Agent:
 
                 if after_result.action == MiddlewareAction.STOP:
                     self._flush_new_messages()
+                    yield self._context_usage_event()
                     return
 
                 self._flush_new_messages()
                 await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+                    self.messages,
+                    self.stats,
+                    self.config,
+                    self.tool_manager,
+                    self._additional_directory_contexts,
                 )
 
-        except Exception:
-            self._flush_new_messages()
-            await self.interaction_logger.save_interaction(
-                self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
-            )
-            raise
+            except Exception as exc:
+                if is_context_overflow(exc) and not self._overflow_recovered:
+                    self._overflow_recovered = True
+                    async for event in self._recover_from_context_overflow(exc):
+                        yield event
+                    continue
+
+                self._flush_new_messages()
+                await self.interaction_logger.save_interaction(
+                    self.messages,
+                    self.stats,
+                    self.config,
+                    self.tool_manager,
+                    self._additional_directory_contexts,
+                )
+                raise
+
+        self._flush_new_messages()
+        yield self._context_usage_event()
 
     async def _perform_llm_turn(
         self,
-    ) -> AsyncGenerator[AssistantEvent | ToolCallEvent | ToolResultEvent | ModeChangedEvent]:
+    ) -> AsyncGenerator[
+        AssistantEvent | ToolCallEvent | ToolResultEvent | ModeChangedEvent
+    ]:
         if self.enable_streaming:
             async for event in self._stream_assistant_events():
                 yield event
@@ -410,10 +494,7 @@ class Agent:
             yield event
 
     def _create_assistant_event(
-        self,
-        content: str,
-        chunk: LLMChunk | None,
-        reasoning_content: str | None = None,
+        self, content: str, chunk: LLMChunk | None, reasoning_content: str | None = None
     ) -> AssistantEvent:
         return AssistantEvent(
             content=content,
@@ -505,9 +586,16 @@ class Agent:
         finish_reason = next(
             (c.finish_reason for c in chunks if c.finish_reason is not None), None
         )
+        self._finalize_assistant_stats(last_message, chunks[-1].usage, finish_reason)
+
+    def _finalize_assistant_stats(
+        self, message: LLMMessage, usage: LLMUsage | None, finish_reason: str | None
+    ) -> None:
         self._last_chunk = LLMChunk(
-            message=last_message, usage=chunks[-1].usage, finish_reason=finish_reason
+            message=message, usage=usage, finish_reason=finish_reason
         )
+        self.stats.last_usage_message_index = len(self.messages) - 1
+        self._refresh_context_stats()
 
     async def _get_assistant_event(self) -> AssistantEvent:
         llm_result = await self._chat()
@@ -518,7 +606,9 @@ class Agent:
         self._last_chunk = llm_result
         assistant_msg = llm_result.message
         self.messages.append(assistant_msg)
-
+        self._finalize_assistant_stats(
+            assistant_msg, llm_result.usage, llm_result.finish_reason
+        )
         return AssistantEvent(
             content=assistant_msg.content or "",
             prompt_tokens=llm_result.usage.prompt_tokens,
@@ -700,7 +790,11 @@ class Agent:
                     )
                 )
                 await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+                    self.messages,
+                    self.stats,
+                    self.config,
+                    self.tool_manager,
+                    self._additional_directory_contexts,
                 )
                 raise
 
@@ -722,7 +816,11 @@ class Agent:
                     )
                 )
                 await self.interaction_logger.save_interaction(
-                    self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+                    self.messages,
+                    self.stats,
+                    self.config,
+                    self.tool_manager,
+                    self._additional_directory_contexts,
                 )
                 raise
 
@@ -750,14 +848,23 @@ class Agent:
                 )
                 continue
 
-    async def _chat(self, max_tokens: int | None = None) -> LLMChunk:
+    async def _chat(
+        self,
+        max_tokens: int | None = None,
+        *,
+        messages: list[LLMMessage] | None = None,
+        include_tools: bool = True,
+    ) -> LLMChunk:
         active_model = self.config.get_active_model()
         provider = self.config.get_provider_for_model(active_model)
+        request_messages = messages if messages is not None else self.messages
 
-        available_tools = self.format_handler.get_available_tools(
-            self.tool_manager, self.config
+        available_tools = (
+            self.format_handler.get_available_tools(self.tool_manager, self.config)
+            if include_tools
+            else None
         )
-        tool_choice = self.format_handler.get_tool_choice()
+        tool_choice = self.format_handler.get_tool_choice() if include_tools else None
 
         try:
             start_time = time.perf_counter()
@@ -765,7 +872,7 @@ class Agent:
             async with self.backend as backend:
                 result = await backend.complete(
                     model=active_model,
-                    messages=self.messages,
+                    messages=request_messages,
                     temperature=active_model.temperature,
                     tools=available_tools,
                     tool_choice=tool_choice,
@@ -787,9 +894,9 @@ class Agent:
             self.stats.last_turn_completion_tokens = result.usage.completion_tokens
             self.stats.session_prompt_tokens += result.usage.prompt_tokens
             self.stats.session_completion_tokens += result.usage.completion_tokens
-            self.stats.context_tokens = (
-                result.usage.prompt_tokens + result.usage.completion_tokens
-            )
+            self._last_usage = result.usage
+            if messages is None:
+                self.stats.last_usage_message_index = len(self.messages) - 1
 
             processed_message = self.format_handler.process_api_response_message(
                 result.message
@@ -819,6 +926,7 @@ class Agent:
         try:
             start_time = time.perf_counter()
             last_chunk = None
+            self.stats.last_usage_message_index = len(self.messages) - 1
             async with self.backend as backend:
                 async for chunk in backend.complete_streaming(
                     model=active_model,
@@ -855,9 +963,7 @@ class Agent:
             self.stats.last_turn_completion_tokens = last_chunk.usage.completion_tokens
             self.stats.session_prompt_tokens += last_chunk.usage.prompt_tokens
             self.stats.session_completion_tokens += last_chunk.usage.completion_tokens
-            self.stats.context_tokens = (
-                last_chunk.usage.prompt_tokens + last_chunk.usage.completion_tokens
-            )
+            self._last_usage = last_chunk.usage
 
         except Exception as e:
             raise RuntimeError(
@@ -907,7 +1013,9 @@ class Agent:
                 args_model, _ = tool._get_tool_args_results()
                 validated_args = args_model.model_validate(args)
 
-                allowlist_denylist_result = tool.check_allowlist_denylist(validated_args)
+                allowlist_denylist_result = tool.check_allowlist_denylist(
+                    validated_args
+                )
                 if allowlist_denylist_result == ToolPermission.NEVER:
                     return ToolDecision(
                         verdict=ToolExecutionResponse.SKIP,
@@ -1050,7 +1158,11 @@ class Agent:
 
     async def clear_history(self) -> None:
         await self.interaction_logger.save_interaction(
-            self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+            self.messages,
+            self.stats,
+            self.config,
+            self.tool_manager,
+            self._additional_directory_contexts,
         )
         self.messages = self.messages[:1]
 
@@ -1061,115 +1173,73 @@ class Agent:
             self.stats.update_pricing(
                 active_model.input_price, active_model.output_price
             )
+            self.stats.context_window = active_model.context_limit
         except ValueError:
             pass
 
+        self._last_usage = None
+        self.compactor.reset()
         self.middleware_pipeline.reset()
         self.tool_manager.reset_all()
         self._reset_session()
 
-    async def compact(self) -> str:
+    async def compact(self, instructions: str | None = None) -> str:
         try:
-            self._clean_message_history()
-            await self.interaction_logger.save_interaction(
-                self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
-            )
-
-            last_user_message = None
-            for msg in reversed(self.messages):
-                if msg.role == Role.user:
-                    last_user_message = msg.content
-                    break
-
-            summary_request = UtilityPrompt.COMPACT.read()
-            self.messages.append(LLMMessage(role=Role.user, content=summary_request))
-            self.stats.steps += 1
-
-            summary_result = await self._chat()
-            if summary_result.usage is None:
-                raise LLMResponseError(
-                    "Usage data missing in compaction summary response"
-                )
-            summary_content = summary_result.message.content or ""
-
-            if last_user_message:
-                summary_content += (
-                    f"\n\nLast request from user was: {last_user_message}"
-                )
-
-            system_message = self.messages[0]
-            summary_message = LLMMessage(role=Role.user, content=summary_content)
-            self.messages = [system_message, summary_message]
-
-            active_model = self.config.get_active_model()
-            provider = self.config.get_provider_for_model(active_model)
-
-            async with self.backend as backend:
-                actual_context_tokens = await backend.count_tokens(
-                    model=active_model,
-                    messages=self.messages,
-                    tools=self.format_handler.get_available_tools(
-                        self.tool_manager, self.config
-                    ),
-                    extra_headers={"user-agent": get_user_agent(provider.backend)},
-                )
-
-            self.stats.context_tokens = actual_context_tokens
-
-            self._reset_session()
-            await self.interaction_logger.save_interaction(
-                self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
-            )
-
-            self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
-
-            return summary_content or ""
-
+            result = await self.compactor.compact(instructions=instructions, force=True)
+            return result.summary
         except Exception:
             await self.interaction_logger.save_interaction(
-                self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+                self.messages,
+                self.stats,
+                self.config,
+                self.tool_manager,
+                self._additional_directory_contexts,
             )
             raise
 
     def _regenerate_system_prompt_for_mode(self) -> None:
         """Regenerate the system prompt when mode changes."""
         new_system_prompt = get_universal_system_prompt(
-            self.tool_manager, 
-            self.config, 
-            skill_manager=self.skill_manager, 
+            self.tool_manager,
+            self.config,
+            skill_manager=self.skill_manager,
             mode=self._mode.value,
-            additional_directory_contexts=self._additional_directory_contexts
+            additional_directory_contexts=self._additional_directory_contexts,
         )
         if len(self.messages) > 0:
             self.messages[0] = LLMMessage(role=Role.system, content=new_system_prompt)
         else:
-            self.messages.insert(0, LLMMessage(role=Role.system, content=new_system_prompt))
+            self.messages.insert(
+                0, LLMMessage(role=Role.system, content=new_system_prompt)
+            )
 
     def add_additional_directory_context(self, directory_path: Path) -> None:
         """Add an additional directory context to the agent."""
         # Resolve the path to absolute form
         resolved_path = directory_path.resolve()
-        
+
         # Check if this directory is already added
         if resolved_path in self._additional_directory_contexts:
             raise ValueError(f"Directory {resolved_path} is already added to contexts")
-        
+
         # Add to the list of additional contexts
         self._additional_directory_contexts.append(resolved_path)
 
     def _regenerate_system_prompt_with_additional_contexts(self) -> None:
         """Regenerate the system prompt with additional directory contexts."""
         new_system_prompt = get_universal_system_prompt(
-            self.tool_manager, 
-            self.config, 
-            skill_manager=self.skill_manager, 
+            self.tool_manager,
+            self.config,
+            skill_manager=self.skill_manager,
             mode=self._mode.value,
-            additional_directory_contexts=self._additional_directory_contexts
+            additional_directory_contexts=self._additional_directory_contexts,
         )
         if len(self.messages) > 0:
             self.messages[0] = LLMMessage(role=Role.system, content=new_system_prompt)
         else:
-            self.messages.insert(0, LLMMessage(role=Role.system, content=new_system_prompt))
+            self.messages.insert(
+                0, LLMMessage(role=Role.system, content=new_system_prompt)
+            )
 
     async def reload_with_initial_messages(
         self,
@@ -1178,7 +1248,11 @@ class Agent:
         max_price: float | None = None,
     ) -> None:
         await self.interaction_logger.save_interaction(
-            self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+            self.messages,
+            self.stats,
+            self.config,
+            self.tool_manager,
+            self._additional_directory_contexts,
         )
 
         preserved_messages = self.messages[1:] if len(self.messages) > 1 else []
@@ -1193,11 +1267,11 @@ class Agent:
         self.tool_manager = ToolManager(self.config, skill_manager=self.skill_manager)
 
         new_system_prompt = get_universal_system_prompt(
-            self.tool_manager, 
-            self.config, 
-            skill_manager=self.skill_manager, 
+            self.tool_manager,
+            self.config,
+            skill_manager=self.skill_manager,
             mode=self._mode.value,
-            additional_directory_contexts=self._additional_directory_contexts
+            additional_directory_contexts=self._additional_directory_contexts,
         )
         self.messages = [LLMMessage(role=Role.system, content=new_system_prompt)]
         did_system_prompt_change = old_system_prompt != new_system_prompt
@@ -1207,12 +1281,14 @@ class Agent:
 
         if len(self.messages) == 1 or did_system_prompt_change:
             self.stats.reset_context_state()
+            self._last_usage = None
 
         try:
             active_model = self.config.get_active_model()
             self.stats.update_pricing(
                 active_model.input_price, active_model.output_price
             )
+            self.stats.context_window = active_model.context_limit
         except ValueError:
             pass
 
@@ -1228,5 +1304,9 @@ class Agent:
         self.tool_manager.reset_all()
 
         await self.interaction_logger.save_interaction(
-            self.messages, self.stats, self.config, self.tool_manager, self._additional_directory_contexts
+            self.messages,
+            self.stats,
+            self.config,
+            self.tool_manager,
+            self._additional_directory_contexts,
         )

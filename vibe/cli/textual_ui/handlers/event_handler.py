@@ -13,6 +13,7 @@ from vibe.core.types import (
     BaseEvent,
     CompactEndEvent,
     CompactStartEvent,
+    ContextUsageEvent,
     ToolCallEvent,
     ToolResultEvent,
 )
@@ -60,7 +61,8 @@ class EventHandler:
                 await self._handle_compact_end(event)
                 return None
             case _:
-                await self._handle_unknown_event(event)
+                if not isinstance(event, ContextUsageEvent):
+                    await self._handle_unknown_event(event)
                 return None
 
     def _sanitize_event(self, event: ToolResultEvent) -> ToolResultEvent:

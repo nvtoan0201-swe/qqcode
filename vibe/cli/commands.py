@@ -53,7 +53,7 @@ class CommandRegistry:
             ),
             "compact": Command(
                 aliases=frozenset(["/compact", "/summarize"]),
-                description="Compact conversation history by summarizing",
+                description="Compact conversation history by summarizing (optional instructions)",
                 handler="_compact_history",
             ),
             "exit": Command(

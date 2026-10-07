@@ -27,6 +27,8 @@ class UtilityPrompt(Prompt):
     DANGEROUS_DIRECTORY = auto()
     PLAN_MODE = auto()
     PROJECT_CONTEXT = auto()
+    SUMMARY = auto()
+    SUMMARY_UPDATE = auto()
 
 
 __all__ = ["SystemPrompt", "UtilityPrompt"]

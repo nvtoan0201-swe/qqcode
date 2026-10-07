@@ -19,6 +19,7 @@ class FakeBackend:
         *,
         token_counter: Callable[[list[LLMMessage]], int] | None = None,
         exception_to_raise: Exception | None = None,
+        exceptions: Iterable[Exception | None] | None = None,
     ) -> None:
         self._chunks = list(results or [])
         self._requests_messages: list[list[LLMMessage]] = []
@@ -26,6 +27,16 @@ class FakeBackend:
         self._count_tokens_calls: list[list[LLMMessage]] = []
         self._token_counter = token_counter or self._default_token_counter
         self._exception_to_raise = exception_to_raise
+        self._exceptions: list[Exception | None] = list(exceptions or [])
+
+    def _next_exception(self) -> Exception | None:
+        if self._exceptions:
+            return self._exceptions.pop(0)
+        return self._exception_to_raise
+
+    @property
+    def count_tokens_calls(self) -> list[list[LLMMessage]]:
+        return self._count_tokens_calls
 
     @property
     def requests_messages(self) -> list[list[LLMMessage]]:
@@ -56,8 +67,8 @@ class FakeBackend:
         extra_headers,
         max_tokens,
     ) -> LLMChunk:
-        if self._exception_to_raise:
-            raise self._exception_to_raise
+        if (exception := self._next_exception()) is not None:
+            raise exception
 
         self._requests_messages.append(messages)
         self._requests_extra_headers.append(extra_headers)
@@ -79,8 +90,8 @@ class FakeBackend:
         extra_headers,
         max_tokens,
     ) -> AsyncGenerator[LLMChunk]:
-        if self._exception_to_raise:
-            raise self._exception_to_raise
+        if (exception := self._next_exception()) is not None:
+            raise exception
 
         self._requests_messages.append(messages)
         self._requests_extra_headers.append(extra_headers)

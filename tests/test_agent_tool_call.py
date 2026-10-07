@@ -16,6 +16,7 @@ from vibe.core.tools.builtins.todo import TodoItem
 from vibe.core.types import (
     AssistantEvent,
     BaseEvent,
+    ContextUsageEvent,
     FunctionCall,
     LLMMessage,
     Role,
@@ -28,7 +29,9 @@ from vibe.core.utils import ApprovalResponse
 
 
 async def act_and_collect_events(agent: Agent, prompt: str) -> list[BaseEvent]:
-    return [ev async for ev in agent.act(prompt)]
+    return [
+        ev async for ev in agent.act(prompt) if not isinstance(ev, ContextUsageEvent)
+    ]
 
 
 def make_config(todo_permission: ToolPermission = ToolPermission.ALWAYS) -> VibeConfig:
