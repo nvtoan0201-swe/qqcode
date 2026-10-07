@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass
 from enum import StrEnum, auto
 import time
 from typing import Any, cast
@@ -16,7 +17,12 @@ from vibe.core.context.overflow import is_context_overflow
 from vibe.core.context.tokens import estimate_context_tokens
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
-from vibe.core.llm.format import APIToolFormatHandler, ResolvedMessage
+from vibe.core.llm.format import (
+    APIToolFormatHandler,
+    FailedToolCall,
+    ResolvedMessage,
+    ResolvedToolCall,
+)
 from vibe.core.llm.types import BackendLike
 from vibe.core.middleware import (
     AutoCompactMiddleware,
@@ -73,6 +79,8 @@ from vibe.core.utils import (
 PLAN_MODE_ALLOWED_TOOLS = frozenset({
     "read_file",
     "grep",
+    "find",
+    "ls",
     "todo",
     "submit_plan",
     "bash",
@@ -88,6 +96,39 @@ class ToolExecutionResponse(StrEnum):
 class ToolDecision(BaseModel):
     verdict: ToolExecutionResponse
     feedback: str | None = None
+
+
+@dataclass
+class _PlanApproval:
+    approved: bool
+    mode_or_feedback: str | None
+
+
+@dataclass
+class _ApprovedCall:
+    tool_call: ResolvedToolCall
+    tool_instance: BaseTool
+    tool_call_id: str
+    timeout: float | None
+    duration: float | None = None
+    plan_approval: _PlanApproval | None = None
+
+
+@dataclass
+class _SkippedCall:
+    tool_call: ResolvedToolCall
+    tool_call_id: str
+    reason: str
+
+
+@dataclass
+class _FailedPreparedCall:
+    tool_call: ResolvedToolCall
+    tool_call_id: str
+    error_msg: str
+
+
+_PreparedCall = _ApprovedCall | _SkippedCall | _FailedPreparedCall
 
 
 class AgentError(Exception):
@@ -607,10 +648,73 @@ class Agent:
             tokens_per_second=self.stats.tokens_per_second,
         )
 
-    async def _handle_tool_calls(  # noqa: PLR0915
+    async def _handle_tool_calls(
         self, resolved: ResolvedMessage
     ) -> AsyncGenerator[ToolCallEvent | ToolResultEvent | ModeChangedEvent]:
-        for failed in resolved.failed_calls:
+        async for event in self._emit_failed_tool_calls(resolved.failed_calls):
+            yield event
+
+        prepared: list[_PreparedCall] = []
+        for tool_call in resolved.tool_calls:
+            tool_call_id = tool_call.call_id
+
+            yield ToolCallEvent(
+                tool_name=tool_call.tool_name,
+                tool_class=tool_call.tool_class,
+                args=tool_call.validated_args,
+                tool_call_id=tool_call_id,
+            )
+
+            try:
+                tool_instance = self._get_tool_instance(tool_call.tool_name)
+            except Exception as exc:
+                prepared.append(
+                    _FailedPreparedCall(
+                        tool_call=tool_call,
+                        tool_call_id=tool_call_id,
+                        error_msg=f"Error getting tool '{tool_call.tool_name}': {exc}",
+                    )
+                )
+                continue
+
+            decision = await self._should_execute_tool(
+                tool_instance, tool_call.args_dict, tool_call_id
+            )
+
+            if decision.verdict == ToolExecutionResponse.SKIP:
+                skip_reason = decision.feedback or str(
+                    get_user_cancellation_message(
+                        CancellationReason.TOOL_SKIPPED, tool_call.tool_name
+                    )
+                )
+                prepared.append(
+                    _SkippedCall(
+                        tool_call=tool_call,
+                        tool_call_id=tool_call_id,
+                        reason=skip_reason,
+                    )
+                )
+                continue
+
+            plan_approval = await self._request_plan_approval(tool_call)
+            prepared.append(
+                _ApprovedCall(
+                    tool_call=tool_call,
+                    tool_instance=tool_instance,
+                    tool_call_id=tool_call_id,
+                    timeout=tool_instance.config.timeout,
+                    plan_approval=plan_approval,
+                )
+            )
+
+        outcomes = await self._execute_prepared_calls(prepared)
+        async for event in self._commit_tool_results(prepared, outcomes):
+            yield event
+
+    async def _emit_failed_tool_calls(
+        self, failed_calls: list[FailedToolCall]
+    ) -> AsyncGenerator[ToolResultEvent]:
+        for failed in failed_calls:
             error_msg = f"<{TOOL_ERROR_TAG}>{failed.tool_name}: {failed.error}</{TOOL_ERROR_TAG}>"
 
             yield ToolResultEvent(
@@ -627,203 +731,275 @@ class Agent:
                 )
             )
 
-        for tool_call in resolved.tool_calls:
-            tool_call_id = tool_call.call_id
+    async def _request_plan_approval(
+        self, tool_call: ResolvedToolCall
+    ) -> _PlanApproval | None:
+        if tool_call.tool_name != "submit_plan" or self.plan_approval_callback is None:
+            return None
 
-            yield ToolCallEvent(
-                tool_name=tool_call.tool_name,
-                tool_class=tool_call.tool_class,
-                args=tool_call.validated_args,
-                tool_call_id=tool_call_id,
-            )
+        plan_content = tool_call.args_dict.get("plan", "")
+        callback_result = self.plan_approval_callback(plan_content)
+        if asyncio.iscoroutine(callback_result):
+            approved, mode_or_feedback = await callback_result
+        else:
+            approved, mode_or_feedback = callback_result
+        return _PlanApproval(approved=approved, mode_or_feedback=mode_or_feedback)
 
-            try:
-                tool_instance = self._get_tool_instance(tool_call.tool_name)
-            except Exception as exc:
-                error_msg = f"Error getting tool '{tool_call.tool_name}': {exc}"
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    error=error_msg,
-                    tool_call_id=tool_call_id,
-                )
-                self._append_message(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, error_msg
-                        )
-                    )
-                )
+    async def _execute_prepared_calls(
+        self, prepared: list[_PreparedCall]
+    ) -> list[BaseModel | BaseException | None]:
+        outcomes: list[BaseModel | BaseException | None] = [None] * len(prepared)
+        runtime = self.config.tool_runtime
+        semaphore = asyncio.Semaphore(max(1, runtime.max_parallel_tools))
+        batch: list[tuple[int, _ApprovedCall]] = []
+
+        for index, call in enumerate(prepared):
+            if not isinstance(call, _ApprovedCall):
                 continue
 
-            decision = await self._should_execute_tool(
-                tool_instance, tool_call.args_dict, tool_call_id
-            )
+            if not runtime.parallel or self._is_sequential_call(call):
+                await self._run_parallel_batch(batch, outcomes, semaphore)
+                outcomes[index] = await self._invoke_tool_call(call, semaphore)
+            else:
+                batch.append((index, call))
 
-            if decision.verdict == ToolExecutionResponse.SKIP:
-                self.stats.tool_calls_rejected += 1
-                skip_reason = decision.feedback or str(
-                    get_user_cancellation_message(
-                        CancellationReason.TOOL_SKIPPED, tool_call.tool_name
-                    )
+        await self._run_parallel_batch(batch, outcomes, semaphore)
+        return outcomes
+
+    async def _run_parallel_batch(
+        self,
+        batch: list[tuple[int, _ApprovedCall]],
+        outcomes: list[BaseModel | BaseException | None],
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        if not batch:
+            return
+
+        results = await asyncio.gather(
+            *(self._invoke_tool_call(call, semaphore) for _, call in batch)
+        )
+        for (index, _), result in zip(batch, results, strict=True):
+            outcomes[index] = result
+        batch.clear()
+
+    def _is_sequential_call(self, call: _ApprovedCall) -> bool:
+        if call.tool_instance.execution_mode == "sequential":
+            return True
+        return call.tool_call.tool_name in self.config.tool_runtime.sequential
+
+    async def _invoke_tool_call(
+        self, call: _ApprovedCall, semaphore: asyncio.Semaphore
+    ) -> BaseModel | BaseException:
+        start_time = time.perf_counter()
+        try:
+            async with semaphore:
+                result = await self._invoke_with_timeout(
+                    call.tool_instance, call.tool_call.args_dict, call.timeout
                 )
-
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    skipped=True,
-                    skip_reason=skip_reason,
-                    tool_call_id=tool_call_id,
-                )
-
-                self._append_message(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, skip_reason
-                        )
-                    )
-                )
-                continue
-
-            self.stats.tool_calls_agreed += 1
-
-            try:
-                start_time = time.perf_counter()
-                result_model = await tool_instance.invoke(**tool_call.args_dict)
-                duration = time.perf_counter() - start_time
-
-                # Handle plan submission approval via callback
-                if (
-                    hasattr(result_model, "plan_submitted")
-                    and result_model.plan_submitted
-                    and self.plan_approval_callback
-                ):
-                    plan_content = tool_call.args_dict.get("plan", "")
-                    callback_result = self.plan_approval_callback(plan_content)
-                    if asyncio.iscoroutine(callback_result):
-                        approved, mode_or_feedback = await callback_result
-                    else:
-                        approved, mode_or_feedback = callback_result
-                    # Mutate result with approval info
-                    result_model.approved = approved
-                    if approved:
-                        result_model.execution_mode = mode_or_feedback
-                        result_model.message = (
-                            f"Plan approved. Execution mode: {mode_or_feedback}"
-                        )
-                    else:
-                        result_model.execution_mode = None
-                        result_model.message = (
-                            f"User requested revisions: {mode_or_feedback}"
-                        )
-
-                text = "\n".join(
-                    f"{k}: {v}" for k, v in result_model.model_dump().items()
-                )
-
-                self._append_message(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, text
-                        )
-                    )
-                )
-
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    result=result_model,
-                    duration=duration,
-                    tool_call_id=tool_call_id,
-                )
-
-                self.stats.tool_calls_succeeded += 1
-
-                # Check for mode change from plan approval
-                if (
-                    hasattr(result_model, "execution_mode")
-                    and result_model.execution_mode
-                    and hasattr(result_model, "approved")
-                    and result_model.approved
-                ):
-                    new_mode = _mode_string_to_agent_mode(result_model.execution_mode)
-                    if new_mode and new_mode != self._mode:
-                        self._mode = new_mode
-                        self._regenerate_system_prompt_for_mode()
-                        yield ModeChangedEvent(new_mode=new_mode)
-
-                # Check for mode change signals in tool result (legacy)
-                if (
-                    hasattr(result_model, "mode_change")
-                    and result_model.mode_change == "plan"
-                ):
-                    self._mode = AgentMode.PLAN
-                    self._regenerate_system_prompt_for_mode()
-                    yield ModeChangedEvent(new_mode=AgentMode.PLAN)
-
-            except asyncio.CancelledError:
-                cancel = str(
-                    get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
-                )
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    error=cancel,
-                    tool_call_id=tool_call_id,
-                )
-                self._append_message(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, cancel
-                        )
-                    )
-                )
-                await self._recorder.flush()
+        except asyncio.CancelledError as exc:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
                 raise
+            return exc
+        except BaseException as exc:
+            return exc
 
-            except KeyboardInterrupt:
-                cancel = str(
-                    get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
-                )
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    error=cancel,
-                    tool_call_id=tool_call_id,
-                )
-                self._append_message(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, cancel
-                        )
-                    )
-                )
-                await self._recorder.flush()
-                raise
+        call.duration = time.perf_counter() - start_time
+        return result
 
-            except (ToolError, ToolPermissionError) as exc:
-                error_msg = f"<{TOOL_ERROR_TAG}>{tool_instance.get_name()} failed: {exc}</{TOOL_ERROR_TAG}>"
+    async def _invoke_with_timeout(
+        self, tool: BaseTool, args: dict[str, Any], timeout: float | None
+    ) -> BaseModel:
+        if timeout is None or timeout <= 0:
+            return await tool.invoke(**args)
+        try:
+            return await asyncio.wait_for(tool.invoke(**args), timeout=timeout)
+        except TimeoutError as exc:
+            raise ToolError(f"Tool timed out after {timeout}s") from exc
 
-                yield ToolResultEvent(
-                    tool_name=tool_call.tool_name,
-                    tool_class=tool_call.tool_class,
-                    error=error_msg,
-                    tool_call_id=tool_call_id,
-                )
-
-                if isinstance(exc, ToolPermissionError):
-                    self.stats.tool_calls_agreed -= 1
+    async def _commit_tool_results(
+        self,
+        prepared: list[_PreparedCall],
+        outcomes: list[BaseModel | BaseException | None],
+    ) -> AsyncGenerator[ToolResultEvent | ModeChangedEvent]:
+        for item, outcome in zip(prepared, outcomes, strict=True):
+            match item:
+                case _SkippedCall():
                     self.stats.tool_calls_rejected += 1
-                else:
-                    self.stats.tool_calls_failed += 1
-                self._append_message(
-                    LLMMessage.model_validate(
-                        self.format_handler.create_tool_response_message(
-                            tool_call, error_msg
+
+                    yield ToolResultEvent(
+                        tool_name=item.tool_call.tool_name,
+                        tool_class=item.tool_call.tool_class,
+                        skipped=True,
+                        skip_reason=item.reason,
+                        tool_call_id=item.tool_call_id,
+                    )
+
+                    self._append_message(
+                        LLMMessage.model_validate(
+                            self.format_handler.create_tool_response_message(
+                                item.tool_call, item.reason
+                            )
                         )
                     )
+
+                case _FailedPreparedCall():
+                    yield ToolResultEvent(
+                        tool_name=item.tool_call.tool_name,
+                        tool_class=item.tool_call.tool_class,
+                        error=item.error_msg,
+                        tool_call_id=item.tool_call_id,
+                    )
+
+                    self._append_message(
+                        LLMMessage.model_validate(
+                            self.format_handler.create_tool_response_message(
+                                item.tool_call, item.error_msg
+                            )
+                        )
+                    )
+
+                case _ApprovedCall():
+                    async for event in self._commit_approved_call(item, outcome):
+                        yield event
+
+    async def _commit_approved_call(
+        self, call: _ApprovedCall, outcome: BaseModel | BaseException | None
+    ) -> AsyncGenerator[ToolResultEvent | ModeChangedEvent]:
+        self.stats.tool_calls_agreed += 1
+
+        if isinstance(outcome, (asyncio.CancelledError, KeyboardInterrupt)):
+            cancel = str(
+                get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
+            )
+            yield ToolResultEvent(
+                tool_name=call.tool_call.tool_name,
+                tool_class=call.tool_call.tool_class,
+                error=cancel,
+                tool_call_id=call.tool_call_id,
+            )
+            self._append_message(
+                LLMMessage.model_validate(
+                    self.format_handler.create_tool_response_message(
+                        call.tool_call, cancel
+                    )
                 )
-                continue
+            )
+            await self._recorder.flush()
+            raise outcome
+
+        if isinstance(outcome, ToolPermissionError):
+            error_msg = (
+                f"<{TOOL_ERROR_TAG}>{call.tool_instance.get_name()} failed: "
+                f"{outcome}</{TOOL_ERROR_TAG}>"
+            )
+
+            yield ToolResultEvent(
+                tool_name=call.tool_call.tool_name,
+                tool_class=call.tool_call.tool_class,
+                error=error_msg,
+                tool_call_id=call.tool_call_id,
+            )
+
+            self.stats.tool_calls_agreed -= 1
+            self.stats.tool_calls_rejected += 1
+            self._append_message(
+                LLMMessage.model_validate(
+                    self.format_handler.create_tool_response_message(
+                        call.tool_call, error_msg
+                    )
+                )
+            )
+            return
+
+        if isinstance(outcome, ToolError):
+            error_msg = (
+                f"<{TOOL_ERROR_TAG}>{call.tool_instance.get_name()} failed: "
+                f"{outcome}</{TOOL_ERROR_TAG}>"
+            )
+
+            yield ToolResultEvent(
+                tool_name=call.tool_call.tool_name,
+                tool_class=call.tool_call.tool_class,
+                error=error_msg,
+                tool_call_id=call.tool_call_id,
+            )
+
+            self.stats.tool_calls_failed += 1
+            self._append_message(
+                LLMMessage.model_validate(
+                    self.format_handler.create_tool_response_message(
+                        call.tool_call, error_msg
+                    )
+                )
+            )
+            return
+
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+        if not isinstance(outcome, BaseModel):
+            raise LLMResponseError(
+                f"Tool '{call.tool_call.tool_name}' returned no result"
+            )
+
+        result_model = outcome
+        if call.plan_approval is not None and getattr(
+            result_model, "plan_submitted", False
+        ):
+            self._apply_plan_approval(result_model, call.plan_approval)
+
+        text = self._format_tool_result(result_model)
+
+        self._append_message(
+            LLMMessage.model_validate(
+                self.format_handler.create_tool_response_message(call.tool_call, text)
+            )
+        )
+
+        yield ToolResultEvent(
+            tool_name=call.tool_call.tool_name,
+            tool_class=call.tool_call.tool_class,
+            result=result_model,
+            duration=call.duration,
+            tool_call_id=call.tool_call_id,
+        )
+
+        self.stats.tool_calls_succeeded += 1
+
+        execution_mode = getattr(result_model, "execution_mode", None)
+        approved = getattr(result_model, "approved", None)
+        if execution_mode and approved:
+            new_mode = _mode_string_to_agent_mode(cast(str, execution_mode))
+            if new_mode and new_mode != self._mode:
+                self._mode = new_mode
+                self._regenerate_system_prompt_for_mode()
+                yield ModeChangedEvent(new_mode=new_mode)
+
+        if getattr(result_model, "mode_change", None) == "plan":
+            self._mode = AgentMode.PLAN
+            self._regenerate_system_prompt_for_mode()
+            yield ModeChangedEvent(new_mode=AgentMode.PLAN)
+
+    def _apply_plan_approval(
+        self, result_model: BaseModel, approval: _PlanApproval
+    ) -> None:
+        model = cast(Any, result_model)
+        model.approved = approval.approved
+        if approval.approved:
+            model.execution_mode = approval.mode_or_feedback
+            model.message = (
+                f"Plan approved. Execution mode: {approval.mode_or_feedback}"
+            )
+        else:
+            model.execution_mode = None
+            model.message = f"User requested revisions: {approval.mode_or_feedback}"
+
+    def _format_tool_result(self, result_model: BaseModel) -> str:
+        format_for_model = getattr(result_model, "format_for_model", None)
+        if callable(format_for_model):
+            return cast(str, format_for_model())
+        return "\n".join(f"{k}: {v}" for k, v in result_model.model_dump().items())
 
     async def _chat(
         self,

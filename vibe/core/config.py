@@ -442,6 +442,17 @@ DEFAULT_MODELS = [
 ]
 
 
+class ToolRuntimeConfig(BaseModel):
+    """Runtime behavior shared by all tools."""
+
+    parallel: bool = True
+    max_parallel_tools: int = Field(default=4, ge=1)
+    sequential: list[str] = Field(
+        default_factory=list,
+        description="Tool names that must run sequentially, outside parallel batches.",
+    )
+
+
 class VibeConfig(BaseSettings):
     active_model: str = "devstral-2"
     vim_keybindings: bool = False
@@ -467,6 +478,7 @@ class VibeConfig(BaseSettings):
     project_context: ProjectContextConfig = Field(default_factory=ProjectContextConfig)
     session_logging: SessionLoggingConfig = Field(default_factory=SessionLoggingConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    tool_runtime: ToolRuntimeConfig = Field(default_factory=ToolRuntimeConfig)
     tools: dict[str, BaseToolConfig] = Field(default_factory=dict)
     tool_paths: list[str] = Field(
         default_factory=list,
@@ -711,6 +723,32 @@ class VibeConfig(BaseSettings):
                 f"Tried to set {v} as working directory, path doesn't exist"
             )
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hoist_tool_runtime_settings(cls, data: Any) -> Any:
+        """Support ``[tools] parallel = ...`` next to per-tool ``[tools.<name>]``."""
+        if not isinstance(data, dict):
+            return data
+
+        raw_tools = data.get("tools")
+        if not isinstance(raw_tools, dict):
+            return data
+
+        runtime_keys = ("parallel", "max_parallel_tools", "sequential")
+        runtime = {key: raw_tools[key] for key in runtime_keys if key in raw_tools}
+        if not runtime:
+            return data
+
+        data = dict(data)
+        data["tools"] = {
+            name: value for name, value in raw_tools.items() if name not in runtime_keys
+        }
+        existing = data.get("tool_runtime")
+        data["tool_runtime"] = (
+            {**runtime, **existing} if isinstance(existing, dict) else runtime
+        )
+        return data
 
     @field_validator("tools", mode="before")
     @classmethod

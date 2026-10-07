@@ -7,9 +7,14 @@ import inspect
 from pathlib import Path
 import re
 import sys
-from typing import Any, ClassVar, cast, get_args, get_type_hints
+from typing import Any, ClassVar, Literal, Protocol, cast, get_args, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from vibe.core.tools.file_mutation_queue import (
+    FileMutationQueue,
+    get_default_file_mutation_queue,
+)
 
 ARGS_COUNT = 4
 
@@ -51,6 +56,28 @@ class ToolPermission(StrEnum):
             )
 
 
+class ToolResultFormatter(Protocol):
+    def format_for_model(self) -> str: ...
+
+    def ui_summary(self) -> str: ...
+
+
+class BaseToolResult(BaseModel):
+    """Optional base for structured tool results.
+
+    Older tool result models do not need to inherit from this class; the Agent
+    falls back to generic ``key: value`` formatting when it is absent.
+    """
+
+    truncated: bool = False
+    full_output_path: str | None = None
+
+    def format_for_model(self) -> str:
+        return "\n".join(
+            f"{k}: {v}" for k, v in self.model_dump(exclude_none=True).items()
+        )
+
+
 class BaseToolConfig(BaseModel):
     """Configuration for a tool.
 
@@ -59,6 +86,7 @@ class BaseToolConfig(BaseModel):
         workdir: The working directory for the tool. If None, the current working directory is used.
         allowlist: Patterns that automatically allow tool execution.
         denylist: Patterns that automatically deny tool execution.
+        timeout: Per-invocation timeout in seconds. None (or <= 0) disables it.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -67,6 +95,9 @@ class BaseToolConfig(BaseModel):
     workdir: Path | None = Field(default=None, exclude=True)
     allowlist: list[str] = Field(default_factory=list)
     denylist: list[str] = Field(default_factory=list)
+    timeout: float | None = Field(
+        default=None, description="Per-invocation timeout in seconds."
+    )
 
     @field_validator("workdir", mode="before")
     @classmethod
@@ -89,6 +120,8 @@ class BaseToolState(BaseModel):
         extra="forbid", validate_default=True, arbitrary_types_allowed=True
     )
 
+    file_mutation_queue: FileMutationQueue | None = Field(default=None, exclude=True)
+
 
 class BaseTool[
     ToolArgs: BaseModel,
@@ -103,10 +136,14 @@ class BaseTool[
     )
 
     prompt_path: ClassVar[Path] | None = None
+    execution_mode: ClassVar[Literal["parallel", "sequential"]] = "parallel"
 
     def __init__(self, config: ToolConfig, state: ToolState) -> None:
         self.config = config
         self.state = state
+
+    def get_file_mutation_queue(self) -> FileMutationQueue:
+        return self.state.file_mutation_queue or get_default_file_mutation_queue()
 
     @abstractmethod
     async def run(self, args: ToolArgs) -> ToolResult:

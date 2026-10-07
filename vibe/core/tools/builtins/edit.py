@@ -31,6 +31,9 @@ class EditResult(BaseModel):
 class EditConfig(BaseToolConfig):
     max_file_size: int = 100_000
     create_backup: bool = False
+    timeout: float | None = Field(
+        default=120.0, description="Agent-level timeout for the whole tool invocation."
+    )
 
 
 class EditState(BaseToolState):
@@ -55,10 +58,7 @@ class Edit(
         return ToolCallDisplay(
             summary=f"Updating {args.file_path}",
             content=f"- {args.old_string}\n+ {args.new_string}",
-            details={
-                "path": args.file_path,
-                "replace_all": args.replace_all,
-            },
+            details={"path": args.file_path, "replace_all": args.replace_all},
         )
 
     @classmethod
@@ -84,6 +84,10 @@ class Edit(
     @final
     async def run(self, args: EditArgs) -> EditResult:
         file_path = self._validate_and_resolve_path(args.file_path)
+        queue = self.get_file_mutation_queue()
+        return await queue.run(file_path, lambda: self._apply_edit(args, file_path))
+
+    async def _apply_edit(self, args: EditArgs, file_path: Path) -> EditResult:
         original_content = await self._read_file(file_path)
 
         # Check if old_string exists

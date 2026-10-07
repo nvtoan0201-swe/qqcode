@@ -28,6 +28,12 @@ class MCPToolResult(BaseModel):
     structured: dict[str, Any] | None = None
 
 
+class MCPToolConfig(BaseToolConfig):
+    """Config for MCP proxy tools with a shorter default timeout."""
+
+    timeout: float | None = 60.0
+
+
 class RemoteTool(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -130,7 +136,7 @@ def create_mcp_http_proxy_tool_class(
     alias: str | None = None,
     server_hint: str | None = None,
     headers: dict[str, str] | None = None,
-) -> type[BaseTool[_OpenArgs, MCPToolResult, BaseToolConfig, BaseToolState]]:
+) -> type[BaseTool[_OpenArgs, MCPToolResult, MCPToolConfig, BaseToolState]]:
     from urllib.parse import urlparse
 
     def _alias_from_url(url: str) -> str:
@@ -142,7 +148,7 @@ def create_mcp_http_proxy_tool_class(
     published_name = f"{(alias or _alias_from_url(url))}_{remote.name}"
 
     class MCPHttpProxyTool(
-        BaseTool[_OpenArgs, MCPToolResult, BaseToolConfig, BaseToolState]
+        BaseTool[_OpenArgs, MCPToolResult, MCPToolConfig, BaseToolState]
     ):
         description: ClassVar[str] = (
             (f"[{alias}] " if alias else "")
@@ -233,7 +239,7 @@ def create_mcp_stdio_proxy_tool_class(
     remote: RemoteTool,
     alias: str | None = None,
     server_hint: str | None = None,
-) -> type[BaseTool[_OpenArgs, MCPToolResult, BaseToolConfig, BaseToolState]]:
+) -> type[BaseTool[_OpenArgs, MCPToolResult, MCPToolConfig, BaseToolState]]:
     def _alias_from_command(cmd: list[str]) -> str:
         prog = Path(cmd[0]).name.replace(".", "_") if cmd else "mcp"
         digest = hashlib.blake2s(
@@ -245,7 +251,7 @@ def create_mcp_stdio_proxy_tool_class(
     published_name = f"{computed_alias}_{remote.name}"
 
     class MCPStdioProxyTool(
-        BaseTool[_OpenArgs, MCPToolResult, BaseToolConfig, BaseToolState]
+        BaseTool[_OpenArgs, MCPToolResult, MCPToolConfig, BaseToolState]
     ):
         description: ClassVar[str] = (
             (f"[{computed_alias}] " if computed_alias else "")

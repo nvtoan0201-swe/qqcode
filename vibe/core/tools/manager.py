@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from vibe import VIBE_ROOT
 from vibe.core.config import get_vibe_home
 from vibe.core.tools.base import BaseTool, BaseToolConfig
+from vibe.core.tools.file_mutation_queue import FileMutationQueue
 from vibe.core.tools.mcp import (
     RemoteTool,
     create_mcp_http_proxy_tool_class,
@@ -49,6 +50,7 @@ class ToolManager:
         self._skill_manager = skill_manager
         self._instances: dict[str, BaseTool] = {}
         self._search_paths: list[Path] = self._compute_search_paths(config)
+        self.file_mutation_queue = FileMutationQueue()
 
         self._available: dict[str, type[BaseTool]] = {
             cls.get_name(): cls for cls in self._iter_tool_classes(self._search_paths)
@@ -247,7 +249,10 @@ class ToolManager:
         if user_overrides is None:
             merged_dict = default_config.model_dump()
         else:
-            merged_dict = {**default_config.model_dump(), **user_overrides.model_dump()}
+            merged_dict = {
+                **default_config.model_dump(),
+                **user_overrides.model_dump(exclude_unset=True),
+            }
 
         if self._config.workdir is not None:
             merged_dict["workdir"] = self._config.workdir
@@ -277,12 +282,16 @@ class ToolManager:
 
             # Cast config to SkillConfig type (get_tool_config returns correct type)
             skill_config = tool_config  # type: ignore[assignment]
-            self._instances[tool_name] = Skill.create_with_skill_manager(
+            instance = Skill.create_with_skill_manager(
                 skill_config, self._skill_manager
             )
+            instance.state.file_mutation_queue = self.file_mutation_queue
+            self._instances[tool_name] = instance
             return self._instances[tool_name]
 
-        self._instances[tool_name] = tool_class.from_config(tool_config)
+        instance = tool_class.from_config(tool_config)
+        instance.state.file_mutation_queue = self.file_mutation_queue
+        self._instances[tool_name] = instance
         return self._instances[tool_name]
 
     def reset_all(self) -> None:
