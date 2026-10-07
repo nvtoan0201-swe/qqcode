@@ -10,12 +10,23 @@ import time
 from typing import Any, cast
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from vibe.core.config import ModelConfig, ThinkingLevel, VibeConfig
 from vibe.core.context.compactor import Compactor
 from vibe.core.context.overflow import is_context_overflow
 from vibe.core.context.tokens import estimate_context_tokens
+from vibe.core.hooks.events import (
+    AfterResponseEvent,
+    AgentEndEvent,
+    AgentStartEvent,
+    BeforeRequestEvent,
+    HookDecision,
+    ToolCallEventHook,
+    ToolResultEventHook,
+)
+from vibe.core.hooks.loader import load_hooks
+from vibe.core.hooks.registry import HookRegistry
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.cache import CachePlan, build_cache_plan
@@ -185,6 +196,9 @@ class Agent:
         # Initialize tool manager with skill manager reference
         self.tool_manager = ToolManager(config, skill_manager=self.skill_manager)
         self.format_handler = APIToolFormatHandler()
+
+        # Lifecycle extension hooks (project + package + global directories)
+        self.hooks: HookRegistry = load_hooks(config)
 
         self.backend_factory = lambda: backend or self._select_backend()
         self.backend = self.backend_factory()
@@ -398,6 +412,11 @@ class Agent:
         self._clean_message_history()
         self._abort_event.clear()
         self._active_task = asyncio.current_task()
+        start_decision = await self.hooks.dispatch(
+            AgentStartEvent(session_id=self.session_id, prompt=msg)
+        )
+        for injected in start_decision.injected_messages:
+            self._append_message(injected)
         try:
             async for event in self._conversation_loop(msg):
                 yield event
@@ -507,6 +526,17 @@ class Agent:
             ) from compact_exc
 
     async def _conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
+        try:
+            async for event in self._run_conversation_loop(user_msg):
+                yield event
+        finally:
+            await self.hooks.dispatch(
+                AgentEndEvent(
+                    session_id=self.session_id, usage=self._last_usage or LLMUsage()
+                )
+            )
+
+    async def _run_conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
         self._append_message(LLMMessage(role=Role.user, content=user_msg))
         self.stats.steps += 1
         self._overflow_recovered = False
@@ -589,6 +619,27 @@ class Agent:
         self._flush_new_messages()
         yield self._context_usage_event()
 
+    async def _dispatch_before_request(self) -> HookDecision:
+        active_model = self.config.get_active_model()
+        return await self.hooks.dispatch(
+            BeforeRequestEvent(
+                messages=list(self.messages), model_alias=active_model.alias
+            )
+        )
+
+    def _request_messages(self, decision: HookDecision) -> list[LLMMessage] | None:
+        if not decision.injected_messages:
+            return None
+        return [*self.messages, *decision.injected_messages]
+
+    async def _dispatch_after_response(self) -> None:
+        chunk = self._last_chunk
+        if chunk is None or chunk.usage is None:
+            return
+        await self.hooks.dispatch(
+            AfterResponseEvent(message=chunk.message, usage=chunk.usage)
+        )
+
     async def _perform_llm_turn(
         self,
     ) -> AsyncGenerator[
@@ -598,13 +649,33 @@ class Agent:
         | ModeChangedEvent
         | SystemPromptChangedEvent
     ]:
+        decision = await self._dispatch_before_request()
+        if decision.action == "deny":
+            reason = decision.reason or "no reason provided"
+            content = f"Request blocked by hook: {reason}"
+            denial = LLMMessage(role=Role.assistant, content=content)
+            self._append_message(denial)
+            self._last_chunk = LLMChunk(
+                message=denial, usage=None, finish_reason="stop"
+            )
+            yield AssistantEvent(
+                content=content,
+                session_total_tokens=self.stats.session_total_llm_tokens,
+                last_turn_duration=self.stats.last_turn_duration,
+                tokens_per_second=self.stats.tokens_per_second,
+            )
+            return
+
+        request_messages = self._request_messages(decision)
         if self.enable_streaming:
-            async for event in self._stream_assistant_events():
+            async for event in self._stream_assistant_events(request_messages):
                 yield event
         else:
-            assistant_event = await self._get_assistant_event()
+            assistant_event = await self._get_assistant_event(request_messages)
             if assistant_event.content:
                 yield assistant_event
+
+        await self._dispatch_after_response()
 
         last_message = self.messages[-1]
         last_chunk = self._last_chunk
@@ -644,14 +715,16 @@ class Agent:
             tokens_per_second=self.stats.tokens_per_second,
         )
 
-    async def _stream_assistant_events(self) -> AsyncGenerator[AssistantEvent]:
+    async def _stream_assistant_events(
+        self, messages: list[LLMMessage] | None = None
+    ) -> AsyncGenerator[AssistantEvent]:
         chunks: list[LLMChunk] = []
         content_buffer = ""
         reasoning_buffer = ""
         chunks_with_content = 0
         BATCH_SIZE = 5
 
-        async for chunk in self._chat_streaming():
+        async for chunk in self._chat_streaming(messages=messages):
             chunks.append(chunk)
 
             # Handle reasoning/thinking content
@@ -738,8 +811,10 @@ class Agent:
     def _record_usage(self, usage: LLMUsage) -> None:
         self._recorder.on_usage(usage, self.stats.usage_cost(usage))
 
-    async def _get_assistant_event(self) -> AssistantEvent:
-        llm_result = await self._chat()
+    async def _get_assistant_event(
+        self, messages: list[LLMMessage] | None = None
+    ) -> AssistantEvent:
+        llm_result = await self._chat(messages=messages)
         if llm_result.usage is None:
             raise LLMResponseError(
                 "Usage data missing in non-streaming completion response"
@@ -792,6 +867,47 @@ class Agent:
                     )
                 )
                 continue
+
+            hook_decision = await self.hooks.dispatch(
+                ToolCallEventHook(
+                    tool_name=tool_call.tool_name,
+                    tool_call_id=tool_call_id,
+                    args=dict(tool_call.args_dict),
+                )
+            )
+            if hook_decision.action == "deny":
+                prepared.append(
+                    _SkippedCall(
+                        tool_call=tool_call,
+                        tool_call_id=tool_call_id,
+                        reason=(
+                            hook_decision.reason
+                            or f"Tool call blocked by hook: {tool_call.tool_name}"
+                        ),
+                    )
+                )
+                continue
+
+            if (
+                hook_decision.action == "modify"
+                and hook_decision.replacement_args is not None
+            ):
+                try:
+                    tool_call = self._apply_hook_args(
+                        tool_call, hook_decision.replacement_args
+                    )
+                except ValidationError as exc:
+                    prepared.append(
+                        _FailedPreparedCall(
+                            tool_call=tool_call,
+                            tool_call_id=tool_call_id,
+                            error_msg=(
+                                f"Hook replacement args invalid for tool "
+                                f"'{tool_call.tool_name}': {exc}"
+                            ),
+                        )
+                    )
+                    continue
 
             decision = await self._should_execute_tool(
                 tool_instance, tool_call.args_dict, tool_call_id
@@ -846,6 +962,33 @@ class Agent:
                     failed, error_msg
                 )
             )
+
+    def _apply_hook_args(
+        self, tool_call: ResolvedToolCall, replacement_args: dict[str, Any]
+    ) -> ResolvedToolCall:
+        """Re-validate hook-provided arguments against the tool args model."""
+        args_model, _ = tool_call.tool_class._get_tool_args_results()
+        validated = args_model.model_validate(replacement_args)
+        return tool_call.model_copy(update={"validated_args": validated})
+
+    async def _observe_tool_result(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        *,
+        ok: bool,
+        text: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        await self.hooks.dispatch(
+            ToolResultEventHook(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                ok=ok,
+                text=text,
+                error=error,
+            )
+        )
 
     async def _request_plan_approval(
         self, tool_call: ResolvedToolCall
@@ -948,6 +1091,13 @@ class Agent:
                 case _SkippedCall():
                     self.stats.tool_calls_rejected += 1
 
+                    await self._observe_tool_result(
+                        item.tool_call.tool_name,
+                        item.tool_call_id,
+                        ok=False,
+                        error=item.reason,
+                    )
+
                     yield ToolResultEvent(
                         tool_name=item.tool_call.tool_name,
                         tool_class=item.tool_call.tool_class,
@@ -965,6 +1115,13 @@ class Agent:
                     )
 
                 case _FailedPreparedCall():
+                    await self._observe_tool_result(
+                        item.tool_call.tool_name,
+                        item.tool_call_id,
+                        ok=False,
+                        error=item.error_msg,
+                    )
+
                     yield ToolResultEvent(
                         tool_name=item.tool_call.tool_name,
                         tool_class=item.tool_call.tool_class,
@@ -993,6 +1150,9 @@ class Agent:
             cancel = str(
                 get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
             )
+            await self._observe_tool_result(
+                call.tool_call.tool_name, call.tool_call_id, ok=False, error=cancel
+            )
             yield ToolResultEvent(
                 tool_name=call.tool_call.tool_name,
                 tool_class=call.tool_call.tool_class,
@@ -1013,6 +1173,10 @@ class Agent:
             error_msg = (
                 f"<{TOOL_ERROR_TAG}>{call.tool_instance.get_name()} failed: "
                 f"{outcome}</{TOOL_ERROR_TAG}>"
+            )
+
+            await self._observe_tool_result(
+                call.tool_call.tool_name, call.tool_call_id, ok=False, error=error_msg
             )
 
             yield ToolResultEvent(
@@ -1039,6 +1203,10 @@ class Agent:
                 f"{outcome}</{TOOL_ERROR_TAG}>"
             )
 
+            await self._observe_tool_result(
+                call.tool_call.tool_name, call.tool_call_id, ok=False, error=error_msg
+            )
+
             yield ToolResultEvent(
                 tool_name=call.tool_call.tool_name,
                 tool_class=call.tool_call.tool_class,
@@ -1057,6 +1225,12 @@ class Agent:
             return
 
         if isinstance(outcome, BaseException):
+            await self._observe_tool_result(
+                call.tool_call.tool_name,
+                call.tool_call_id,
+                ok=False,
+                error=str(outcome),
+            )
             raise outcome
 
         if not isinstance(outcome, BaseModel):
@@ -1071,6 +1245,10 @@ class Agent:
             self._apply_plan_approval(result_model, call.plan_approval)
 
         text = self._format_tool_result(result_model)
+
+        await self._observe_tool_result(
+            call.tool_call.tool_name, call.tool_call_id, ok=True, text=text
+        )
 
         self._append_message(
             LLMMessage.model_validate(
@@ -1202,11 +1380,12 @@ class Agent:
             ) from e
 
     async def _chat_streaming(
-        self, max_tokens: int | None = None
+        self, max_tokens: int | None = None, *, messages: list[LLMMessage] | None = None
     ) -> AsyncGenerator[LLMChunk]:
         active_model = self.config.get_active_model()
         provider = self.config.get_provider_for_model(active_model)
         cache_plan = build_cache_plan(provider, active_model, self.session_id)
+        request_messages = messages if messages is not None else self.messages
 
         send_tools = active_model.capabilities.tools
         available_tools = (
@@ -1226,7 +1405,7 @@ class Agent:
             async with self.backend as backend:
                 async for chunk in backend.complete_streaming(
                     model=active_model,
-                    messages=self.messages,
+                    messages=request_messages,
                     temperature=active_model.temperature,
                     tools=available_tools,
                     tool_choice=tool_choice,
@@ -1632,6 +1811,7 @@ class Agent:
         # Recreate skill manager and tool manager with updated config
         self.skill_manager = SkillManager(self.config)
         self.tool_manager = ToolManager(self.config, skill_manager=self.skill_manager)
+        self.hooks = load_hooks(self.config)
 
         self._prompt_sections = build_prompt_sections(
             self.tool_manager,

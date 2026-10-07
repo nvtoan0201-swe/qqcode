@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from logging import getLogger
 from pathlib import Path
 import re
 
 from vibe.core.prompts.sections import SECTION_NAME_PATTERN
+
+logger = getLogger("vibe")
 
 FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 KEY_VALUE_PATTERN = re.compile(r"^([\w-]+):\s*(.+)$", re.MULTILINE)
@@ -120,7 +123,15 @@ def load_templates(dirs: list[Path]) -> dict[str, PromptTemplate]:
 
         for path in sorted(directory.glob("*.md")):
             name = path.stem
-            if not SECTION_NAME_PATTERN.fullmatch(name) or name in templates:
+            if not SECTION_NAME_PATTERN.fullmatch(name):
+                continue
+            if name in templates:
+                logger.warning(
+                    "Duplicate prompt template '%s' in %s ignored; keeping %s",
+                    name,
+                    directory,
+                    templates[name].source,
+                )
                 continue
 
             try:

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from vibe import VIBE_ROOT
 from vibe.core.config import get_vibe_home
+from vibe.core.packages import package_resource_dirs
 from vibe.core.tools.base import BaseTool, BaseToolConfig
 from vibe.core.tools.file_mutation_queue import FileMutationQueue
 from vibe.core.tools.mcp import (
@@ -52,13 +53,25 @@ class ToolManager:
         self._search_paths: list[Path] = self._compute_search_paths(config)
         self.file_mutation_queue = FileMutationQueue()
 
-        self._available: dict[str, type[BaseTool]] = {
-            cls.get_name(): cls for cls in self._iter_tool_classes(self._search_paths)
-        }
+        self._available: dict[str, type[BaseTool]] = {}
+        for cls in self._iter_tool_classes(self._search_paths):
+            name = cls.get_name()
+            if name in self._available:
+                logger.warning(
+                    "Duplicate tool '%s' from %s overrides an earlier definition",
+                    name,
+                    cls.__module__,
+                )
+            self._available[name] = cls
         self._integrate_mcp()
 
     @staticmethod
     def _compute_search_paths(config: VibeConfig) -> list[Path]:
+        """Compute tool search paths in increasing priority order.
+
+        Later paths win on name collisions: project > package > global >
+        explicit ``tool_paths`` > builtins.
+        """
         paths: list[Path] = [DEFAULT_TOOL_DIR]
 
         for p in config.tool_paths:
@@ -66,16 +79,18 @@ class ToolManager:
             if path.is_dir():
                 paths.append(path)
 
+        global_tools = get_vibe_home() / "tools"
+        if global_tools.is_dir():
+            paths.append(global_tools)
+
+        paths.extend(package_resource_dirs(config.packages, "tools"))
+
         cwd = config.effective_workdir
         for directory in (cwd, *cwd.parents):
             tools_dir = directory / ".qqcode" / "tools"
             if tools_dir.is_dir():
                 paths.append(tools_dir)
                 break
-
-        global_tools = get_vibe_home() / "tools"
-        if global_tools.is_dir():
-            paths.append(global_tools)
 
         unique: list[Path] = []
         seen: set[Path] = set()

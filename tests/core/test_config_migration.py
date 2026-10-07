@@ -10,6 +10,7 @@ import tomli_w
 from vibe.core import config
 from vibe.core.config import (
     CompactionConfig,
+    HooksConfig,
     ModelCapabilities,
     ModelConfig,
     ModelPricing,
@@ -215,3 +216,53 @@ def test_config_with_legacy_model_dicts_still_loads() -> None:
     assert config.get_context_limit_for_active_model() == 100_000
     assert model.pricing.input_per_million == 0.4
     assert model.pricing.output_per_million == 2.0
+
+
+def test_old_config_without_hooks_and_packages_still_loads(tmp_path: Path) -> None:
+    content = 'active_model = "devstral-2"\n'
+
+    with _migrate_config_file(tmp_path, content) as config_file:
+        data = _load_migrated_config(config_file)
+        loaded = VibeConfig(**data)
+
+    assert loaded.hooks == HooksConfig()
+    assert loaded.hooks.enabled is True
+    assert loaded.hooks.timeout == 5.0
+    assert loaded.packages == []
+
+
+def test_hooks_section_is_parsed() -> None:
+    loaded = VibeConfig(
+        hooks=HooksConfig(enabled=False, timeout=1.5, paths=["/tmp/hooks"])
+    )
+
+    assert loaded.hooks.enabled is False
+    assert loaded.hooks.timeout == 1.5
+    assert loaded.hooks.paths == ["/tmp/hooks"]
+
+
+def test_packages_section_is_parsed() -> None:
+    loaded = VibeConfig(packages=["alpha", "beta"])
+
+    assert loaded.packages == ["alpha", "beta"]
+
+
+def test_set_packages_persists_to_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        'active_model = "devstral-2"\nauto_compact_threshold = 200000\n',
+        encoding="utf-8",
+    )
+    original_dump_config = _restore_dump_config(config_file)
+    monkeypatch.setattr(config, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+
+    try:
+        VibeConfig.set_packages(["alpha", "beta"])
+
+        assert _load_migrated_config(config_file)["packages"] == ["alpha", "beta"]
+        assert _load_migrated_config(config_file)["active_model"] == "devstral-2"
+    finally:
+        VibeConfig.dump_config = original_dump_config

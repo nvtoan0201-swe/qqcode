@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from vibe.core.config import get_vibe_home
+from vibe.core.packages import package_resource_dirs
 
 if TYPE_CHECKING:
     from vibe.core.config import VibeConfig
@@ -75,8 +76,9 @@ class SkillManager:
         Priority order:
         1. Project-local: ./.qqcode/skills/ (cwd up to root)
         2. Project-local: ./.agents/skills/ (cwd up to root)
-        3. Global: ~/.qqcode/skills/
-        4. Global: ~/.agents/skills/
+        3. Installed resource packages
+        4. Global: ~/.qqcode/skills/
+        5. Global: ~/.agents/skills/
         """
         paths: list[Path] = []
 
@@ -87,6 +89,8 @@ class SkillManager:
                 if skills_dir.is_dir():
                     paths.append(skills_dir)
                     break
+
+        paths.extend(package_resource_dirs(config.packages, "skills"))
 
         global_paths = (get_vibe_home() / "skills", Path.home() / ".agents" / "skills")
         paths.extend(path for path in global_paths if path.is_dir())
@@ -175,8 +179,11 @@ class SkillManager:
 
                     # Skip duplicates (first one wins - project takes priority)
                     if name in seen_names:
-                        logger.debug(
-                            "Skipping duplicate skill '%s' from %s", name, skill_dir
+                        logger.warning(
+                            "Duplicate skill '%s' from %s ignored; "
+                            "a higher-priority definition already loaded",
+                            name,
+                            skill_dir,
                         )
                         continue
 

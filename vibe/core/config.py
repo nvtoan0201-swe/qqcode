@@ -180,6 +180,15 @@ class RetryConfig(BaseSettings):
     honor_retry_after: bool = True
 
 
+class HooksConfig(BaseSettings):
+    enabled: bool = True
+    timeout: float = 5.0
+    paths: list[str] = Field(
+        default_factory=list,
+        description="Additional directories to search for hook modules.",
+    )
+
+
 class Backend(StrEnum):
     MISTRAL = auto()
     GENERIC = auto()
@@ -659,6 +668,11 @@ class VibeConfig(BaseSettings):
     session_logging: SessionLoggingConfig = Field(default_factory=SessionLoggingConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    hooks: HooksConfig = Field(default_factory=HooksConfig)
+    packages: list[str] = Field(
+        default_factory=list,
+        description="Names of installed resource packages under ~/.qqcode/packages.",
+    )
     tool_runtime: ToolRuntimeConfig = Field(default_factory=ToolRuntimeConfig)
     tools: dict[str, BaseToolConfig] = Field(default_factory=dict)
     tool_paths: list[str] = Field(
@@ -1027,17 +1041,41 @@ class VibeConfig(BaseSettings):
             tomli_w.dump(config, f)
 
     @classmethod
-    def _get_agent_config(cls, agent: str | None) -> dict[str, Any] | None:
+    def set_packages(cls, names: list[str]) -> None:
+        """Persist the installed resource package list to the config file."""
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        current_config = TomlFileSettingsSource(cls).toml_data
+        current_config["packages"] = list(names)
+        cls.dump_config(
+            to_jsonable_python(current_config, exclude_none=True, fallback=str)
+        )
+
+    @classmethod
+    def _get_agent_config(
+        cls, agent: str | None, packages: list[str] | None = None
+    ) -> dict[str, Any] | None:
         if agent is None:
             return None
 
-        agent_config_path = (AGENT_DIR / agent).with_suffix(".toml")
-        try:
-            return tomllib.load(agent_config_path.open("rb"))
-        except FileNotFoundError:
-            raise ValueError(
-                f"Config '{agent}.toml' for agent not found in {AGENT_DIR}"
-            )
+        search_dirs: list[Path] = []
+        cwd = Path.cwd()
+        for directory in (cwd, *cwd.parents):
+            project_dir = directory / ".qqcode" / "agents"
+            if project_dir.is_dir():
+                search_dirs.append(project_dir)
+                break
+
+        from vibe.core.packages import package_resource_dirs
+
+        search_dirs.extend(package_resource_dirs(packages or [], "agents"))
+        search_dirs.append(AGENT_DIR)
+
+        for directory in search_dirs:
+            agent_config_path = (directory / agent).with_suffix(".toml")
+            if agent_config_path.is_file():
+                return tomllib.load(agent_config_path.open("rb"))
+
+        raise ValueError(f"Config '{agent}.toml' for agent not found in {AGENT_DIR}")
 
     @classmethod
     def _migrate(cls) -> None:
@@ -1065,9 +1103,11 @@ class VibeConfig(BaseSettings):
     @classmethod
     def load(cls, agent: str | None = None, **overrides: Any) -> VibeConfig:
         cls._migrate()
-        agent_config = cls._get_agent_config(agent)
-        init_data = {**(agent_config or {}), **overrides}
-        config = cls(**init_data)
+        base = cls(**overrides)
+        config = base
+        if agent is not None:
+            agent_config = cls._get_agent_config(agent, base.packages)
+            config = cls(**{**(agent_config or {}), **overrides})
 
         from vibe.core.models_overlay import (
             default_overlay_paths,

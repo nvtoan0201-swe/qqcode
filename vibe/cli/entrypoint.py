@@ -24,6 +24,14 @@ from vibe.core.config import (
 )
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.models_overlay import validate_models
+from vibe.core.packages import (
+    InstalledPackage,
+    PackageError,
+    install,
+    list_packages,
+    remove,
+    update,
+)
 from vibe.core.programmatic import run_programmatic
 from vibe.core.sessions.migrate import migrate_directory
 from vibe.core.sessions.store import JsonlSessionStore
@@ -508,12 +516,86 @@ def run_models_command(argv: list[str]) -> int:
     return 1
 
 
+def _build_packages_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="qqcode",
+        description="Manage resource packages (tools, skills, prompts, agents, hooks)",
+    )
+    subparsers = parser.add_subparsers(dest="packages_command", required=True)
+
+    install_parser = subparsers.add_parser(
+        "install", help="Install a package from a git URL or a local directory"
+    )
+    install_parser.add_argument("source", metavar="SOURCE")
+    install_parser.add_argument(
+        "--name", metavar="NAME", help="Override the installed package name"
+    )
+
+    subparsers.add_parser("list", help="List installed packages")
+
+    remove_parser = subparsers.add_parser("remove", help="Remove an installed package")
+    remove_parser.add_argument("name", metavar="NAME")
+
+    update_parser = subparsers.add_parser(
+        "update", help="Update a git-installed package (git pull)"
+    )
+    update_parser.add_argument("name", metavar="NAME")
+    return parser
+
+
+def _package_entry(package: InstalledPackage) -> dict[str, Any]:
+    return {
+        "name": package.name,
+        "version": package.version,
+        "path": str(package.path),
+        "source": package.source,
+        "git": package.git,
+    }
+
+
+def run_packages_command(argv: list[str]) -> int:
+    args = _build_packages_parser().parse_args(argv)
+    config = load_config_or_exit()
+
+    try:
+        match args.packages_command:
+            case "install":
+                info = install(args.source, args.name)
+                names = list(dict.fromkeys([*config.packages, info.name]))
+                VibeConfig.set_packages(names)
+                print(json.dumps(_package_entry(info)))
+                return 0
+            case "list":
+                installed = list_packages(config.packages)
+                print(json.dumps([_package_entry(pkg) for pkg in installed]))
+                return 0
+            case "remove":
+                remove(args.name)
+                names = [name for name in config.packages if name != args.name]
+                VibeConfig.set_packages(names)
+                print(json.dumps({"removed": args.name}))
+                return 0
+            case "update":
+                output = update(args.name)
+                print(json.dumps({"updated": args.name, "output": output}))
+                return 0
+            case _:
+                return 1
+    except PackageError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 1
+
+
 def main() -> None:  # noqa: PLR0912, PLR0915
     load_api_keys_from_env()
     if sys.argv[1:2] == ["sessions"]:
         sys.exit(run_sessions_command(sys.argv[2:]))
     if sys.argv[1:2] == ["models"]:
         sys.exit(run_models_command(sys.argv[2:]))
+    if sys.argv[1:2] == ["packages"]:
+        sys.exit(run_packages_command(sys.argv[2:]))
+    if sys.argv[1:2] in (["install"], ["list"], ["remove"], ["update"]):
+        sys.exit(run_packages_command(sys.argv[1:]))
     args = parse_arguments()
 
     if args.setup:

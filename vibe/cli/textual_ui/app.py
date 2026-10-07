@@ -54,6 +54,7 @@ from vibe.core.agent import Agent
 from vibe.core.autocompletion.path_prompt_adapter import render_path_prompt
 from vibe.core.config import HISTORY_FILE, ThinkingLevel, VibeConfig, get_vibe_home
 from vibe.core.interaction_logger import InteractionLogger
+from vibe.core.packages import package_resource_dirs
 from vibe.core.prompts.templates import load_templates, render_template
 from vibe.core.sessions.entries import MessageEntry
 from vibe.core.sessions.export import export_session, import_session
@@ -646,6 +647,8 @@ class VibeApp(App):
             if candidate.is_dir():
                 dirs.append(candidate)
                 break
+
+        dirs.extend(package_resource_dirs(self.config.packages, "prompts"))
 
         global_dir = get_vibe_home() / "prompts" / "commands"
         if global_dir.is_dir():
