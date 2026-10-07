@@ -37,6 +37,7 @@ from vibe.core.llm.format import (
     ResolvedToolCall,
 )
 from vibe.core.llm.types import BackendLike
+from vibe.core.mcp.manager import MCPManager
 from vibe.core.middleware import (
     AutoCompactMiddleware,
     ContextWarningMiddleware,
@@ -75,6 +76,7 @@ from vibe.core.types import (
     LLMChunk,
     LLMMessage,
     LLMUsage,
+    MCPToolsChangedEvent,
     ModeChangedEvent,
     Role,
     SyncApprovalCallback,
@@ -187,14 +189,23 @@ class Agent:
         enable_streaming: bool = False,
         session_id: str | None = None,
         additional_directory_contexts: list[Path] | None = None,
+        mcp_manager: MCPManager | None = None,
     ) -> None:
         self.config = config
 
         # Initialize skill manager for domain-specific expertise
         self.skill_manager = SkillManager(config)
 
-        # Initialize tool manager with skill manager reference
-        self.tool_manager = ToolManager(config, skill_manager=self.skill_manager)
+        # Initialize tool manager with skill manager reference. When an MCP
+        # manager is provided its already-discovered tools are registered;
+        # otherwise ToolManager keeps the legacy connect-per-call behaviour.
+        self.mcp_manager = mcp_manager
+        self.tool_manager = ToolManager(
+            config,
+            skill_manager=self.skill_manager,
+            mcp_manager=mcp_manager,
+            tools_changed_callback=self._on_mcp_tools_changed,
+        )
         self.format_handler = APIToolFormatHandler()
 
         # Lifecycle extension hooks (project + package + global directories)
@@ -252,6 +263,7 @@ class Agent:
         self._steering: asyncio.Queue[str] = asyncio.Queue()
         self._abort_event = asyncio.Event()
         self._active_task: asyncio.Task[Any] | None = None
+        self._pending_events: list[BaseEvent] = []
 
         self.approval_callback: ApprovalCallback | None = None
         self.plan_approval_callback: Callable[[str], Any] | None = (
@@ -417,6 +429,8 @@ class Agent:
         )
         for injected in start_decision.injected_messages:
             self._append_message(injected)
+        while self._pending_events:
+            yield self._pending_events.pop(0)
         try:
             async for event in self._conversation_loop(msg):
                 yield event
@@ -1744,6 +1758,22 @@ class Agent:
         else:
             self._prompt_sections.remove("skills")
 
+    def _on_mcp_tools_changed(self) -> None:
+        if getattr(self, "tool_manager", None) is None:
+            return
+        if getattr(self, "_prompt_sections", None) is None:
+            return
+        self._pending_events.append(MCPToolsChangedEvent())
+        self._refresh_tool_sections()
+        self._apply_prompt_sections()
+
+    def refresh_mcp_tools(self) -> None:
+        """Re-sync MCP tool classes and rebuild tool-dependent prompt sections."""
+        if self.mcp_manager is None:
+            return
+        self.tool_manager.apply_mcp_tools()
+        self._on_mcp_tools_changed()
+
     def _apply_prompt_sections(self) -> SystemPromptChangedEvent | None:
         content = self._prompt_sections.render()
         if self.messages and self.messages[0].content == content:
@@ -1810,7 +1840,12 @@ class Agent:
 
         # Recreate skill manager and tool manager with updated config
         self.skill_manager = SkillManager(self.config)
-        self.tool_manager = ToolManager(self.config, skill_manager=self.skill_manager)
+        self.tool_manager = ToolManager(
+            self.config,
+            skill_manager=self.skill_manager,
+            mcp_manager=self.mcp_manager,
+            tools_changed_callback=self._on_mcp_tools_changed,
+        )
         self.hooks = load_hooks(self.config)
 
         self._prompt_sections = build_prompt_sections(

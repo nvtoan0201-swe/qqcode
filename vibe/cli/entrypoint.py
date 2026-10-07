@@ -10,6 +10,7 @@ from typing import Any
 from rich import print as rprint
 from rich.table import Table
 
+from vibe.cli.mcp_cli import run_mcp_command
 from vibe.cli.textual_ui.app import UISessionOptions, run_textual_ui
 from vibe.core.config import (
     CONFIG_FILE,
@@ -44,8 +45,9 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the QQcode interactive CLI",
         epilog=(
-            "Use 'qqcode sessions [list|repair|migrate]' to manage saved sessions "
-            "or 'qqcode models [list|validate]' to inspect the model catalog."
+            "Use 'qqcode sessions [list|repair|migrate]' to manage saved sessions, "
+            "'qqcode models [list|validate]' to inspect the model catalog, or "
+            "'qqcode mcp [list|add|remove|login|logout]' to manage MCP servers."
         ),
     )
     parser.add_argument(
@@ -594,6 +596,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         sys.exit(run_models_command(sys.argv[2:]))
     if sys.argv[1:2] == ["packages"]:
         sys.exit(run_packages_command(sys.argv[2:]))
+    if sys.argv[1:2] == ["mcp"]:
+        sys.exit(run_mcp_command(sys.argv[2:]))
     if sys.argv[1:2] in (["install"], ["list"], ["remove"], ["update"]):
         sys.exit(run_packages_command(sys.argv[1:]))
     args = parse_arguments()

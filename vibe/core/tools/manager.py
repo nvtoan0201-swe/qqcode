@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 import importlib.util
 import inspect
 from logging import getLogger
@@ -27,6 +27,7 @@ logger = getLogger("vibe")
 
 if TYPE_CHECKING:
     from vibe.core.config import MCPHttp, MCPStdio, MCPStreamableHttp, VibeConfig
+    from vibe.core.mcp.manager import MCPManager
     from vibe.core.skills.manager import SkillManager
 
 
@@ -45,10 +46,17 @@ class ToolManager:
     """
 
     def __init__(
-        self, config: VibeConfig, skill_manager: SkillManager | None = None
+        self,
+        config: VibeConfig,
+        skill_manager: SkillManager | None = None,
+        mcp_manager: MCPManager | None = None,
+        tools_changed_callback: Callable[[], None] | None = None,
     ) -> None:
         self._config = config
         self._skill_manager = skill_manager
+        self._mcp_manager = mcp_manager
+        self._tools_changed_callback = tools_changed_callback
+        self._mcp_tool_names: set[str] = set()
         self._instances: dict[str, BaseTool] = {}
         self._search_paths: list[Path] = self._compute_search_paths(config)
         self.file_mutation_queue = FileMutationQueue()
@@ -63,7 +71,13 @@ class ToolManager:
                     cls.__module__,
                 )
             self._available[name] = cls
-        self._integrate_mcp()
+        if mcp_manager is not None:
+            self._apply_mcp_tools()
+            mcp_manager.on_tools_changed(self._apply_mcp_tools)
+        else:
+            # Compatibility shim: connect-per-call discovery when no manager
+            # is provided by the caller.
+            self._integrate_mcp()
 
     @staticmethod
     def _compute_search_paths(config: VibeConfig) -> list[Path]:
@@ -158,6 +172,34 @@ class ToolManager:
 
     def available_tools(self) -> dict[str, type[BaseTool]]:
         return dict(self._available)
+
+    def apply_mcp_tools(self) -> None:
+        """Re-sync MCP tool classes from the manager (also used as a callback)."""
+        self._apply_mcp_tools()
+
+    def _apply_mcp_tools(self) -> None:
+        manager = self._mcp_manager
+        if manager is None:
+            return
+        classes = {cls.get_name(): cls for cls in manager.cached_tool_classes()}
+        changed = False
+
+        for name in list(self._mcp_tool_names):
+            if name not in classes:
+                self._available.pop(name, None)
+                self._instances.pop(name, None)
+                self._mcp_tool_names.discard(name)
+                changed = True
+
+        for name, tool_class in classes.items():
+            if self._available.get(name) is not tool_class:
+                self._available[name] = tool_class
+                self._instances.pop(name, None)
+                self._mcp_tool_names.add(name)
+                changed = True
+
+        if changed and self._tools_changed_callback is not None:
+            self._tools_changed_callback()
 
     def _integrate_mcp(self) -> None:
         if not self._config.mcp_servers:

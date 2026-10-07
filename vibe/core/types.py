@@ -339,6 +339,12 @@ class SystemPromptChangedEvent(BaseEvent):
     content: str
 
 
+class MCPToolsChangedEvent(BaseEvent):
+    """Emitted when an MCP server reports a changed tool list."""
+
+    server: str | None = None
+
+
 class OutputFormat(StrEnum):
     TEXT = auto()
     JSON = auto()

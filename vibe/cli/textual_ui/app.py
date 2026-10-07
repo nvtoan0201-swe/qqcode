@@ -54,6 +54,7 @@ from vibe.core.agent import Agent
 from vibe.core.autocompletion.path_prompt_adapter import render_path_prompt
 from vibe.core.config import HISTORY_FILE, ThinkingLevel, VibeConfig, get_vibe_home
 from vibe.core.interaction_logger import InteractionLogger
+from vibe.core.mcp.manager import MCPManager
 from vibe.core.packages import package_resource_dirs
 from vibe.core.prompts.templates import load_templates, render_template
 from vibe.core.sessions.entries import MessageEntry
@@ -161,6 +162,7 @@ class VibeApp(App):
             self.agent_mode = AgentMode.INTERACTIVE
         self.enable_streaming = enable_streaming
         self.agent: Agent | None = None
+        self.mcp_manager: MCPManager | None = None
         self._agent_running = False
         self._agent_initializing = False
         self._interrupt_requested = False
@@ -262,6 +264,11 @@ class VibeApp(App):
             self.run_worker(
                 self._handle_user_message(self._initial_prompt), exclusive=False
             )
+
+    async def on_unmount(self) -> None:
+        if self.mcp_manager is not None:
+            await self.mcp_manager.stop()
+            self.mcp_manager = None
 
     async def on_chat_input_container_submitted(
         self, event: ChatInputContainer.Submitted
@@ -846,11 +853,16 @@ class VibeApp(App):
 
         self._agent_initializing = True
         try:
+            mcp_manager = MCPManager(self.config)
+            await mcp_manager.start()
+            self.mcp_manager = mcp_manager
+
             agent = Agent(
                 self.config,
                 mode=self.agent_mode,
                 enable_streaming=self.enable_streaming,
                 additional_directory_contexts=self._additional_directory_contexts,
+                mcp_manager=mcp_manager,
             )
 
             if self.agent_mode != AgentMode.AUTO_APPROVE:

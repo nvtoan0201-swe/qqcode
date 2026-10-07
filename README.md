@@ -297,6 +297,38 @@ Key fields:
 - `api_key_env`: Environment variable containing the API key
 - `command`: Command to run for stdio transport
 - `args`: Additional arguments for stdio transport
+- `enabled`: Connect the server at startup (default `true`)
+- `timeout`: Per-operation timeout in seconds (default `60`)
+- `tool_exposure`: `direct` (default), `deferred` (hidden behind `mcp_search`), or `hidden`
+- `env`: Extra environment variables for stdio servers
+- `oauth`: OAuth 2.1 configuration for protected HTTP servers
+
+```toml
+# Protected HTTP server with OAuth
+[[mcp_servers]]
+name = "protected"
+transport = "streamable-http"
+url = "https://mcp.example.com/mcp"
+
+[mcp_servers.oauth]
+client_id = "my-client"      # omit to use dynamic client registration
+scopes = ["read"]
+```
+
+Manage servers from the CLI instead of editing TOML by hand:
+
+```bash
+qqcode mcp list [--json]
+qqcode mcp add fetch_server -- uvx mcp-server-fetch
+qqcode mcp add protected --url https://mcp.example.com/mcp --oauth
+qqcode mcp remove protected
+qqcode mcp login protected    # browser OAuth flow
+qqcode mcp logout protected
+```
+
+Resource tools (`mcp__<server>__list_resources`,
+`mcp__<server>__list_resource_templates`, `mcp__<server>__read_resource`) expose
+server resources. See [docs/mcp.md](docs/mcp.md) for the full guide.
 
 MCP tools are named using the pattern `{server_name}_{tool_name}` and can be configured with permissions like built-in tools:
 

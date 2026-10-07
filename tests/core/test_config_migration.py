@@ -11,6 +11,8 @@ from vibe.core import config
 from vibe.core.config import (
     CompactionConfig,
     HooksConfig,
+    MCPStdio,
+    MCPStreamableHttp,
     ModelCapabilities,
     ModelConfig,
     ModelPricing,
@@ -266,3 +268,69 @@ def test_set_packages_persists_to_config_file(
         assert _load_migrated_config(config_file)["active_model"] == "devstral-2"
     finally:
         VibeConfig.dump_config = original_dump_config
+
+
+def test_legacy_mcp_server_config_still_loads() -> None:
+    loaded = VibeConfig.model_validate({
+        "mcp_servers": [
+            {
+                "name": "legacy",
+                "transport": "stdio",
+                "command": "python",
+                "args": ["server.py"],
+            }
+        ]
+    })
+
+    server = loaded.mcp_servers[0]
+    assert server.enabled is True
+    assert server.timeout == 60.0
+    assert server.tool_exposure == "direct"
+
+
+def test_mcp_http_oauth_fields_are_parsed() -> None:
+    loaded = VibeConfig.model_validate({
+        "mcp_servers": [
+            {
+                "name": "protected",
+                "transport": "streamable-http",
+                "url": "https://example.invalid/mcp",
+                "timeout": 5.0,
+                "tool_exposure": "deferred",
+                "oauth": {
+                    "client_id": "cid",
+                    "client_secret": "secret",
+                    "callback_port": 3334,
+                    "auth_server_url": "https://auth.example.invalid",
+                    "scopes": ["read", "write"],
+                },
+            }
+        ]
+    })
+
+    server = loaded.mcp_servers[0]
+    assert isinstance(server, MCPStreamableHttp)
+    assert server.timeout == 5.0
+    assert server.tool_exposure == "deferred"
+    assert server.oauth is not None
+    assert server.oauth.client_id == "cid"
+    assert server.oauth.callback_port == 3334
+    assert server.oauth.scopes == ["read", "write"]
+
+
+def test_mcp_stdio_env_is_parsed() -> None:
+    loaded = VibeConfig.model_validate({
+        "mcp_servers": [
+            {
+                "name": "env-server",
+                "transport": "stdio",
+                "command": "python",
+                "env": {"API_TOKEN": "abc"},
+            }
+        ]
+    })
+
+    server = loaded.mcp_servers[0]
+    assert isinstance(server, MCPStdio)
+    assert server.env == {"API_TOKEN": "abc"}
+    assert server.stdio_env()["API_TOKEN"] == "abc"

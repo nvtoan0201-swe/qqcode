@@ -209,10 +209,43 @@ class ProviderConfig(BaseModel):
     models_path: str | None = None
 
 
+class MCPOAuthConfig(BaseModel):
+    client_id: str | None = Field(
+        default=None, description="Pre-registered OAuth client id (skips DCR)."
+    )
+    client_secret: str | None = Field(
+        default=None, description="OAuth client secret, if the client is confidential."
+    )
+    callback_port: int | None = Field(
+        default=None,
+        description="Fixed loopback callback port for the OAuth redirect (random if unset).",
+    )
+    auth_server_url: str | None = Field(
+        default=None, description="Override OAuth authorization server discovery."
+    )
+    scopes: list[str] = Field(
+        default_factory=list, description="OAuth scopes to request."
+    )
+
+
 class _MCPBase(BaseModel):
     name: str = Field(description="Short alias used to prefix tool names")
     prompt: str | None = Field(
         default=None, description="Optional usage hint appended to tool descriptions"
+    )
+    enabled: bool = Field(
+        default=True, description="Whether this server is connected at startup."
+    )
+    timeout: float = Field(
+        default=60.0, description="Per-operation timeout in seconds for this server."
+    )
+    tool_exposure: Literal["direct", "deferred", "hidden"] = Field(
+        default="direct",
+        description=(
+            "How the server's tools are exposed: 'direct' adds them to the tool "
+            "list, 'deferred' hides them behind the mcp_search tool, 'hidden' "
+            "keeps them callable only by name."
+        ),
     )
 
     @field_validator("name", mode="after")
@@ -225,6 +258,10 @@ class _MCPBase(BaseModel):
 
 class _MCPHttpFields(BaseModel):
     url: str = Field(description="Base URL of the MCP HTTP server")
+    oauth: MCPOAuthConfig | None = Field(
+        default=None,
+        description="OAuth 2.1 client configuration for protected HTTP servers.",
+    )
     headers: dict[str, str] = Field(
         default_factory=dict,
         description=(
@@ -276,6 +313,9 @@ class MCPStdio(_MCPBase):
     transport: Literal["stdio"]
     command: str | list[str]
     args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(
+        default_factory=dict, description="Extra environment variables for the process."
+    )
 
     def argv(self) -> list[str]:
         base = (
@@ -284,6 +324,9 @@ class MCPStdio(_MCPBase):
             else list(self.command or [])
         )
         return [*base, *self.args] if self.args else base
+
+    def stdio_env(self) -> dict[str, str]:
+        return {**os.environ, **self.env} if self.env else dict(os.environ)
 
 
 MCPServer = Annotated[
@@ -1023,7 +1066,7 @@ class VibeConfig(BaseSettings):
                     and isinstance(target.get(key), list)
                     and isinstance(value, list)
                 ):
-                    if key in {"providers", "models", "enabled_models"}:
+                    if key in {"providers", "models", "enabled_models", "mcp_servers"}:
                         target[key] = value
                     else:
                         target[key] = list(set(value + target[key]))

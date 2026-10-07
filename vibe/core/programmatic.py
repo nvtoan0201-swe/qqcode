@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 import json
 import sys
 import threading
@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol, TextIO
 
 from vibe.core.agent import Agent
 from vibe.core.config import ThinkingLevel, VibeConfig
+from vibe.core.mcp.manager import MCPManager
 from vibe.core.output_formatters import (
     EventJsonlFormatter,
     VScodeJsonFormatter,
@@ -343,6 +344,7 @@ def run_programmatic(
         max_price=max_price,
         enable_streaming=False,
         session_id=session_id,
+        mcp_manager=MCPManager(config),
     )
 
     # Create formatter with agent's session_id for structured output formats
@@ -403,9 +405,8 @@ def run_programmatic(
                 name="stdin-control",
             )
 
-        agent_task = asyncio.create_task(_run_agent(), name="agent-run")
         try:
-            return await agent_task
+            return await _run_agent_with_mcp(agent, _run_agent)
         except asyncio.CancelledError:
             logger.info("Agent turn aborted")
             return formatter.finalize()
@@ -420,3 +421,19 @@ def run_programmatic(
                 channel.close()
 
     return asyncio.run(_async_run())
+
+
+async def _run_agent_with_mcp(
+    agent: Agent, run: Callable[[], Coroutine[Any, Any, str | None]]
+) -> str | None:
+    manager = agent.mcp_manager
+    if manager is not None:
+        await manager.start()
+        agent.refresh_mcp_tools()
+    task = asyncio.create_task(run(), name="agent-run")
+    try:
+        return await task
+    finally:
+        task.cancel()
+        if manager is not None:
+            await manager.stop()
