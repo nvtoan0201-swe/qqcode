@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 import json
+import logging
 import os
 import types
 from typing import TYPE_CHECKING
@@ -9,8 +11,15 @@ from typing import TYPE_CHECKING
 import anthropic
 import httpx
 
+from vibe.core.config import (
+    DEFAULT_BUDGETS,
+    ThinkingLevel,
+    resolve_thinking_level,
+    save_oauth_token,
+)
 from vibe.core.llm.cache import CachePlan
 from vibe.core.llm.exceptions import BackendErrorBuilder
+from vibe.core.oauth.registry import get_flow
 from vibe.core.types import (
     AvailableTool,
     FunctionCall,
@@ -24,6 +33,9 @@ from vibe.core.types import (
 
 if TYPE_CHECKING:
     from vibe.core.config import ModelConfig, ProviderConfig
+    from vibe.core.oauth.token import AnthropicOAuthToken, QwenOAuthToken
+
+logger = logging.getLogger(__name__)
 
 
 # Required system prompt prefix for Claude Code OAuth
@@ -284,11 +296,18 @@ class AnthropicMapper:
 class AnthropicBackend:
     """Backend using the official Anthropic Python SDK."""
 
-    def __init__(self, provider: ProviderConfig, timeout: float = 720.0) -> None:
+    def __init__(
+        self,
+        provider: ProviderConfig,
+        timeout: float = 720.0,
+        honor_retry_after: bool = True,
+    ) -> None:
         self._client: anthropic.AsyncAnthropic | None = None
         self._provider = provider
         self._mapper = AnthropicMapper()
         self._timeout = timeout
+        self._honor_retry_after = honor_retry_after
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
 
     def _is_oauth(self) -> bool:
         """Check if OAuth token is configured."""
@@ -302,32 +321,77 @@ class AnthropicBackend:
             return os.getenv(self._provider.api_key_env_var)
         return None
 
-    async def _refresh_oauth_token(self) -> None:
+    async def _refresh_oauth_token(
+        self, token: AnthropicOAuthToken | QwenOAuthToken | None = None
+    ) -> None:
         """Refresh the OAuth token if it's expired."""
-        if not self._provider.oauth_token:
+        token = token or self._provider.oauth_token
+        if token is None:
             return
 
         try:
-            from vibe.core.config import save_oauth_token
-            from vibe.core.oauth.claude import refresh_token
-
-            new_token = await refresh_token(self._provider.oauth_token.refresh_token)
+            flow = get_flow(self._provider.oauth_flow or self._provider.name)
+            new_token = await flow.refresh(token.refresh_token)
             # Update in-memory token
             self._provider.oauth_token = new_token
             # Persist to config
             save_oauth_token(self._provider.name, new_token)
         except Exception:
             # If refresh fails, clear the token so we fall back to API key
+            logger.debug(
+                "OAuth refresh failed for provider %s",
+                self._provider.name,
+                exc_info=True,
+            )
             self._provider.oauth_token = None
 
     async def _ensure_fresh_token(self) -> None:
         """Ensure OAuth token is refreshed if expired.
 
         This should be called at the start of both complete() and complete_streaming()
-        to ensure the token is valid before making API calls.
+        to ensure the token is valid before making API calls. Concurrent callers
+        share a per-provider lock so the token is refreshed at most once.
         """
-        if self._provider.oauth_token and self._provider.oauth_token.is_expired():
-            await self._refresh_oauth_token()
+        token = self._provider.oauth_token
+        if token is None or not token.is_expired(skew=60):
+            return
+
+        lock = self._refresh_locks.setdefault(self._provider.name, asyncio.Lock())
+        async with lock:
+            token = self._provider.oauth_token
+            if token is None or not token.is_expired(skew=60):
+                return
+            await self._refresh_oauth_token(token)
+
+    def _apply_thinking(
+        self,
+        kwargs: dict,
+        messages: list[LLMMessage],
+        model: ModelConfig,
+        thinking_level: ThinkingLevel | None,
+    ) -> dict[str, str]:
+        """Add thinking config to request kwargs and return extra headers."""
+        extra_body = model.extra_body or {}
+        level = resolve_thinking_level(model, thinking_level)
+        thinking: dict | None = None
+        if "thinking" in extra_body:
+            candidate = extra_body["thinking"]
+            thinking = candidate if isinstance(candidate, dict) else None
+        elif level is not None and level is not ThinkingLevel.OFF:
+            thinking = {"type": "enabled", "budget_tokens": DEFAULT_BUDGETS[level]}
+
+        if not thinking or not self._mapper.is_compatible_with_thinking(messages):
+            return {}
+
+        kwargs["thinking"] = thinking
+        # Temperature must be 1 for thinking mode
+        kwargs.pop("temperature", None)
+
+        if self._is_oauth():
+            return {
+                "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14"
+            }
+        return {"anthropic-beta": "interleaved-thinking-2025-05-14"}
 
     def _build_client(self) -> anthropic.AsyncAnthropic:
         """Build the Anthropic client with proper authentication."""
@@ -385,6 +449,7 @@ class AnthropicBackend:
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
         cache_plan: CachePlan | None = None,
+        thinking_level: ThinkingLevel | None = None,
     ) -> LLMChunk:
         await self._ensure_fresh_token()
 
@@ -426,27 +491,10 @@ class AnthropicBackend:
                 if tc:
                     kwargs["tool_choice"] = tc
 
-            # Handle thinking mode from model.extra_body
-            extra_call_headers: dict[str, str] = {}
-            thinking_enabled = (
-                model.extra_body
-                and "thinking" in model.extra_body
-                and self._mapper.is_compatible_with_thinking(messages)
+            # Handle thinking mode from the session level or model.extra_body
+            extra_call_headers = self._apply_thinking(
+                kwargs, messages, model, thinking_level
             )
-            if thinking_enabled:
-                kwargs["thinking"] = model.extra_body["thinking"]  # type: ignore
-
-                if self._is_oauth():
-                    extra_call_headers["anthropic-beta"] = (
-                        "oauth-2025-04-20,interleaved-thinking-2025-05-14"
-                    )
-                else:
-                    extra_call_headers["anthropic-beta"] = (
-                        "interleaved-thinking-2025-05-14"
-                    )
-                # Temperature must be 1 for thinking mode
-                if "temperature" in kwargs:
-                    del kwargs["temperature"]
 
             response = await self._get_client().messages.create(
                 **kwargs,
@@ -512,6 +560,7 @@ class AnthropicBackend:
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
         cache_plan: CachePlan | None = None,
+        thinking_level: ThinkingLevel | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
         await self._ensure_fresh_token()
 
@@ -553,26 +602,10 @@ class AnthropicBackend:
                 if tc:
                     kwargs["tool_choice"] = tc
 
-            # Handle thinking mode from model.extra_body
-            extra_call_headers: dict[str, str] = {}
-            thinking_enabled = (
-                model.extra_body
-                and "thinking" in model.extra_body
-                and self._mapper.is_compatible_with_thinking(messages)
+            # Handle thinking mode from the session level or model.extra_body
+            extra_call_headers = self._apply_thinking(
+                kwargs, messages, model, thinking_level
             )
-            if thinking_enabled:
-                kwargs["thinking"] = model.extra_body["thinking"]  # type: ignore
-                if self._is_oauth():
-                    extra_call_headers["anthropic-beta"] = (
-                        "oauth-2025-04-20,interleaved-thinking-2025-05-14"
-                    )
-                else:
-                    extra_call_headers["anthropic-beta"] = (
-                        "interleaved-thinking-2025-05-14"
-                    )
-                # Temperature must be 1 for thinking mode
-                if "temperature" in kwargs:
-                    del kwargs["temperature"]
 
             # Accumulate tool calls across stream
             current_tool_calls: dict[int, dict] = {}

@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import secrets
+from typing import ClassVar
 from urllib.parse import urlencode
 
 import httpx
 
+from vibe.core.oauth.registry import register_flow
 from vibe.core.oauth.token import AnthropicOAuthToken
 
 # OAuth constants from Crush CLI implementation
@@ -98,16 +100,18 @@ async def exchange_token(code: str, verifier: str) -> AnthropicOAuthToken:
         response = await client.post(
             TOKEN_URL,
             json=data,  # Send as JSON
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "anthropic",
-            },
+            headers={"Content-Type": "application/json", "User-Agent": "anthropic"},
         )
         if not response.is_success:
             # Try to get error details from response
             try:
                 error_data = response.json()
-                error_msg = error_data.get("error_description") or error_data.get("message") or error_data.get("error") or response.text
+                error_msg = (
+                    error_data.get("error_description")
+                    or error_data.get("message")
+                    or error_data.get("error")
+                    or response.text
+                )
             except Exception:
                 error_msg = response.text
             raise ValueError(f"Token exchange failed: {error_msg}")
@@ -121,7 +125,7 @@ async def exchange_token(code: str, verifier: str) -> AnthropicOAuthToken:
     )
 
 
-async def refresh_token(refresh_token_str: str) -> AnthropicOAuthToken:
+async def _refresh_access_token(refresh_token_str: str) -> AnthropicOAuthToken:
     """Refresh an expired access token.
 
     Args:
@@ -143,15 +147,17 @@ async def refresh_token(refresh_token_str: str) -> AnthropicOAuthToken:
         response = await client.post(
             TOKEN_URL,
             json=data,  # Send as JSON
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "anthropic",
-            },
+            headers={"Content-Type": "application/json", "User-Agent": "anthropic"},
         )
         if not response.is_success:
             try:
                 error_data = response.json()
-                error_msg = error_data.get("error_description") or error_data.get("message") or error_data.get("error") or response.text
+                error_msg = (
+                    error_data.get("error_description")
+                    or error_data.get("message")
+                    or error_data.get("error")
+                    or response.text
+                )
             except Exception:
                 error_msg = response.text
             raise ValueError(f"Token refresh failed: {error_msg}")
@@ -163,3 +169,21 @@ async def refresh_token(refresh_token_str: str) -> AnthropicOAuthToken:
         refresh_token=token_data.get("refresh_token", refresh_token_str),
         expires_in=token_data.get("expires_in", 3600),
     )
+
+
+async def refresh_token(refresh_token_str: str) -> AnthropicOAuthToken:
+    """Refresh an expired access token (module-level compatibility wrapper)."""
+    return await _refresh_access_token(refresh_token_str)
+
+
+class ClaudeOAuthFlow:
+    """Claude subscription OAuth flow."""
+
+    name: ClassVar[str] = "anthropic"
+    is_subscription: ClassVar[bool] = True
+
+    async def refresh(self, refresh_token: str) -> AnthropicOAuthToken:
+        return await _refresh_access_token(refresh_token)
+
+
+register_flow(ClaudeOAuthFlow())

@@ -13,9 +13,9 @@ class OAuthToken(BaseModel):
     expires_in: int  # Seconds until expiration
     expires_at: int  # Unix timestamp when token expires
 
-    def is_expired(self) -> bool:
-        """Check if token is expired or within 10% of expiration time."""
-        buffer = self.expires_in // 10
+    def is_expired(self, skew: float = 0.0) -> bool:
+        """Check if token is expired, keeping the 10% buffer and extra skew."""
+        buffer = max(self.expires_in // 10, skew)
         return time.time() >= (self.expires_at - buffer)
 
     @classmethod
@@ -36,10 +36,7 @@ class AnthropicOAuthToken(OAuthToken):
 
     @classmethod
     def from_token_response(
-        cls,
-        access_token: str,
-        refresh_token: str,
-        expires_in: int,
+        cls, access_token: str, refresh_token: str, expires_in: int
     ) -> AnthropicOAuthToken:
         """Create an AnthropicOAuthToken from a token response."""
         return cls(

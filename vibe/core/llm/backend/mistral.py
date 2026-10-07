@@ -24,7 +24,7 @@ from vibe.core.types import (
 )
 
 if TYPE_CHECKING:
-    from vibe.core.config import ModelConfig, ProviderConfig
+    from vibe.core.config import ModelConfig, ProviderConfig, ThinkingLevel
     from vibe.core.llm.cache import CachePlan
 
 
@@ -113,7 +113,12 @@ class MistralMapper:
 
 
 class MistralBackend:
-    def __init__(self, provider: ProviderConfig, timeout: float = 720.0) -> None:
+    def __init__(
+        self,
+        provider: ProviderConfig,
+        timeout: float = 720.0,
+        honor_retry_after: bool = True,
+    ) -> None:
         self._client: mistralai.Mistral | None = None
         self._provider = provider
         self._mapper = MistralMapper()
@@ -172,6 +177,7 @@ class MistralBackend:
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
         cache_plan: CachePlan | None = None,
+        thinking_level: ThinkingLevel | None = None,
     ) -> LLMChunk:
         if not model.capabilities.tools:
             tools = None
@@ -251,6 +257,7 @@ class MistralBackend:
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_headers: dict[str, str] | None,
         cache_plan: CachePlan | None = None,
+        thinking_level: ThinkingLevel | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
         if not model.capabilities.tools:
             tools = None

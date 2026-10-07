@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from vibe.core.config import VibeConfig
+from vibe.core.config import ThinkingLevel, VibeConfig
 from vibe.core.context.compactor import Compactor
 from vibe.core.context.overflow import is_context_overflow
 from vibe.core.context.tokens import estimate_context_tokens
@@ -233,6 +233,7 @@ class Agent:
 
         self._last_usage: LLMUsage | None = None
         self._overflow_recovered = False
+        self._thinking_level: ThinkingLevel | None = None
         self.compactor = Compactor(self)
 
         self.approval_callback: ApprovalCallback | None = None
@@ -293,7 +294,19 @@ class Agent:
             if provider.timeout is not None
             else self.config.api_timeout
         )
-        return BACKEND_FACTORY[provider.backend](provider=provider, timeout=timeout)
+        return BACKEND_FACTORY[provider.backend](
+            provider=provider,
+            timeout=timeout,
+            honor_retry_after=self.config.retry.honor_retry_after,
+        )
+
+    def set_thinking_level(self, level: ThinkingLevel | None) -> None:
+        """Set the session thinking level override (None clears it)."""
+        self._thinking_level = level
+
+    @property
+    def thinking_level(self) -> ThinkingLevel | None:
+        return self._thinking_level
 
     def add_message(self, message: LLMMessage) -> None:
         self._append_message(message)
@@ -1066,6 +1079,7 @@ class Agent:
                     },
                     max_tokens=max_tokens,
                     cache_plan=cache_plan,
+                    thinking_level=self._thinking_level,
                 )
 
             end_time = time.perf_counter()
@@ -1135,6 +1149,7 @@ class Agent:
                     },
                     max_tokens=max_tokens,
                     cache_plan=cache_plan,
+                    thinking_level=self._thinking_level,
                 ):
                     last_chunk = chunk
                     processed_message = (

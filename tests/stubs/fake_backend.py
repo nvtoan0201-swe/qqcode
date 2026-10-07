@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable, Iterable
 
 from tests.mock.utils import mock_llm_chunk
+from vibe.core.config import ThinkingLevel
 from vibe.core.llm.cache import CachePlan
 from vibe.core.types import LLMChunk, LLMMessage
 
@@ -26,6 +27,7 @@ class FakeBackend:
         self._requests_messages: list[list[LLMMessage]] = []
         self._requests_extra_headers: list[dict[str, str] | None] = []
         self._requests_cache_plans: list[CachePlan | None] = []
+        self._requests_thinking_levels: list[ThinkingLevel | None] = []
         self._count_tokens_calls: list[list[LLMMessage]] = []
         self._token_counter = token_counter or self._default_token_counter
         self._exception_to_raise = exception_to_raise
@@ -52,6 +54,10 @@ class FakeBackend:
     def requests_cache_plans(self) -> list[CachePlan | None]:
         return self._requests_cache_plans
 
+    @property
+    def requests_thinking_levels(self) -> list[ThinkingLevel | None]:
+        return self._requests_thinking_levels
+
     @staticmethod
     def _default_token_counter(messages: list[LLMMessage]) -> int:
         return 1
@@ -73,6 +79,7 @@ class FakeBackend:
         extra_headers,
         max_tokens,
         cache_plan=None,
+        thinking_level: ThinkingLevel | None = None,
     ) -> LLMChunk:
         if (exception := self._next_exception()) is not None:
             raise exception
@@ -80,6 +87,7 @@ class FakeBackend:
         self._requests_messages.append(messages)
         self._requests_extra_headers.append(extra_headers)
         self._requests_cache_plans.append(cache_plan)
+        self._requests_thinking_levels.append(thinking_level)
         if self._chunks:
             chunk = self._chunks.pop(0)
             if not self._chunks:
@@ -98,6 +106,7 @@ class FakeBackend:
         extra_headers,
         max_tokens,
         cache_plan=None,
+        thinking_level: ThinkingLevel | None = None,
     ) -> AsyncGenerator[LLMChunk]:
         if (exception := self._next_exception()) is not None:
             raise exception
@@ -105,6 +114,7 @@ class FakeBackend:
         self._requests_messages.append(messages)
         self._requests_extra_headers.append(extra_headers)
         self._requests_cache_plans.append(cache_plan)
+        self._requests_thinking_levels.append(thinking_level)
         has_final_chunk = False
         while self._chunks:
             chunk = self._chunks.pop(0)

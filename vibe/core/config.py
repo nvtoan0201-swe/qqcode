@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from enum import StrEnum, auto
+import logging
 import os
 from pathlib import Path
 import re
 import shlex
+import tempfile
 import tomllib
 from typing import Annotated, Any, Literal
 
@@ -19,7 +21,7 @@ from pydantic_settings import (
 )
 import tomli_w
 
-from vibe.core.oauth.token import AnthropicOAuthToken, OAuthToken, QwenOAuthToken
+from vibe.core.oauth.token import AnthropicOAuthToken, QwenOAuthToken
 from vibe.core.prompts import SystemPrompt
 from vibe.core.tools.base import BaseToolConfig
 
@@ -33,6 +35,8 @@ def get_vibe_home() -> Path:
 GLOBAL_CONFIG_DIR = get_vibe_home()
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.toml"
 GLOBAL_ENV_FILE = GLOBAL_CONFIG_DIR / ".env"
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_config_file() -> Path:
@@ -171,6 +175,10 @@ class CompactionConfig(BaseSettings):
     prompt: Literal["summary", "legacy"] = "summary"
 
 
+class RetryConfig(BaseSettings):
+    honor_retry_after: bool = True
+
+
 class Backend(StrEnum):
     MISTRAL = auto()
     GENERIC = auto()
@@ -182,6 +190,7 @@ class ProviderConfig(BaseModel):
     api_base: str
     api_key_env_var: str = ""
     api_style: str = "openai"
+    oauth_flow: str = ""
     backend: Backend = Backend.GENERIC
     oauth_token: AnthropicOAuthToken | QwenOAuthToken | None = None
     extra_headers: dict[str, str] = Field(default_factory=dict)
@@ -280,6 +289,16 @@ class ThinkingLevel(StrEnum):
     HIGH = "high"
 
 
+DEFAULT_BUDGETS: dict[ThinkingLevel, int] = {
+    ThinkingLevel.MINIMAL: 1024,
+    ThinkingLevel.LOW: 2048,
+    ThinkingLevel.MEDIUM: 8192,
+    ThinkingLevel.HIGH: 16384,
+}
+
+REASONING_EXTRA_BODY_KEYS = frozenset({"reasoning", "reasoning_effort", "thinking"})
+
+
 class ModelCapabilities(BaseModel):
     tools: bool = True
     tool_choice: bool = True
@@ -354,6 +373,37 @@ class ModelConfig(BaseModel):
     @property
     def output_price(self) -> float:
         return self.pricing.output_per_million
+
+
+def extra_body_has_reasoning(extra_body: dict[str, Any] | None) -> bool:
+    """Whether the caller's extra_body already configures reasoning settings."""
+    return bool(extra_body) and any(
+        key in extra_body for key in REASONING_EXTRA_BODY_KEYS
+    )
+
+
+def resolve_thinking_level(
+    model: ModelConfig, override: ThinkingLevel | None
+) -> ThinkingLevel | None:
+    """Resolve the effective thinking level for a request.
+
+    The session override wins over the model's configured level. Levels other
+    than OFF are ignored (with a debug log) when the model does not declare
+    reasoning support.
+    """
+    level = override if override is not None else model.reasoning_level
+    match level:
+        case None | ThinkingLevel.OFF:
+            return level
+        case _ if model.capabilities.reasoning:
+            return level
+        case _:
+            logger.debug(
+                "Ignoring thinking level '%s' for model '%s': reasoning not supported",
+                level,
+                model.name,
+            )
+            return None
 
 
 DEFAULT_PROVIDERS = [
@@ -590,6 +640,7 @@ class VibeConfig(BaseSettings):
     project_context: ProjectContextConfig = Field(default_factory=ProjectContextConfig)
     session_logging: SessionLoggingConfig = Field(default_factory=SessionLoggingConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
     tool_runtime: ToolRuntimeConfig = Field(default_factory=ToolRuntimeConfig)
     tools: dict[str, BaseToolConfig] = Field(default_factory=dict)
     tool_paths: list[str] = Field(
@@ -752,7 +803,7 @@ class VibeConfig(BaseSettings):
             active_model = self.get_active_model()
             provider = self.get_provider_for_model(active_model)
 
-            if provider.oauth_token and provider.oauth_token.is_expired():
+            if provider.oauth_token and provider.oauth_token.is_expired(skew=60):
                 try:
                     import asyncio
 
@@ -779,7 +830,7 @@ class VibeConfig(BaseSettings):
                 except Exception:
                     pass
 
-            if provider.oauth_token and not provider.oauth_token.is_expired():
+            if provider.oauth_token and not provider.oauth_token.is_expired(skew=60):
                 return self
             api_key_env = provider.api_key_env_var
             if api_key_env and not os.getenv(api_key_env):
@@ -1014,6 +1065,33 @@ class VibeConfig(BaseSettings):
         return config_dict
 
 
+def _atomic_write_toml(path: Path, config: dict[str, Any]) -> None:
+    """Write ``config`` to ``path`` atomically with owner-only permissions.
+
+    The TOML payload is written to a temporary file in the same directory,
+    fsynced, chmodded to 600 and moved over the target with ``os.replace`` so
+    an interrupted write can never corrupt the existing config.
+
+    Raises:
+        OSError: If the file cannot be written or replaced.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            tomli_w.dump(config, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.chmod(0o600)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def save_oauth_token(
     provider_name: str, token: AnthropicOAuthToken | QwenOAuthToken
 ) -> None:
@@ -1050,4 +1128,4 @@ def save_oauth_token(
             providers.append(provider_dict)
             current_config["providers"] = providers
 
-    VibeConfig.dump_config(current_config)
+    _atomic_write_toml(CONFIG_FILE, current_config)

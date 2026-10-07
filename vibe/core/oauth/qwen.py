@@ -6,11 +6,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 import secrets
-import uuid
+from typing import ClassVar
 from urllib.parse import urlencode
+import uuid
 
 import httpx
 
+from vibe.core.oauth.registry import register_flow
 from vibe.core.oauth.token import QwenOAuthToken
 
 # Qwen OAuth constants
@@ -281,7 +283,7 @@ async def poll_for_token(
     raise AuthorizationTimeout("Authorization timed out")
 
 
-async def refresh_token(refresh_token_str: str) -> QwenOAuthToken:
+async def _refresh_access_token(refresh_token_str: str) -> QwenOAuthToken:
     """Refresh an expired access token.
 
     Args:
@@ -331,3 +333,21 @@ async def refresh_token(refresh_token_str: str) -> QwenOAuthToken:
         expires_in=token_data.get("expires_in", 3600),
         resource_url=token_data.get("resource_url"),
     )
+
+
+async def refresh_token(refresh_token_str: str) -> QwenOAuthToken:
+    """Refresh an expired access token (module-level compatibility wrapper)."""
+    return await _refresh_access_token(refresh_token_str)
+
+
+class QwenOAuthFlow:
+    """Qwen device-code OAuth flow."""
+
+    name: ClassVar[str] = "qwen"
+    is_subscription: ClassVar[bool] = True
+
+    async def refresh(self, refresh_token: str) -> QwenOAuthToken:
+        return await _refresh_access_token(refresh_token)
+
+
+register_flow(QwenOAuthFlow())
