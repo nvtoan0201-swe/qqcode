@@ -99,12 +99,18 @@ class ToolManager:
 
         paths.extend(package_resource_dirs(config.packages, "tools"))
 
-        cwd = config.effective_workdir
-        for directory in (cwd, *cwd.parents):
-            tools_dir = directory / ".qqcode" / "tools"
-            if tools_dir.is_dir():
-                paths.append(tools_dir)
-                break
+        if config.project_trusted:
+            cwd = config.effective_workdir
+            for directory in (cwd, *cwd.parents):
+                tools_dir = directory / ".qqcode" / "tools"
+                if tools_dir.is_dir():
+                    paths.append(tools_dir)
+                    break
+        else:
+            logger.debug(
+                "Skipping project tool discovery in %s: project is not trusted",
+                config.effective_workdir,
+            )
 
         unique: list[Path] = []
         seen: set[Path] = set()

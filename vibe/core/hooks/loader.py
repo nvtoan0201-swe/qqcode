@@ -21,19 +21,24 @@ logger = getLogger("vibe")
 def compute_hook_dirs(config: VibeConfig) -> list[Path]:
     """Return hook directories by priority: explicit, project, package, global.
 
-    Project hooks (``.qqcode/hooks``) are code committed to the repository.
-    TODO(plan-10): only load project hooks once the project is trusted. Until
-    trust gating lands they are loaded exactly like user hooks, so the feature
-    can be exercised end to end.
+    Project hooks (``.qqcode/hooks``) execute repository code, so they only
+    load when the project is trusted (``--trust``/trust store). Explicit
+    ``hooks.paths``, package and global hooks always load.
     """
     candidates: list[Path] = [Path(raw).expanduser() for raw in config.hooks.paths]
 
-    cwd = config.effective_workdir
-    for directory in (cwd, *cwd.parents):
-        project_dir = directory / ".qqcode" / "hooks"
-        if project_dir.is_dir():
-            candidates.append(project_dir)
-            break
+    if config.project_trusted:
+        cwd = config.effective_workdir
+        for directory in (cwd, *cwd.parents):
+            project_dir = directory / ".qqcode" / "hooks"
+            if project_dir.is_dir():
+                candidates.append(project_dir)
+                break
+    else:
+        logger.debug(
+            "Skipping project hooks in %s: project is not trusted",
+            config.effective_workdir,
+        )
 
     candidates.extend(package_resource_dirs(config.packages, "hooks"))
 

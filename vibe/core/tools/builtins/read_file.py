@@ -14,6 +14,8 @@ from vibe.core.tools.base import (
     BaseToolState,
     ToolError,
     ToolPermission,
+    check_path_patterns,
+    resolve_tool_path,
 )
 from vibe.core.tools.truncate import DEFAULT_MAX_LINES, format_notice, truncate_head
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
@@ -124,6 +126,13 @@ class ReadFile(
                 return ToolPermission.ALWAYS
 
         return None
+
+    def check_path_restrictions(self, args: ReadFileArgs) -> ToolPermission | None:
+        return check_path_patterns(
+            resolve_tool_path(args.path, self.config.effective_workdir),
+            allowlist=self.config.path_allowlist,
+            denylist=self.config.path_denylist,
+        )
 
     def _prepare_and_validate_path(self, args: ReadFileArgs) -> Path:
         self._validate_inputs(args)

@@ -67,6 +67,7 @@ include = ["vibe/"]
 [project.scripts]
 qqcode = "vibe.cli.entrypoint:main"
 qqcode-acp = "vibe.acp.entrypoint:main"
+qqcode-evals = "vibe.core.evals.__main__:cli"
 
 
 [tool.uv]

@@ -12,6 +12,8 @@ from vibe.core.tools.base import (
     BaseToolState,
     ToolError,
     ToolPermission,
+    check_path_patterns,
+    resolve_tool_path,
 )
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from vibe.core.types import ToolCallEvent, ToolResultEvent
@@ -109,6 +111,13 @@ class WriteFile(
                 return ToolPermission.ALWAYS
 
         return None
+
+    def check_path_restrictions(self, args: WriteFileArgs) -> ToolPermission | None:
+        return check_path_patterns(
+            resolve_tool_path(args.path, self.config.effective_workdir),
+            allowlist=self.config.path_allowlist,
+            denylist=self.config.path_denylist,
+        )
 
     @final
     async def run(self, args: WriteFileArgs) -> WriteFileResult:

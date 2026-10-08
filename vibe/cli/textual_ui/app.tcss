@@ -823,3 +823,41 @@ ContextProgress {
         color: $text-error;
     }
 }
+
+/* Project Trust Modal */
+TrustScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+#trust-dialog {
+    width: 70;
+    height: auto;
+    background: $surface;
+    border: round $primary;
+    padding: 1 2;
+}
+
+#trust-title {
+    width: 100%;
+    height: auto;
+    text-style: bold;
+    color: $primary;
+}
+
+#trust-body {
+    width: 100%;
+    height: auto;
+    margin: 1 0;
+    color: $foreground;
+}
+
+#trust-buttons {
+    width: 100%;
+    height: auto;
+    align-horizontal: center;
+}
+
+#trust-buttons Button {
+    margin: 0 1;
+}

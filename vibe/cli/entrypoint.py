@@ -19,6 +19,7 @@ from vibe.core.config import (
     MissingAPIKeyError,
     MissingPromptFileError,
     ModelConfig,
+    SessionLoggingConfig,
     ThinkingLevel,
     VibeConfig,
     load_api_keys_from_env,
@@ -36,6 +37,12 @@ from vibe.core.packages import (
 from vibe.core.programmatic import run_programmatic
 from vibe.core.sessions.migrate import migrate_directory
 from vibe.core.sessions.store import JsonlSessionStore
+from vibe.core.trust import (
+    TrustPrompt,
+    TrustStore,
+    pending_trust,
+    read_default_project_trust,
+)
 from vibe.core.types import OutputFormat, ResumeSessionInfo
 from vibe.core.utils import ConversationLimitException
 from vibe.setup.onboarding import run_onboarding
@@ -221,6 +228,20 @@ def parse_arguments() -> argparse.Namespace:
         metavar="SESSION_ID",
         help="Resume a specific session by its ID (supports partial matching)",
     )
+    trust_group = parser.add_mutually_exclusive_group()
+    trust_group.add_argument(
+        "--trust",
+        action="store_true",
+        dest="trust",
+        default=None,
+        help="Trust the current project and load its .qqcode resources.",
+    )
+    trust_group.add_argument(
+        "--no-trust",
+        action="store_false",
+        dest="trust",
+        help="Do not load project resources (headless/CI safe).",
+    )
     return parser.parse_args()
 
 
@@ -337,12 +358,26 @@ def _restore_session_preferences(
     return level, name if isinstance(name, str) else None
 
 
-def load_config_or_exit(agent: str | None = None) -> VibeConfig:
+def load_config_or_exit(
+    agent: str | None = None,
+    *,
+    trust: bool | None = None,
+    trust_callback: TrustPrompt | None = None,
+) -> VibeConfig:
     try:
-        return VibeConfig.load(agent)
+        config, resolution = VibeConfig.load_with_trust(
+            agent, trust=trust, trust_callback=trust_callback
+        )
+        if resolution.project is not None and not resolution.trusted:
+            rprint(
+                f"[yellow]Skipping project resources in "
+                f"{resolution.project.project_dir} ({', '.join(resolution.project.resource_labels)}): "
+                "project not trusted. Use --trust to allow them.[/]"
+            )
+        return config
     except MissingAPIKeyError:
         run_onboarding()
-        return VibeConfig.load(agent)
+        return VibeConfig.load(agent, trust=trust)
     except MissingPromptFileError as e:
         rprint(f"[yellow]Invalid system prompt id: {e}[/]")
         sys.exit(1)
@@ -357,6 +392,10 @@ def _build_sessions_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="sessions_command", required=True)
     subparsers.add_parser("list", help="List recent sessions (outputs JSON)")
+    stats = subparsers.add_parser(
+        "stats", help="Aggregate usage/cost for a session (outputs JSON)"
+    )
+    stats.add_argument("session_id", metavar="SESSION_ID")
     repair = subparsers.add_parser(
         "repair", help="Truncate a damaged session file at its last valid line"
     )
@@ -372,6 +411,43 @@ def _build_sessions_parser() -> argparse.ArgumentParser:
         help="Directory containing legacy .json sessions (defaults to save_dir)",
     )
     return parser
+
+
+def _session_error(message: str) -> int:
+    print(json.dumps({"error": message}), file=sys.stderr)
+    return 1
+
+
+def _run_session_stats(
+    session_id: str, session_config: SessionLoggingConfig, store: JsonlSessionStore
+) -> int:
+    path = InteractionLogger.find_session_by_id(session_id, session_config)
+    if path is None:
+        return _session_error(f"Session '{session_id}' not found")
+    if path.suffix != ".jsonl":
+        return _session_error("Only .jsonl sessions support stats")
+    print(json.dumps(store.read(path).usage_stats().model_dump()))
+    return 0
+
+
+def _run_session_repair(
+    session_id: str, session_config: SessionLoggingConfig, store: JsonlSessionStore
+) -> int:
+    path = InteractionLogger.find_session_by_id(session_id, session_config)
+    if path is None:
+        return _session_error(f"Session '{session_id}' not found")
+    if path.suffix != ".jsonl":
+        return _session_error("Only .jsonl sessions can be repaired")
+    result = store.repair(path)
+    print(
+        json.dumps({
+            "path": str(result.path),
+            "kept_entries": result.kept_entries,
+            "removed_bytes": result.removed_bytes,
+            "backup_path": (str(result.backup_path) if result.backup_path else None),
+        })
+    )
+    return 0
 
 
 def run_sessions_command(argv: list[str]) -> int:
@@ -394,32 +470,10 @@ def run_sessions_command(argv: list[str]) -> int:
                 ])
             )
             return 0
+        case "stats":
+            return _run_session_stats(args.session_id, session_config, store)
         case "repair":
-            path = InteractionLogger.find_session_by_id(args.session_id, session_config)
-            if path is None:
-                print(
-                    json.dumps({"error": f"Session '{args.session_id}' not found"}),
-                    file=sys.stderr,
-                )
-                return 1
-            if path.suffix != ".jsonl":
-                print(
-                    json.dumps({"error": "Only .jsonl sessions can be repaired"}),
-                    file=sys.stderr,
-                )
-                return 1
-            result = store.repair(path)
-            print(
-                json.dumps({
-                    "path": str(result.path),
-                    "kept_entries": result.kept_entries,
-                    "removed_bytes": result.removed_bytes,
-                    "backup_path": (
-                        str(result.backup_path) if result.backup_path else None
-                    ),
-                })
-            )
-            return 0
+            return _run_session_repair(args.session_id, session_config, store)
         case "migrate":
             directory = (
                 Path(args.directory)
@@ -637,7 +691,19 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             except Exception as e:
                 rprint(f"[yellow]Could not create history file: {e}[/]")
 
-        config = load_config_or_exit(args.agent)
+        # In the interactive Textual UI we can ask before loading project
+        # resources; headless/programmatic runs never prompt (safe default).
+        pending = None
+        if args.prompt is None and args.trust is None:
+            pending = pending_trust(
+                Path.cwd(),
+                store=TrustStore.load(),
+                default_project_trust=read_default_project_trust(),
+            )
+
+        config = load_config_or_exit(
+            args.agent, trust=False if pending is not None else args.trust
+        )
         prompt_template_dirs = apply_runtime_flags(config, args)
 
         # Handle model override from environment variable
@@ -910,6 +976,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 resume=UISessionOptions(
                     name=args.name or resumed_name,
                     thinking_level=initial_thinking_level,
+                    trust_request=pending,
                 ),
             )
 

@@ -9,6 +9,8 @@ import re
 import shutil
 from typing import Protocol
 
+from pydantic import BaseModel
+
 from vibe.core.config import SessionLoggingConfig, get_vibe_home
 from vibe.core.sessions.entries import (
     CompactionEntry,
@@ -45,6 +47,25 @@ class SessionSummary:
     cwd: str = ""
     parent_session_id: str | None = None
     modified_at: float = 0.0
+
+
+class SessionUsageStats(BaseModel):
+    """Aggregated usage for one session, derived from ``UsageEntry`` records."""
+
+    session_id: str
+    turns: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: float = 0.0
+    message_count: int = 0
+    compactions: int = 0
+    model: str | None = None
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
 
 
 @dataclass
@@ -102,6 +123,26 @@ class SessionView:
                 stats.session_completion_tokens += entry.completion_tokens
                 stats.steps += 1
         return stats
+
+    def usage_stats(self) -> SessionUsageStats:
+        """Aggregate every ``UsageEntry`` plus message/compaction counts."""
+        result = SessionUsageStats(session_id=self.header.id)
+        for entry in self.entries:
+            match entry:
+                case UsageEntry():
+                    result.turns += 1
+                    result.prompt_tokens += entry.prompt_tokens
+                    result.completion_tokens += entry.completion_tokens
+                    result.cache_read_tokens += entry.cache_read_tokens
+                    result.cache_write_tokens += entry.cache_write_tokens
+                    result.cost_usd = round(result.cost_usd + entry.cost_usd, 6)
+                case MessageEntry():
+                    result.message_count += 1
+                case CompactionEntry():
+                    result.compactions += 1
+                case ModelChangeEntry():
+                    result.model = entry.model_alias
+        return result
 
     def last_model(self) -> ModelChangeEntry | None:
         for entry in reversed(self.entries):

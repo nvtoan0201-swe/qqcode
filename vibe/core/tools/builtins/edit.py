@@ -6,7 +6,15 @@ from typing import ClassVar, final
 import aiofiles
 from pydantic import BaseModel, Field
 
-from vibe.core.tools.base import BaseTool, BaseToolConfig, BaseToolState, ToolError
+from vibe.core.tools.base import (
+    BaseTool,
+    BaseToolConfig,
+    BaseToolState,
+    ToolError,
+    ToolPermission,
+    check_path_patterns,
+    resolve_tool_path,
+)
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from vibe.core.types import ToolCallEvent, ToolResultEvent
 
@@ -80,6 +88,13 @@ class Edit(
     @classmethod
     def get_status_text(cls) -> str:
         return "Updating file"
+
+    def check_path_restrictions(self, args: EditArgs) -> ToolPermission | None:
+        return check_path_patterns(
+            resolve_tool_path(args.file_path, self.config.effective_workdir),
+            allowlist=self.config.path_allowlist,
+            denylist=self.config.path_denylist,
+        )
 
     @final
     async def run(self, args: EditArgs) -> EditResult:

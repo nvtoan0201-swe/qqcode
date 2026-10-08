@@ -41,6 +41,7 @@ from vibe.cli.textual_ui.widgets.mode_indicator import ModeIndicator
 from vibe.cli.textual_ui.widgets.path_display import PathDisplay
 from vibe.cli.textual_ui.widgets.plan_approval import PlanApprovalWidget
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
+from vibe.cli.textual_ui.widgets.trust_app import TrustScreen
 from vibe.cli.textual_ui.widgets.welcome import WelcomeBanner
 from vibe.cli.update_notifier import (
     GitHubVersionUpdateGateway,
@@ -62,6 +63,7 @@ from vibe.core.sessions.export import export_session, import_session
 from vibe.core.sessions.store import JsonlSessionStore
 from vibe.core.skills.manager import SkillManager, SkillNotFoundError
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
+from vibe.core.trust import ProjectResources, TrustChoice, TrustDecision, TrustStore
 from vibe.core.types import (
     AgentMode,
     AgentStats,
@@ -107,6 +109,7 @@ class UISessionOptions:
 
     name: str | None = None
     thinking_level: ThinkingLevel | None = None
+    trust_request: ProjectResources | None = None
 
 
 def _stats_from_metadata(metadata: dict[str, Any]) -> AgentStats | None:
@@ -153,6 +156,7 @@ class VibeApp(App):
         self.config = config
         self._session_name = resume.name if resume else None
         self._initial_thinking_level = resume.thinking_level if resume else None
+        self._trust_request = resume.trust_request if resume else None
         # Support both agent_mode and legacy auto_approve parameter
         if agent_mode is not None:
             self.agent_mode = agent_mode
@@ -254,10 +258,66 @@ class VibeApp(App):
         if self._session_info:
             await self._mount_and_scroll(AssistantMessage(self._session_info.message()))
 
+        if self._trust_request is not None:
+            self.push_screen(
+                TrustScreen(self._trust_request), callback=self._on_trust_resolved
+            )
+            return
+
+        self._start_initial_prompt_or_agent()
+
+    def _start_initial_prompt_or_agent(self) -> None:
         if self._initial_prompt:
             self.call_after_refresh(self._process_initial_prompt)
         else:
             self._ensure_agent_init_task()
+
+    def _on_trust_resolved(self, choice: TrustChoice | None) -> None:
+        self.run_worker(self._apply_trust_choice(choice), exclusive=False)
+
+    async def _apply_trust_choice(self, choice: TrustChoice | None) -> None:
+        project = self._trust_request
+        self._trust_request = None
+        if project is None:
+            return
+
+        match choice:
+            case TrustChoice.ALWAYS:
+                TrustStore.load().set(project.project_dir, TrustDecision.TRUSTED)
+                trusted = True
+                message = (
+                    f"Project trusted: loading resources from {project.project_dir}."
+                )
+            case TrustChoice.YES:
+                trusted = True
+                message = (
+                    f"Project trusted for this session: "
+                    f"loading resources from {project.project_dir}."
+                )
+            case _:
+                trusted = False
+                message = "Project not trusted: using global configuration only."
+
+        try:
+            new_config = VibeConfig.load(trust=trusted)
+        except Exception as e:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Failed to load configuration: {e}",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+        else:
+            self.config = new_config
+            self.skill_manager = SkillManager(new_config)
+            self.prompt_templates = load_templates(
+                self._default_template_dirs(self._prompt_template_dirs)
+            )
+            self._register_dynamic_commands()
+            self._update_context_progress()
+            await self._mount_and_scroll(UserCommandMessage(message))
+
+        self._start_initial_prompt_or_agent()
 
     def _process_initial_prompt(self) -> None:
         if self._initial_prompt:
@@ -945,6 +1005,8 @@ class VibeApp(App):
                 self._context_progress.tokens = TokenState(
                     max_tokens=event.context_window, current_tokens=event.context_tokens
                 )
+                if self.agent:
+                    self._context_progress.cost_usd = self.agent.stats.session_cost
             return
 
         if self._context_progress and self.agent:
@@ -953,6 +1015,7 @@ class VibeApp(App):
                 max_tokens=current_state.max_tokens,
                 current_tokens=self.agent.stats.context_tokens,
             )
+            self._context_progress.cost_usd = self.agent.stats.session_cost
 
         # Handle mode change events (legacy, for backward compatibility)
         if isinstance(event, ModeChangedEvent):
@@ -1073,7 +1136,8 @@ class VibeApp(App):
         stats = self.agent.stats
         status_text = f"""## Agent Statistics
 
-- **Steps**: {stats.steps:,}
+- **Model**: `{self.config.active_model}`
+- **Turns**: {stats.steps:,}
 - **Session Prompt Tokens**: {stats.session_prompt_tokens:,}
 - **Session Completion Tokens**: {stats.session_completion_tokens:,}
 - **Session Cache Read Tokens**: {stats.cache_read_tokens:,}
@@ -1081,7 +1145,8 @@ class VibeApp(App):
 - **Session Total LLM Tokens**: {stats.session_total_llm_tokens:,}
 - **Last Turn Tokens**: {stats.last_turn_total_tokens:,}
 - **Context**: {stats.context_percent:.0f}% ({stats.context_tokens:,}/{stats.context_window:,} tokens)
-- **Cost**: ${stats.session_cost:.6f}
+- **Cost**: ${stats.session_cost:.6f} (cache: ${stats.session_cache_cost:.6f})
+- **Tools**: {stats.tool_calls_succeeded:,} ok / {stats.tool_calls_rejected:,} rejected / {stats.tool_calls_failed:,} failed
 """
         await self._mount_and_scroll(UserCommandMessage(status_text))
 
@@ -1206,6 +1271,10 @@ class VibeApp(App):
             )
         else:
             self._context_progress.tokens = TokenState()
+        self._context_progress.model = self.config.active_model
+        self._context_progress.cost_usd = (
+            self.agent.stats.session_cost if self.agent else 0.0
+        )
 
     def _reasoning_capability(self) -> str:
         try:

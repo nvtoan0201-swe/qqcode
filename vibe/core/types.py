@@ -127,6 +127,16 @@ class AgentStats(BaseModel):
             cache_write_tokens=self.cache_write_tokens,
         )
 
+    @computed_field
+    @property
+    def session_cache_cost(self) -> float:
+        """Portion of :attr:`session_cost` spent on cache reads/writes."""
+        total = (
+            self.cache_read_tokens * self.cache_read_price_per_million
+            + self.cache_write_tokens * self.cache_write_price_per_million
+        )
+        return round(total / 1_000_000, 6)
+
     def update_pricing(self, pricing: ModelPricing) -> None:
         """Update pricing info when model changes.
 

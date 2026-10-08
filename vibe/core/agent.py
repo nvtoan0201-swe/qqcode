@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
 
+from vibe.core.audit import AuditDecision, AuditLogger, build_audit_logger
 from vibe.core.config import ModelConfig, ThinkingLevel, VibeConfig
 from vibe.core.context.compactor import Compactor
 from vibe.core.context.overflow import is_context_overflow
@@ -38,6 +39,16 @@ from vibe.core.llm.format import (
 )
 from vibe.core.llm.types import BackendLike
 from vibe.core.mcp.manager import MCPManager
+from vibe.core.metrics import (
+    COUNTER_COMPACTIONS,
+    COUNTER_OVERFLOWS,
+    COUNTER_TOOL_FAILURES,
+    COUNTER_TURNS,
+    DebugLogger,
+    MetricsRecorder,
+    build_debug_logger,
+    build_metrics_recorder,
+)
 from vibe.core.middleware import (
     AutoCompactMiddleware,
     ContextWarningMiddleware,
@@ -177,6 +188,10 @@ def _mode_string_to_agent_mode(mode_string: str) -> AgentMode | None:
 
 
 class Agent:
+    audit_logger: AuditLogger | None
+    metrics: MetricsRecorder | None
+    debug_logger: DebugLogger | None
+
     def __init__(
         self,
         config: VibeConfig,
@@ -288,7 +303,14 @@ class Agent:
         )
         self._recorder = SessionRecorder(self.interaction_logger, agent=self)
 
+        self._init_observability(config)
+
         self._last_chunk: LLMChunk | None = None
+
+    def _init_observability(self, config: VibeConfig) -> None:
+        self.audit_logger = build_audit_logger(config.audit, session_id=self.session_id)
+        self.metrics = build_metrics_recorder(config.telemetry)
+        self.debug_logger = build_debug_logger(config.debug)
 
     @property
     def mode(self) -> AgentMode:
@@ -524,6 +546,7 @@ class Agent:
     async def _recover_from_context_overflow(
         self, error: BaseException
     ) -> AsyncGenerator[BaseEvent]:
+        self._record_metric(COUNTER_OVERFLOWS)
         metadata = {
             "old_tokens": self.stats.context_tokens,
             "threshold": self.config.get_compaction_threshold(),
@@ -550,11 +573,15 @@ class Agent:
                 )
             )
 
-    async def _run_conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
+    def _begin_conversation_turn(self, user_msg: str) -> None:
         self._append_message(LLMMessage(role=Role.user, content=user_msg))
         self.stats.steps += 1
+        self._record_metric(COUNTER_TURNS)
         self._overflow_recovered = False
         self.middleware_pipeline.reset()
+
+    async def _run_conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
+        self._begin_conversation_turn(user_msg)
 
         should_break_loop = False
         while not should_break_loop:
@@ -690,6 +717,8 @@ class Agent:
                 yield assistant_event
 
         await self._dispatch_after_response()
+
+        self._log_request_debug(request_messages)
 
         last_message = self.messages[-1]
         last_chunk = self._last_chunk
@@ -971,6 +1000,7 @@ class Agent:
             )
 
             self.stats.tool_calls_failed += 1
+            self._record_metric(COUNTER_TOOL_FAILURES)
             self._append_message(
                 self.format_handler.create_failed_tool_response_message(
                     failed, error_msg
@@ -1229,6 +1259,7 @@ class Agent:
             )
 
             self.stats.tool_calls_failed += 1
+            self._record_metric(COUNTER_TOOL_FAILURES)
             self._append_message(
                 LLMMessage.model_validate(
                     self.format_handler.create_tool_response_message(
@@ -1489,10 +1520,26 @@ class Agent:
         self, tool: BaseTool, args: dict[str, Any], tool_call_id: str
     ) -> ToolDecision:
         tool_name = tool.get_name()
+        args_model, _ = tool._get_tool_args_results()
+        validated_args = args_model.model_validate(args)
+
+        # Path allowlists/denylists are hard boundaries: they apply in every
+        # mode, including auto-approve and plan mode.
+        path_decision = tool.check_path_restrictions(validated_args)
+        if path_decision == ToolPermission.NEVER:
+            self._audit(tool_name, args, AuditDecision.DENYLIST)
+            return ToolDecision(
+                verdict=ToolExecutionResponse.SKIP,
+                feedback=(
+                    f"Tool '{tool_name}' blocked by path restrictions "
+                    "(path_allowlist/path_denylist)."
+                ),
+            )
 
         # Plan mode: only allow read-only tools
         if self._mode == AgentMode.PLAN:
             if tool_name not in PLAN_MODE_ALLOWED_TOOLS:
+                self._audit(tool_name, args, AuditDecision.DENIED)
                 return ToolDecision(
                     verdict=ToolExecutionResponse.SKIP,
                     feedback=(
@@ -1503,13 +1550,11 @@ class Agent:
 
             # For bash tool in plan mode, check the restrictive allowlist/denylist
             if tool_name == "bash":
-                args_model, _ = tool._get_tool_args_results()
-                validated_args = args_model.model_validate(args)
-
                 allowlist_denylist_result = tool.check_allowlist_denylist(
                     validated_args
                 )
                 if allowlist_denylist_result == ToolPermission.NEVER:
+                    self._audit(tool_name, args, AuditDecision.DENYLIST)
                     return ToolDecision(
                         verdict=ToolExecutionResponse.SKIP,
                         feedback=(
@@ -1523,16 +1568,19 @@ class Agent:
 
         # Auto-approve mode: execute all tools
         if self._mode == AgentMode.AUTO_APPROVE:
+            self._audit(tool_name, args, AuditDecision.APPROVED)
             return ToolDecision(verdict=ToolExecutionResponse.EXECUTE)
 
         # Interactive mode: check permissions
-        args_model, _ = tool._get_tool_args_results()
-        validated_args = args_model.model_validate(args)
-
         allowlist_denylist_result = tool.check_allowlist_denylist(validated_args)
-        if allowlist_denylist_result == ToolPermission.ALWAYS:
+        if (
+            allowlist_denylist_result is ToolPermission.ALWAYS
+            or path_decision is ToolPermission.ALWAYS
+        ):
+            self._audit(tool_name, args, AuditDecision.APPROVED)
             return ToolDecision(verdict=ToolExecutionResponse.EXECUTE)
-        elif allowlist_denylist_result == ToolPermission.NEVER:
+        if allowlist_denylist_result is ToolPermission.NEVER:
+            self._audit(tool_name, args, AuditDecision.DENYLIST)
             denylist_patterns = tool.config.denylist
             denylist_str = ", ".join(repr(pattern) for pattern in denylist_patterns)
             return ToolDecision(
@@ -1543,8 +1591,10 @@ class Agent:
         perm = self.tool_manager.get_tool_config(tool_name).permission
 
         if perm is ToolPermission.ALWAYS:
+            self._audit(tool_name, args, AuditDecision.APPROVED)
             return ToolDecision(verdict=ToolExecutionResponse.EXECUTE)
         if perm is ToolPermission.NEVER:
+            self._audit(tool_name, args, AuditDecision.DENIED)
             return ToolDecision(
                 verdict=ToolExecutionResponse.SKIP,
                 feedback=f"Tool '{tool_name}' is permanently disabled",
@@ -1552,10 +1602,42 @@ class Agent:
 
         return await self._ask_approval(tool_name, args, tool_call_id)
 
+    def _audit(
+        self, tool_name: str, args: dict[str, Any], decision: AuditDecision
+    ) -> None:
+        if self.audit_logger is None:
+            return
+        self.audit_logger.record(
+            tool_name, args, decision, mode=self._mode.value, session_id=self.session_id
+        )
+
+    def _record_metric(self, name: str, amount: int = 1) -> None:
+        if self.metrics is not None:
+            self.metrics.increment(name, amount)
+
+    def _log_request_debug(self, request_messages: list[LLMMessage] | None) -> None:
+        """Record request metadata only (never message contents)."""
+        if self.debug_logger is None:
+            return
+        try:
+            model_alias = self.config.get_active_model().alias
+        except ValueError:
+            model_alias = self.config.active_model
+        self.debug_logger.log_request(
+            model=model_alias,
+            message_count=len(
+                request_messages if request_messages is not None else self.messages
+            ),
+            estimated_tokens=self.stats.context_tokens,
+            duration=self.stats.last_turn_duration,
+            tool_count=len(self.tool_manager.available_tools()),
+        )
+
     async def _ask_approval(
         self, tool_name: str, args: dict[str, Any], tool_call_id: str
     ) -> ToolDecision:
         if not self.approval_callback:
+            self._audit(tool_name, args, AuditDecision.DENIED)
             return ToolDecision(
                 verdict=ToolExecutionResponse.SKIP,
                 feedback="Tool execution not permitted.",
@@ -1571,14 +1653,17 @@ class Agent:
         match response:
             case ApprovalResponse.ALWAYS:
                 self.auto_approve = True
+                self._audit(tool_name, args, AuditDecision.APPROVED)
                 return ToolDecision(
                     verdict=ToolExecutionResponse.EXECUTE, feedback=feedback
                 )
             case ApprovalResponse.YES:
+                self._audit(tool_name, args, AuditDecision.APPROVED)
                 return ToolDecision(
                     verdict=ToolExecutionResponse.EXECUTE, feedback=feedback
                 )
             case _:
+                self._audit(tool_name, args, AuditDecision.DENIED)
                 return ToolDecision(
                     verdict=ToolExecutionResponse.SKIP, feedback=feedback
                 )
@@ -1721,6 +1806,7 @@ class Agent:
             self._last_observed_message_index = len(self.messages)
 
     async def compact(self, instructions: str | None = None) -> str:
+        self._record_metric(COUNTER_COMPACTIONS)
         try:
             result = await self.compactor.compact(instructions=instructions, force=True)
             return result.summary

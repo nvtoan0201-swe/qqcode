@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import StrEnum, auto
 import fnmatch
 import logging
@@ -25,6 +28,16 @@ import tomli_w
 from vibe.core.oauth.token import AnthropicOAuthToken, QwenOAuthToken
 from vibe.core.prompts import SystemPrompt
 from vibe.core.tools.base import BaseToolConfig
+from vibe.core.trust import (
+    ProjectResources,
+    TrustDecision,
+    TrustPrompt,
+    TrustResolution,
+    TrustStore,
+    read_default_project_trust,
+    read_project_mcp_servers,
+    resolve_trust,
+)
 
 
 def get_vibe_home() -> Path:
@@ -39,6 +52,24 @@ GLOBAL_ENV_FILE = GLOBAL_CONFIG_DIR / ".env"
 
 logger = logging.getLogger(__name__)
 
+_config_file_override: ContextVar[Path | None] = ContextVar(
+    "qqcode_config_file_override", default=None
+)
+
+
+@contextmanager
+def config_file_override(path: Path | None) -> Iterator[None]:
+    """Temporarily make ``TomlFileSettingsSource`` read ``path``.
+
+    Used by trust-aware loading to switch between the global config and a
+    trusted project's ``.qqcode/config.toml``.
+    """
+    token = _config_file_override.set(path)
+    try:
+        yield
+    finally:
+        _config_file_override.reset(token)
+
 
 def resolve_config_file() -> Path:
     # If QQCODE_HOME is explicitly set, always use that config
@@ -49,6 +80,33 @@ def resolve_config_file() -> Path:
         if (candidate := directory / ".qqcode" / "config.toml").is_file():
             return candidate
     return GLOBAL_CONFIG_FILE
+
+
+def resolve_config_file_for_project(
+    workdir: Path,
+    *,
+    trust: bool | None = None,
+    trust_callback: TrustPrompt | None = None,
+    trust_store: TrustStore | None = None,
+    default_project_trust: bool = False,
+    global_config_file: Path | None = None,
+) -> tuple[Path, TrustResolution]:
+    """Pick the config file to load for ``workdir`` under the trust policy.
+
+    Returns the effective config path (global unless the project is trusted and
+    has a project config) together with the trust resolution.
+    """
+    resolution = resolve_trust(
+        workdir,
+        explicit=trust,
+        interactive_callback=trust_callback,
+        store=trust_store,
+        default_project_trust=default_project_trust,
+    )
+    project = resolution.project
+    if resolution.trusted and project is not None and project.config_file is not None:
+        return project.config_file, resolution
+    return global_config_file or GLOBAL_CONFIG_FILE, resolution
 
 
 def load_api_keys_from_env() -> None:
@@ -104,7 +162,7 @@ class TomlFileSettingsSource(PydanticBaseSettingsSource):
         self.toml_data = self._load_toml()
 
     def _load_toml(self) -> dict[str, Any]:
-        file = CONFIG_FILE
+        file = _config_file_override.get() or CONFIG_FILE
         try:
             with file.open("rb") as f:
                 return tomllib.load(f)
@@ -187,6 +245,70 @@ class HooksConfig(BaseSettings):
         default_factory=list,
         description="Additional directories to search for hook modules.",
     )
+
+
+class AuditConfig(BaseSettings):
+    """Tool permission audit log (``~/.qqcode/logs/audit.jsonl``)."""
+
+    enabled: bool = False
+    log_args: bool = Field(
+        default=False,
+        description="Store full tool arguments; sensitive tools are always reduced.",
+    )
+    log_path: str = ""
+    max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024)
+    keep_files: int = Field(default=3, ge=1)
+
+    @field_validator("log_path", mode="before")
+    @classmethod
+    def set_default_log_path(cls, v: str) -> str:
+        if not v:
+            return str(get_vibe_home() / "logs" / "audit.jsonl")
+        return v
+
+    @field_validator("log_path", mode="after")
+    @classmethod
+    def expand_log_path(cls, v: str) -> str:
+        return str(Path(v).expanduser().resolve())
+
+
+class DebugConfig(BaseSettings):
+    """Structured request-metadata debug log (no message contents)."""
+
+    enabled: bool = False
+    log_path: str = ""
+
+    @field_validator("log_path", mode="before")
+    @classmethod
+    def set_default_log_path(cls, v: str) -> str:
+        if not v:
+            return str(get_vibe_home() / "logs" / "debug.jsonl")
+        return v
+
+    @field_validator("log_path", mode="after")
+    @classmethod
+    def expand_log_path(cls, v: str) -> str:
+        return str(Path(v).expanduser().resolve())
+
+
+class TelemetryConfig(BaseSettings):
+    """Local-only counters; ``off`` disables collection entirely."""
+
+    mode: Literal["off", "local"] = "off"
+    metrics_path: str = ""
+    flush_interval: float = Field(default=5.0, ge=0.0)
+
+    @field_validator("metrics_path", mode="before")
+    @classmethod
+    def set_default_metrics_path(cls, v: str) -> str:
+        if not v:
+            return str(get_vibe_home() / "logs" / "metrics.json")
+        return v
+
+    @field_validator("metrics_path", mode="after")
+    @classmethod
+    def expand_metrics_path(cls, v: str) -> str:
+        return str(Path(v).expanduser().resolve())
 
 
 class Backend(StrEnum):
@@ -712,6 +834,21 @@ class VibeConfig(BaseSettings):
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     hooks: HooksConfig = Field(default_factory=HooksConfig)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
+    debug: DebugConfig = Field(default_factory=DebugConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    default_project_trust: bool = Field(
+        default=False,
+        description="Trust projects without a stored decision (secure default: false).",
+    )
+    project_trust: TrustDecision | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Trust decision applied by VibeConfig.load; None means resources "
+            "were constructed directly (legacy behaviour)."
+        ),
+    )
     packages: list[str] = Field(
         default_factory=list,
         description="Names of installed resource packages under ~/.qqcode/packages.",
@@ -755,6 +892,15 @@ class VibeConfig(BaseSettings):
     @property
     def effective_workdir(self) -> Path:
         return self.workdir if self.workdir is not None else Path.cwd()
+
+    @property
+    def project_trusted(self) -> bool:
+        """Whether project-scoped resources may load.
+
+        ``None`` keeps the legacy behaviour for directly-constructed configs
+        (tests, embedded use); production loading always sets a decision.
+        """
+        return self.project_trust is not TrustDecision.UNTRUSTED
 
     @property
     def system_prompt(self) -> str:
@@ -1144,31 +1290,116 @@ class VibeConfig(BaseSettings):
             cls.dump_config(config)
 
     @classmethod
-    def load(cls, agent: str | None = None, **overrides: Any) -> VibeConfig:
-        cls._migrate()
-        base = cls(**overrides)
-        config = base
-        if agent is not None:
-            agent_config = cls._get_agent_config(agent, base.packages)
-            config = cls(**{**(agent_config or {}), **overrides})
+    def load(
+        cls,
+        agent: str | None = None,
+        *,
+        workdir: Path | None = None,
+        trust: bool | None = None,
+        trust_callback: TrustPrompt | None = None,
+        trust_store: TrustStore | None = None,
+        **overrides: Any,
+    ) -> VibeConfig:
+        """Load configuration with project resources gated by trust.
 
-        from vibe.core.models_overlay import (
-            default_overlay_paths,
-            load_model_overlay,
-            merge_model_overlays,
+        ``workdir`` (defaulting to the current directory) is inspected for
+        ``.qqcode`` resources; they only load when the project is trusted (see
+        :func:`vibe.core.trust.resolve_trust`). Context files such as
+        ``AGENTS.md`` are never gated because they are inert text.
+        """
+        config, _ = cls.load_with_trust(
+            agent,
+            workdir=workdir,
+            trust=trust,
+            trust_callback=trust_callback,
+            trust_store=trust_store,
+            **overrides,
         )
-
-        overlay_paths = default_overlay_paths()
-        overlay_paths.extend(
-            Path(provider.models_path).expanduser()
-            for provider in config.providers
-            if provider.models_path
-            and not provider.models_path.startswith(("http://", "https://"))
-        )
-        if overlay_models := load_model_overlay(overlay_paths):
-            config.models = merge_model_overlays(config.models, overlay_models)
-
         return config
+
+    @classmethod
+    def load_with_trust(
+        cls,
+        agent: str | None = None,
+        *,
+        workdir: Path | None = None,
+        trust: bool | None = None,
+        trust_callback: TrustPrompt | None = None,
+        trust_store: TrustStore | None = None,
+        global_config_file: Path | None = None,
+        default_project_trust: bool | None = None,
+        **overrides: Any,
+    ) -> tuple[VibeConfig, TrustResolution]:
+        """Trust-aware :meth:`load` returning the resolution alongside the config.
+
+        Kept separate from ``load`` so tests can bypass the suite-wide
+        ``VibeConfig.load`` patch and exercise the gating logic directly.
+        """
+        cls._migrate()
+        cwd = Path(workdir).expanduser() if workdir is not None else Path.cwd()
+        effective_default = (
+            default_project_trust
+            if default_project_trust is not None
+            else read_default_project_trust(global_config_file)
+        )
+        config_file, resolution = resolve_config_file_for_project(
+            cwd,
+            trust=trust,
+            trust_callback=trust_callback,
+            trust_store=trust_store,
+            default_project_trust=effective_default,
+            global_config_file=global_config_file,
+        )
+        if workdir is not None:
+            overrides = {**overrides, "workdir": workdir}
+
+        with config_file_override(config_file):
+            base = cls(**overrides)
+            config = base
+            if agent is not None:
+                agent_config = cls._get_agent_config(agent, base.packages)
+                config = cls(**{**(agent_config or {}), **overrides})
+
+            from vibe.core.models_overlay import (
+                default_overlay_paths,
+                load_model_overlay,
+                merge_model_overlays,
+            )
+
+            overlay_paths = default_overlay_paths()
+            overlay_paths.extend(
+                Path(provider.models_path).expanduser()
+                for provider in config.providers
+                if provider.models_path
+                and not provider.models_path.startswith(("http://", "https://"))
+            )
+            if overlay_models := load_model_overlay(overlay_paths):
+                config.models = merge_model_overlays(config.models, overlay_models)
+
+        config.project_trust = resolution.decision
+        if resolution.trusted and resolution.project is not None:
+            config.mcp_servers.extend(
+                cls._validated_project_mcp_servers(resolution.project)
+            )
+
+        return config, resolution
+
+    @staticmethod
+    def _validated_project_mcp_servers(project: ProjectResources) -> list[MCPServer]:
+        from pydantic import TypeAdapter, ValidationError
+
+        adapter: TypeAdapter[MCPServer] = TypeAdapter(MCPServer)
+        servers: list[MCPServer] = []
+        for raw in read_project_mcp_servers(project):
+            try:
+                servers.append(adapter.validate_python(raw))
+            except ValidationError as exc:
+                logger.warning(
+                    "Ignoring invalid project MCP server in %s: %s",
+                    project.mcp_file,
+                    exc,
+                )
+        return servers
 
     @classmethod
     def create_default(cls) -> dict[str, Any]:
