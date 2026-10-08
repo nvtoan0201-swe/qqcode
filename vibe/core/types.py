@@ -355,6 +355,22 @@ class MCPToolsChangedEvent(BaseEvent):
     server: str | None = None
 
 
+class SubagentEvent(BaseEvent):
+    """Coarse progress summary for a delegated subagent run."""
+
+    description: str
+    status: Literal["running", "completed", "failed", "timeout", "cancelled"] = (
+        "running"
+    )
+    turns: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    message: str | None = None
+
+
+type SubagentProgressEvent = SubagentEvent | ToolCallEvent | ToolResultEvent
+
+
 class OutputFormat(StrEnum):
     TEXT = auto()
     JSON = auto()

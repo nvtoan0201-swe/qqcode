@@ -311,6 +311,34 @@ class TelemetryConfig(BaseSettings):
         return str(Path(v).expanduser().resolve())
 
 
+class SubagentConfig(BaseSettings):
+    """Limits and isolation rules for delegated ``task`` runs."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Expose the ``task`` tool; when false it is hidden entirely.",
+    )
+    timeout: float = Field(
+        default=600.0,
+        gt=0.0,
+        description="Hard wall-clock timeout in seconds for one subagent run.",
+    )
+    max_concurrent: int = Field(
+        default=2, ge=1, description="Maximum simultaneous subagent runs."
+    )
+    max_price: float | None = Field(
+        default=None, gt=0.0, description="Optional per-subagent cost cap in dollars."
+    )
+    stream_tools: bool = Field(
+        default=False,
+        description="Forward subagent tool call/result events to the parent UI.",
+    )
+    default_agent: str = Field(
+        default="general",
+        description="Agent config used when the model does not name one.",
+    )
+
+
 class Backend(StrEnum):
     MISTRAL = auto()
     GENERIC = auto()
@@ -837,6 +865,7 @@ class VibeConfig(BaseSettings):
     audit: AuditConfig = Field(default_factory=AuditConfig)
     debug: DebugConfig = Field(default_factory=DebugConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    subagent: SubagentConfig = Field(default_factory=SubagentConfig)
     default_project_trust: bool = Field(
         default=False,
         description="Trust projects without a stored decision (secure default: false).",

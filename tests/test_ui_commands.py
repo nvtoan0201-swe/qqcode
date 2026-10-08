@@ -473,9 +473,7 @@ async def test_scoped_models_screen_saves_scope(
         )
 
     assert first_alias not in session_app_config.enabled_models
-    assert len(session_app_config.enabled_models) == len(
-        session_app_config.models
-    ) - 1
+    assert len(session_app_config.enabled_models) == len(session_app_config.models) - 1
 
 
 @pytest.mark.asyncio

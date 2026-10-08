@@ -93,6 +93,11 @@ def get_active_tool_classes(
 
     all_tools = list(tool_manager.available_tools().values())
 
+    if not config.subagent.enabled:
+        all_tools = [
+            tool_class for tool_class in all_tools if tool_class.get_name() != "task"
+        ]
+
     if config.enabled_tools:
         return [
             tool_class

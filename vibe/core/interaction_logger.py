@@ -80,6 +80,7 @@ class InteractionLogger:
         auto_approve: bool = False,
         workdir: Path | None = None,
         existing_filepath: Path | None = None,
+        parent_session_id: str | None = None,
     ) -> None:
         if workdir is None:
             workdir = Path.cwd()
@@ -87,6 +88,7 @@ class InteractionLogger:
         self.enabled = session_config.enabled
         self.auto_approve = auto_approve
         self.workdir = workdir
+        self.parent_session_id = parent_session_id
         self.format: Literal["json", "jsonl"] = session_config.format
         self._write_format: Literal["json", "jsonl"] = session_config.format
         self._store = JsonlSessionStore(session_config)
@@ -160,6 +162,7 @@ class InteractionLogger:
             git_branch=self._get_git_branch(),
             git_commit=self._get_git_commit(),
             username=self._get_username(),
+            parent_session_id=self.parent_session_id,
         )
 
     def _ensure_session_file(self) -> None:

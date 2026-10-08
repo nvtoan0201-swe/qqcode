@@ -12,7 +12,13 @@ from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_tool import FakeTool
 from tests.stubs.sleep_tool import SleepTool
 from vibe.core.agent import Agent
-from vibe.core.config import SessionLoggingConfig, ToolRuntimeConfig, VibeConfig
+from vibe.core.config import (
+    SessionLoggingConfig,
+    SubagentConfig,
+    ToolRuntimeConfig,
+    VibeConfig,
+)
+from vibe.core.llm.format import get_active_tool_classes
 from vibe.core.tools.base import BaseToolConfig, ToolPermission
 from vibe.core.tools.builtins.todo import TodoItem
 from vibe.core.types import (
@@ -580,3 +586,38 @@ async def test_parallel_false_runs_everything_sequentially() -> None:
     elapsed = time.perf_counter() - start
 
     assert elapsed > 0.35
+
+
+def make_subagent_agent(subagent_config: SubagentConfig) -> Agent:
+    config = VibeConfig(
+        session_logging=SessionLoggingConfig(enabled=False),
+        auto_compact_threshold=0,
+        subagent=subagent_config,
+        system_prompt_id="tests",
+        include_project_context=False,
+        include_prompt_detail=False,
+    )
+    return Agent(config, backend=FakeBackend([]))
+
+
+def test_task_tool_is_listed_when_subagent_enabled() -> None:
+    agent = make_subagent_agent(SubagentConfig(enabled=True))
+
+    names = {
+        tool_class.get_name()
+        for tool_class in get_active_tool_classes(agent.tool_manager, agent.config)
+    }
+
+    assert "task" in names
+
+
+def test_task_tool_is_hidden_when_subagent_disabled() -> None:
+    agent = make_subagent_agent(SubagentConfig(enabled=False))
+
+    names = {
+        tool_class.get_name()
+        for tool_class in get_active_tool_classes(agent.tool_manager, agent.config)
+    }
+
+    assert "task" not in names
+    assert "read_file" in names

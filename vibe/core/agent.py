@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum, auto
 from pathlib import Path
 import time
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
@@ -90,6 +91,8 @@ from vibe.core.types import (
     MCPToolsChangedEvent,
     ModeChangedEvent,
     Role,
+    SubagentEvent,
+    SubagentProgressEvent,
     SyncApprovalCallback,
     SystemPromptChangedEvent,
     ToolCall,
@@ -105,6 +108,10 @@ from vibe.core.utils import (
     get_user_cancellation_message,
     is_user_cancellation_event,
 )
+
+if TYPE_CHECKING:
+    from vibe.core.subagent import SubAgentRunner
+
 
 # Tools allowed in Plan Mode (read-only operations + plan submission)
 # Note: exit_plan_mode is NOT included because mode switching happens
@@ -205,6 +212,7 @@ class Agent:
         session_id: str | None = None,
         additional_directory_contexts: list[Path] | None = None,
         mcp_manager: MCPManager | None = None,
+        parent_session_id: str | None = None,
     ) -> None:
         self.config = config
 
@@ -300,6 +308,7 @@ class Agent:
             self._mode == AgentMode.AUTO_APPROVE,
             config.effective_workdir,
             existing_filepath=existing_filepath,
+            parent_session_id=parent_session_id,
         )
         self._recorder = SessionRecorder(self.interaction_logger, agent=self)
 
@@ -311,6 +320,10 @@ class Agent:
         self.audit_logger = build_audit_logger(config.audit, session_id=self.session_id)
         self.metrics = build_metrics_recorder(config.telemetry)
         self.debug_logger = build_debug_logger(config.debug)
+        self._subagent_event_queue: asyncio.Queue[SubagentProgressEvent] = (
+            asyncio.Queue()
+        )
+        self._subagent_runner: SubAgentRunner | None = None
 
     @property
     def mode(self) -> AgentMode:
@@ -417,6 +430,16 @@ class Agent:
     @property
     def aborted(self) -> bool:
         return self._abort_event.is_set()
+
+    def _get_or_create_subagent_runner(self) -> SubAgentRunner:
+        from vibe.core.subagent import SubAgentRunner
+
+        if self._subagent_runner is None:
+            self._subagent_runner = SubAgentRunner(self)
+        return self._subagent_runner
+
+    def _emit_subagent_event(self, event: SubagentProgressEvent) -> None:
+        self._subagent_event_queue.put_nowait(event)
 
     def _drain_steering(self) -> list[str]:
         messages: list[str] = []
@@ -689,6 +712,7 @@ class Agent:
         | ToolResultEvent
         | ModeChangedEvent
         | SystemPromptChangedEvent
+        | SubagentEvent
     ]:
         decision = await self._dispatch_before_request()
         if decision.action == "deny":
@@ -883,7 +907,11 @@ class Agent:
     async def _handle_tool_calls(
         self, resolved: ResolvedMessage
     ) -> AsyncGenerator[
-        ToolCallEvent | ToolResultEvent | ModeChangedEvent | SystemPromptChangedEvent
+        ToolCallEvent
+        | ToolResultEvent
+        | ModeChangedEvent
+        | SystemPromptChangedEvent
+        | SubagentEvent
     ]:
         async for event in self._emit_failed_tool_calls(resolved.failed_calls):
             yield event
@@ -982,9 +1010,46 @@ class Agent:
                 )
             )
 
-        outcomes = await self._execute_prepared_calls(prepared)
+        outcomes: list[BaseModel | BaseException | None] = []
+        async for event in self._execute_calls_streaming(prepared, outcomes):
+            yield event
         async for event in self._commit_tool_results(prepared, outcomes):
             yield event
+
+    async def _execute_calls_streaming(
+        self,
+        prepared: list[_PreparedCall],
+        outcomes: list[BaseModel | BaseException | None],
+    ) -> AsyncGenerator[SubagentProgressEvent]:
+        """Run the prepared tool batch, yielding subagent progress events.
+
+        Tools themselves cannot yield into the agent generator, so the
+        subagent runner pushes summary events onto ``_subagent_event_queue``
+        while the batch executes; this method interleaves them with the
+        running batch and stores the final outcomes in ``outcomes``.
+        """
+        execution = asyncio.create_task(self._execute_prepared_calls(prepared))
+        try:
+            while not execution.done():
+                event_task = asyncio.create_task(self._subagent_event_queue.get())
+                done, _ = await asyncio.wait(
+                    {execution, event_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if event_task in done:
+                    yield event_task.result()
+                else:
+                    event_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await event_task
+        except BaseException:
+            execution.cancel()
+            with suppress(asyncio.CancelledError):
+                await execution
+            raise
+
+        outcomes.extend(execution.result())
+        while not self._subagent_event_queue.empty():
+            yield self._subagent_event_queue.get_nowait()
 
     async def _emit_failed_tool_calls(
         self, failed_calls: list[FailedToolCall]
@@ -1513,8 +1578,14 @@ class Agent:
             # Return a new instance with plan mode config
             return tool_class.from_config(plan_mode_config)
 
-        # For all other cases, use the normal tool manager
-        return self.tool_manager.get(tool_name)
+        # For all other cases, use the normal tool manager. Builtin tools are
+        # discovered dynamically, so match by name and duck-type the injector.
+        instance = self.tool_manager.get(tool_name)
+        if tool_name == "task":
+            attach_runner = getattr(instance, "attach_runner", None)
+            if callable(attach_runner):
+                attach_runner(self._get_or_create_subagent_runner())
+        return instance
 
     async def _should_execute_tool(  # noqa: PLR0911
         self, tool: BaseTool, args: dict[str, Any], tool_call_id: str
