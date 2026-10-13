@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 import mistralai
 
+from vibe.core.llm.capabilities import clamp_max_tokens
 from vibe.core.llm.exceptions import BackendErrorBuilder
 from vibe.core.types import (
     AvailableTool,
@@ -193,7 +194,7 @@ class MistralBackend:
                 tools=[self._mapper.prepare_tool(tool) for tool in tools]
                 if tools
                 else None,
-                max_tokens=max_tokens,
+                max_tokens=clamp_max_tokens(model, max_tokens),
                 tool_choice=self._mapper.prepare_tool_choice(tool_choice)
                 if tool_choice
                 else None,
@@ -273,7 +274,7 @@ class MistralBackend:
                 tools=[self._mapper.prepare_tool(tool) for tool in tools]
                 if tools
                 else None,
-                max_tokens=max_tokens,
+                max_tokens=clamp_max_tokens(model, max_tokens),
                 tool_choice=self._mapper.prepare_tool_choice(tool_choice)
                 if tool_choice
                 else None,

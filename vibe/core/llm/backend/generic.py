@@ -24,6 +24,7 @@ from vibe.core.llm.backend.adapters import (
     register_adapter,
 )
 from vibe.core.llm.cache import CachePlan
+from vibe.core.llm.capabilities import clamp_max_tokens
 from vibe.core.llm.exceptions import BackendErrorBuilder
 from vibe.core.oauth.registry import get_flow
 from vibe.core.types import AvailableTool, LLMChunk, LLMMessage, Role, StrToolChoice
@@ -34,6 +35,15 @@ if TYPE_CHECKING:
     from vibe.core.oauth.token import AnthropicOAuthToken, QwenOAuthToken
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_qwen_resource_url(resource_url: str | None) -> str | None:
+    """Ensure a Qwen resource URL carries the https:// prefix and /v1 suffix."""
+    if not resource_url:
+        return None
+    url = resource_url if resource_url.startswith("http") else f"https://{resource_url}"
+    return url if url.endswith("/v1") else f"{url}/v1"
+
 
 __all__ = [
     "ADAPTER_REGISTRY",
@@ -146,36 +156,12 @@ class GenericBackend:
             - api_key may be a Bearer token for OAuth authentication
             - api_base_override is the URL to use instead of provider.api_base (for Qwen OAuth)
         """
-        extra_headers: dict[str, str] = {}
-        api_base_override: str | None = None
-
-        # Check for OAuth token first
         if self._provider.oauth_token:
             # Refresh token if expired (serialized per provider)
             await self._ensure_fresh_token()
-
-            if self._provider.oauth_token and not self._provider.oauth_token.is_expired(
-                skew=60
-            ):
-                # OAuth token is valid - use Bearer auth
-                api_key = self._provider.oauth_token.access_token
-                # Add provider-specific OAuth headers
-                if self._provider.name == "anthropic":
-                    extra_headers["anthropic-version"] = "2023-06-01"
-                    extra_headers["anthropic-beta"] = "oauth-2025-04-20"
-                # Qwen OAuth: use resource_url as API base if available
-                elif self._provider.name == "qwen":
-                    resource_url = getattr(
-                        self._provider.oauth_token, "resource_url", None
-                    )
-                    if resource_url:
-                        # Ensure URL has https:// prefix and /v1 suffix
-                        if not resource_url.startswith("http"):
-                            resource_url = f"https://{resource_url}"
-                        if not resource_url.endswith("/v1"):
-                            resource_url = f"{resource_url}/v1"
-                        api_base_override = resource_url
-                return api_key, extra_headers, api_base_override
+            oauth = self._provider.oauth_token
+            if oauth and not oauth.is_expired(skew=60):
+                return self._oauth_auth_info(oauth.access_token)
 
         # Fall back to API key from env var
         api_key = (
@@ -183,7 +169,27 @@ class GenericBackend:
             if self._provider.api_key_env_var
             else None
         )
-        return api_key, extra_headers, api_base_override
+        return api_key, {}, None
+
+    def _oauth_auth_info(
+        self, access_token: str
+    ) -> tuple[str, dict[str, str], str | None]:
+        """Build the auth tuple for a valid OAuth token."""
+        match self._provider.name:
+            case "anthropic":
+                return (
+                    access_token,
+                    {
+                        "anthropic-version": "2023-06-01",
+                        "anthropic-beta": "oauth-2025-04-20",
+                    },
+                    None,
+                )
+            case "qwen":
+                resource_url = getattr(self._provider.oauth_token, "resource_url", None)
+                return access_token, {}, _normalize_qwen_resource_url(resource_url)
+            case _:
+                return access_token, {}, None
 
     def _resolve_thinking_level(
         self, model: ModelConfig, thinking_level: ThinkingLevel | None
@@ -220,7 +226,7 @@ class GenericBackend:
             messages=messages,
             temperature=temperature,
             tools=tools,
-            max_tokens=max_tokens,
+            max_tokens=clamp_max_tokens(model, max_tokens),
             tool_choice=tool_choice,
             enable_streaming=False,
             provider=self._provider,
@@ -296,7 +302,7 @@ class GenericBackend:
             messages=messages,
             temperature=temperature,
             tools=tools,
-            max_tokens=max_tokens,
+            max_tokens=clamp_max_tokens(model, max_tokens),
             tool_choice=tool_choice,
             enable_streaming=True,
             provider=self._provider,

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
+from dataclasses import dataclass, field
 import json
 import logging
 import os
 import types
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import anthropic
 import httpx
@@ -18,6 +19,7 @@ from vibe.core.config import (
     save_oauth_token,
 )
 from vibe.core.llm.cache import CachePlan
+from vibe.core.llm.capabilities import clamp_max_tokens
 from vibe.core.llm.exceptions import BackendErrorBuilder
 from vibe.core.oauth.registry import get_flow
 from vibe.core.types import (
@@ -40,6 +42,70 @@ logger = logging.getLogger(__name__)
 
 # Required system prompt prefix for Claude Code OAuth
 CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+
+# Cache control needs a previous turn to attach to.
+MIN_MESSAGES_FOR_CACHE = 2
+
+
+@dataclass
+class _StreamState:
+    """Token totals and in-flight tool calls for a streamed response."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    tool_calls: dict[int, dict[str, str]] = field(default_factory=dict)
+
+    def prompt_tokens(self) -> int:
+        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+
+
+def _delta_chunks(event: Any, state: _StreamState) -> Iterator[LLMChunk]:
+    delta = event.delta
+    match delta.type:
+        case "text_delta":
+            yield LLMChunk(
+                message=LLMMessage(role=Role.assistant, content=delta.text),
+                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
+                finish_reason=None,
+            )
+        case "thinking_delta":
+            yield LLMChunk(
+                message=LLMMessage(
+                    role=Role.assistant, reasoning_content=delta.thinking
+                ),
+                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
+                finish_reason=None,
+            )
+        case "signature_delta":
+            yield LLMChunk(
+                message=LLMMessage(
+                    role=Role.assistant, thinking_signature=delta.signature
+                ),
+                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
+                finish_reason=None,
+            )
+        case "input_json_delta":
+            if (tool_call := state.tool_calls.get(event.index)) is not None:
+                tool_call["input"] += delta.partial_json
+
+
+def _tool_call_chunk(index: int, data: dict[str, str]) -> LLMChunk:
+    return LLMChunk(
+        message=LLMMessage(
+            role=Role.assistant,
+            tool_calls=[
+                ToolCall(
+                    id=data["id"],
+                    index=index,  # Required by agent
+                    function=FunctionCall(name=data["name"], arguments=data["input"]),
+                )
+            ],
+        ),
+        usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
+        finish_reason=None,
+    )
 
 
 class AnthropicMapper:
@@ -75,73 +141,89 @@ class AnthropicMapper:
             system_parts.append(CLAUDE_CODE_SYSTEM_PREFIX)
 
         for msg in messages:
-            if msg.role == Role.system:
-                if msg.content:
-                    system_parts.append(msg.content)
-            elif msg.role == Role.user:
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": msg.content or "",
-                })
-            elif msg.role == Role.assistant:
-                if msg.tool_calls or msg.reasoning_content:
-                    # Assistant message with tool calls or thinking content
-                    content: list[anthropic.types.ContentBlockParam] = []
-                    # Thinking block must come first (required by Anthropic API)
-                    if msg.reasoning_content and msg.thinking_signature:
-                        content.append({
-                            "type": "thinking",
-                            "thinking": msg.reasoning_content,
-                            "signature": msg.thinking_signature,
-                        })  # type: ignore[typeddict-item]
+            match msg.role:
+                case Role.system:
                     if msg.content:
-                        content.append({"type": "text", "text": msg.content})
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            input_data = tc.function.arguments or "{}"
-                            if isinstance(input_data, str):
-                                try:
-                                    input_data = json.loads(input_data)
-                                except json.JSONDecodeError:
-                                    input_data = {}
-                            content.append({
-                                "type": "tool_use",
-                                "id": tc.id or "",
-                                "name": tc.function.name or "",
-                                "input": input_data,
-                            })
-                    anthropic_messages.append({"role": "assistant", "content": content})
-                else:
-                    anthropic_messages.append({
-                        "role": "assistant",
-                        "content": msg.content or "",
-                    })
-            elif msg.role == Role.tool:
-                # Tool results go in a user message
-                tool_result: anthropic.types.ToolResultBlockParam = {
-                    "type": "tool_result",
-                    "tool_use_id": msg.tool_call_id or "",
-                    "content": msg.content or "",
-                }
-                # Append to last user message or create new one
-                if anthropic_messages and anthropic_messages[-1]["role"] == "user":
-                    last_content = anthropic_messages[-1]["content"]
-                    if isinstance(last_content, list):
-                        last_content.append(tool_result)  # type: ignore[arg-type]
-                    else:
-                        anthropic_messages[-1]["content"] = [  # type: ignore[typeddict-item]
-                            {"type": "text", "text": last_content}
-                            if last_content
-                            else {"type": "text", "text": ""},
-                            tool_result,
-                        ]
-                else:
+                        system_parts.append(msg.content)
+                case Role.user:
                     anthropic_messages.append({
                         "role": "user",
-                        "content": [tool_result],
+                        "content": msg.content or "",
                     })
+                case Role.assistant:
+                    anthropic_messages.append(self._convert_assistant_message(msg))
+                case Role.tool:
+                    self._append_tool_result(
+                        anthropic_messages,
+                        anthropic.types.ToolResultBlockParam(
+                            type="tool_result",
+                            tool_use_id=msg.tool_call_id or "",
+                            content=msg.content or "",
+                        ),
+                    )
 
         return system_parts, anthropic_messages
+
+    def _convert_assistant_message(
+        self, msg: LLMMessage
+    ) -> anthropic.types.MessageParam:
+        if not msg.tool_calls and not msg.reasoning_content:
+            return {"role": "assistant", "content": msg.content or ""}
+
+        content: list[anthropic.types.ContentBlockParam] = []
+        # Thinking block must come first (required by Anthropic API)
+        if msg.reasoning_content and msg.thinking_signature:
+            content.append({
+                "type": "thinking",
+                "thinking": msg.reasoning_content,
+                "signature": msg.thinking_signature,
+            })  # type: ignore[typeddict-item]
+        if msg.content:
+            content.append({"type": "text", "text": msg.content})
+        if msg.tool_calls:
+            content.extend(
+                self._convert_tool_use(tool_call) for tool_call in msg.tool_calls
+            )
+        return {"role": "assistant", "content": content}
+
+    @staticmethod
+    def _convert_tool_use(tool_call: ToolCall) -> anthropic.types.ContentBlockParam:
+        input_data = tool_call.function.arguments or "{}"
+        if isinstance(input_data, str):
+            try:
+                input_data = json.loads(input_data)
+            except json.JSONDecodeError:
+                input_data = {}
+        return {
+            "type": "tool_use",
+            "id": tool_call.id or "",
+            "name": tool_call.function.name or "",
+            "input": input_data,
+        }
+
+    @staticmethod
+    def _append_tool_result(
+        anthropic_messages: list[anthropic.types.MessageParam],
+        tool_result: anthropic.types.ToolResultBlockParam,
+    ) -> None:
+        """Append a tool result to the last user message, or start a new one."""
+        last = anthropic_messages[-1] if anthropic_messages else None
+        if last is None or last["role"] != "user":
+            anthropic_messages.append({"role": "user", "content": [tool_result]})
+            return
+
+        last_content = last["content"]
+        if isinstance(last_content, str):
+            text_block: anthropic.types.TextBlockParam = {
+                "type": "text",
+                "text": last_content,
+            }
+            last["content"] = [text_block, tool_result]
+            return
+
+        blocks = list(last_content)
+        blocks.append(tool_result)
+        last["content"] = blocks
 
     @staticmethod
     def _cache_control(ttl: str | None) -> anthropic.types.CacheControlEphemeralParam:
@@ -164,7 +246,7 @@ class AnthropicMapper:
         - Turn 2: [User1+cache_hit] [Asst1] [User2] -> cache at Asst1, User1 is cache hit
         - Turn 3: [User1+Asst1:cache_hit] [User2] [Asst2] [User3] -> cache at User2
         """
-        if len(messages) < 2:
+        if len(messages) < MIN_MESSAGES_FOR_CACHE:
             # Need at least 2 messages to cache history
             return messages
 
@@ -462,34 +544,15 @@ class AnthropicBackend:
         plan = cache_plan if cache_plan is not None else CachePlan(enabled=True)
 
         try:
-            system_parts, anthropic_messages = self._mapper.prepare_messages(
-                messages, is_oauth=self._is_oauth()
+            kwargs = self._build_request_kwargs(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                tool_choice=tool_choice,
+                max_tokens=max_tokens,
+                plan=plan,
             )
-
-            # Enable prompt caching for system prompt and conversation history
-            if plan.enabled:
-                anthropic_messages = self._mapper.add_cache_control_to_messages(
-                    anthropic_messages, ttl=plan.ttl
-                )
-
-            kwargs: dict = {
-                "model": model.name,
-                "messages": anthropic_messages,
-                "max_tokens": max_tokens or 8192,
-            }
-
-            if system_parts:
-                kwargs["system"] = self._mapper.prepare_system_blocks(
-                    system_parts, enable_caching=plan.enabled, ttl=plan.ttl
-                )
-            if temperature > 0:
-                kwargs["temperature"] = temperature
-            if tools:
-                kwargs["tools"] = self._mapper.prepare_tools(tools)
-            if tool_choice:
-                tc = self._mapper.prepare_tool_choice(tool_choice)
-                if tc:
-                    kwargs["tool_choice"] = tc
 
             # Handle thinking mode from the session level or model.extra_body
             extra_call_headers = self._apply_thinking(
@@ -573,142 +636,29 @@ class AnthropicBackend:
         plan = cache_plan if cache_plan is not None else CachePlan(enabled=True)
 
         try:
-            system_parts, anthropic_messages = self._mapper.prepare_messages(
-                messages, is_oauth=self._is_oauth()
+            kwargs = self._build_request_kwargs(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                tool_choice=tool_choice,
+                max_tokens=max_tokens,
+                plan=plan,
             )
-
-            # Enable prompt caching for system prompt and conversation history
-            if plan.enabled:
-                anthropic_messages = self._mapper.add_cache_control_to_messages(
-                    anthropic_messages, ttl=plan.ttl
-                )
-
-            kwargs: dict = {
-                "model": model.name,
-                "messages": anthropic_messages,
-                "max_tokens": max_tokens or 8192,
-            }
-
-            if system_parts:
-                kwargs["system"] = self._mapper.prepare_system_blocks(
-                    system_parts, enable_caching=plan.enabled, ttl=plan.ttl
-                )
-            if temperature > 0:
-                kwargs["temperature"] = temperature
-            if tools:
-                kwargs["tools"] = self._mapper.prepare_tools(tools)
-            if tool_choice:
-                tc = self._mapper.prepare_tool_choice(tool_choice)
-                if tc:
-                    kwargs["tool_choice"] = tc
 
             # Handle thinking mode from the session level or model.extra_body
             extra_call_headers = self._apply_thinking(
                 kwargs, messages, model, thinking_level
             )
 
-            # Accumulate tool calls across stream
-            current_tool_calls: dict[int, dict] = {}
-            total_input_tokens = 0
-            total_output_tokens = 0
-            total_cache_read_tokens = 0
-            total_cache_write_tokens = 0
-
+            state = _StreamState()
             async with self._get_client().messages.stream(
                 **kwargs,
                 extra_headers=extra_call_headers if extra_call_headers else None,
             ) as stream:
                 async for event in stream:
-                    if event.type == "message_start":
-                        if event.message.usage:
-                            total_input_tokens = event.message.usage.input_tokens
-                            total_cache_read_tokens = (
-                                event.message.usage.cache_read_input_tokens or 0
-                            )
-                            total_cache_write_tokens = (
-                                event.message.usage.cache_creation_input_tokens or 0
-                            )
-                    elif event.type == "content_block_start":
-                        if event.content_block.type == "tool_use":
-                            current_tool_calls[event.index] = {
-                                "id": event.content_block.id,
-                                "name": event.content_block.name,
-                                "input": "",
-                            }
-                    elif event.type == "content_block_delta":
-                        if event.delta.type == "text_delta":
-                            yield LLMChunk(
-                                message=LLMMessage(
-                                    role=Role.assistant, content=event.delta.text
-                                ),
-                                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
-                                finish_reason=None,
-                            )
-                        elif event.delta.type == "thinking_delta":
-                            # Yield thinking/reasoning content
-                            yield LLMChunk(
-                                message=LLMMessage(
-                                    role=Role.assistant,
-                                    reasoning_content=event.delta.thinking,
-                                ),
-                                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
-                                finish_reason=None,
-                            )
-                        elif event.delta.type == "signature_delta":
-                            # Yield thinking signature (required for API)
-                            yield LLMChunk(
-                                message=LLMMessage(
-                                    role=Role.assistant,
-                                    thinking_signature=event.delta.signature,
-                                ),
-                                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
-                                finish_reason=None,
-                            )
-                        elif event.delta.type == "input_json_delta":
-                            if event.index in current_tool_calls:
-                                current_tool_calls[event.index]["input"] += (
-                                    event.delta.partial_json
-                                )
-                    elif event.type == "content_block_stop":
-                        # When a tool use block completes, yield the tool call
-                        if event.index in current_tool_calls:
-                            tc_data = current_tool_calls[event.index]
-                            yield LLMChunk(
-                                message=LLMMessage(
-                                    role=Role.assistant,
-                                    content=None,
-                                    tool_calls=[
-                                        ToolCall(
-                                            id=tc_data["id"],
-                                            index=event.index,  # Required by agent
-                                            function=FunctionCall(
-                                                name=tc_data["name"],
-                                                arguments=tc_data["input"],
-                                            ),
-                                        )
-                                    ],
-                                ),
-                                usage=LLMUsage(prompt_tokens=0, completion_tokens=0),
-                                finish_reason=None,
-                            )
-                            del current_tool_calls[event.index]
-                    elif event.type == "message_delta":
-                        if event.usage:
-                            total_output_tokens = event.usage.output_tokens
-                        yield LLMChunk(
-                            message=LLMMessage(role=Role.assistant, content=""),
-                            usage=LLMUsage(
-                                prompt_tokens=(
-                                    total_input_tokens
-                                    + total_cache_read_tokens
-                                    + total_cache_write_tokens
-                                ),
-                                completion_tokens=total_output_tokens,
-                                cache_read_tokens=total_cache_read_tokens,
-                                cache_write_tokens=total_cache_write_tokens,
-                            ),
-                            finish_reason=event.delta.stop_reason,
-                        )
+                    for chunk in self._stream_event_chunks(event, state):
+                        yield chunk
 
         except anthropic.APIStatusError as e:
             raise BackendErrorBuilder.build_http_error(
@@ -733,6 +683,81 @@ class AnthropicBackend:
                 has_tools=bool(tools),
                 tool_choice=tool_choice,
             ) from e
+
+    def _build_request_kwargs(
+        self,
+        *,
+        model: ModelConfig,
+        messages: list[LLMMessage],
+        temperature: float,
+        tools: list[AvailableTool] | None,
+        tool_choice: StrToolChoice | AvailableTool | None,
+        max_tokens: int | None,
+        plan: CachePlan,
+    ) -> dict[str, Any]:
+        system_parts, anthropic_messages = self._mapper.prepare_messages(
+            messages, is_oauth=self._is_oauth()
+        )
+
+        # Enable prompt caching for system prompt and conversation history
+        if plan.enabled:
+            anthropic_messages = self._mapper.add_cache_control_to_messages(
+                anthropic_messages, ttl=plan.ttl
+            )
+
+        kwargs: dict[str, Any] = {
+            "model": model.name,
+            "messages": anthropic_messages,
+            "max_tokens": clamp_max_tokens(model, max_tokens) or 8192,
+        }
+
+        if system_parts:
+            kwargs["system"] = self._mapper.prepare_system_blocks(
+                system_parts, enable_caching=plan.enabled, ttl=plan.ttl
+            )
+        if temperature > 0:
+            kwargs["temperature"] = temperature
+        if tools:
+            kwargs["tools"] = self._mapper.prepare_tools(tools)
+        if tool_choice:
+            tc = self._mapper.prepare_tool_choice(tool_choice)
+            if tc:
+                kwargs["tool_choice"] = tc
+        return kwargs
+
+    def _stream_event_chunks(
+        self, event: Any, state: _StreamState
+    ) -> Iterator[LLMChunk]:
+        match event.type:
+            case "message_start":
+                if usage := event.message.usage:
+                    state.input_tokens = usage.input_tokens
+                    state.cache_read_tokens = usage.cache_read_input_tokens or 0
+                    state.cache_write_tokens = usage.cache_creation_input_tokens or 0
+            case "content_block_start" if event.content_block.type == "tool_use":
+                state.tool_calls[event.index] = {
+                    "id": event.content_block.id,
+                    "name": event.content_block.name,
+                    "input": "",
+                }
+            case "content_block_delta":
+                yield from _delta_chunks(event, state)
+            case "content_block_stop":
+                if tc_data := state.tool_calls.pop(event.index, None):
+                    yield _tool_call_chunk(event.index, tc_data)
+            case "message_delta":
+                if event.usage:
+                    state.output_tokens = event.usage.output_tokens
+                yield LLMChunk(
+                    message=LLMMessage(role=Role.assistant, content=""),
+                    usage=LLMUsage(
+                        prompt_tokens=state.prompt_tokens(),
+                        completion_tokens=state.output_tokens,
+                        cache_read_tokens=state.cache_read_tokens,
+                        cache_write_tokens=state.cache_write_tokens,
+                    ),
+                    finish_reason=event.delta.stop_reason,
+                )
 
     async def count_tokens(
         self,
