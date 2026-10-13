@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from vibe.core.context.cut import CutResult, select_cut
 from vibe.core.context.tokens import estimate_context_tokens
+from vibe.core.hooks.events import (
+    AfterCompactEvent,
+    BeforeCompactEvent,
+    CompactFailedEvent,
+    HookDecision,
+)
 from vibe.core.llm.cache import CachePlan
 from vibe.core.middleware import ResetReason
 from vibe.core.prompts import UtilityPrompt
@@ -18,6 +24,8 @@ SUMMARIZER_SYSTEM_PROMPT = (
 )
 SUMMARY_TAG = "conversation_summary"
 TOOL_RESULT_MAX_CHARS = 2000
+
+type CompactionReason = Literal["auto", "manual", "overflow"]
 
 
 @dataclass
@@ -179,8 +187,18 @@ class Compactor:
         agent._recorder.on_compaction(result, first_kept_id)
         return result
 
+    @staticmethod
+    def _summary_override(decision: HookDecision) -> str | None:
+        if decision.action != "modify" or not decision.summary_override:
+            return None
+        return decision.summary_override.strip() or None
+
     async def compact(
-        self, *, instructions: str | None = None, force: bool = False
+        self,
+        *,
+        instructions: str | None = None,
+        force: bool = False,
+        reason: CompactionReason = "auto",
     ) -> CompactionResult:
         agent = self._agent
         config = agent.config
@@ -188,6 +206,45 @@ class Compactor:
 
         if not config.compaction.enabled and not force:
             return self._skipped_result(tokens_before)
+
+        decision = await agent.hooks.dispatch(
+            BeforeCompactEvent(
+                messages=list(agent.messages),
+                tokens_before=tokens_before,
+                reason=reason,
+            )
+        )
+        if decision.action == "deny":
+            return self._skipped_result(tokens_before)
+
+        try:
+            result = await self._summarize(
+                instructions=instructions,
+                tokens_before=tokens_before,
+                summary_override=self._summary_override(decision),
+            )
+        except Exception as exc:
+            await agent.hooks.dispatch(CompactFailedEvent(error=str(exc)))
+            raise
+
+        await agent.hooks.dispatch(
+            AfterCompactEvent(
+                tokens_before=result.tokens_before,
+                tokens_after=result.tokens_after_estimate,
+                is_update=result.is_update,
+            )
+        )
+        return result
+
+    async def _summarize(
+        self,
+        *,
+        instructions: str | None,
+        tokens_before: int,
+        summary_override: str | None,
+    ) -> CompactionResult:
+        agent = self._agent
+        config = agent.config
 
         agent._clean_message_history()
         await agent._recorder.flush()
@@ -209,11 +266,50 @@ class Compactor:
             previous_summary is not None and config.compaction.prompt != "legacy"
         )
 
+        summary, usage = await self._produce_summary(
+            prefix,
+            previous_summary,
+            instructions,
+            cut_index,
+            len(conversation),
+            use_update=use_update,
+            summary_override=summary_override,
+        )
+
+        result = await self._install_summary(
+            system_message,
+            conversation,
+            summary,
+            cut_index,
+            cut=cut,
+            tokens_before=tokens_before,
+            usage=usage,
+            is_update=use_update,
+        )
+        self._previous_summary = summary
+        await agent._recorder.flush()
+        return result
+
+    async def _produce_summary(
+        self,
+        prefix: list[LLMMessage],
+        previous_summary: str | None,
+        instructions: str | None,
+        cut_index: int,
+        conversation_length: int,
+        *,
+        use_update: bool,
+        summary_override: str | None,
+    ) -> tuple[str, LLMUsage | None]:
+        if summary_override is not None:
+            return summary_override, None
+
+        agent = self._agent
         prompt_text = _build_summary_prompt(
             prefix,
             previous_summary,
             instructions,
-            use_legacy=config.compaction.prompt == "legacy",
+            use_legacy=agent.config.compaction.prompt == "legacy",
             use_update=use_update,
         )
         request_messages = [
@@ -228,19 +324,6 @@ class Compactor:
             cache_plan=CachePlan(enabled=False),
         )
         summary = (summary_result.message.content or "").strip()
-        if cut_index == len(conversation):
-            summary = self._with_last_user_message(summary, conversation)
-
-        result = await self._install_summary(
-            system_message,
-            conversation,
-            summary,
-            cut_index,
-            cut=cut,
-            tokens_before=tokens_before,
-            usage=summary_result.usage,
-            is_update=use_update,
-        )
-        self._previous_summary = summary
-        await agent._recorder.flush()
-        return result
+        if cut_index == conversation_length:
+            summary = self._with_last_user_message(summary, prefix)
+        return summary, summary_result.usage

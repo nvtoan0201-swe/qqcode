@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 
 from vibe.core.audit import AuditDecision, AuditLogger, build_audit_logger
 from vibe.core.config import ModelConfig, ThinkingLevel, VibeConfig
-from vibe.core.context.compactor import Compactor
+from vibe.core.context.compactor import CompactionReason, Compactor
 from vibe.core.context.overflow import is_context_overflow
 from vibe.core.context.tokens import estimate_context_tokens
 from vibe.core.hooks.events import (
@@ -537,7 +537,9 @@ class Agent:
                     current_context_tokens=old_tokens, threshold=threshold
                 )
 
-                summary = await self.compact()
+                summary = await self.compact(
+                    reason=result.metadata.get("compact_reason", "auto")
+                )
 
                 yield CompactEndEvent(
                     old_context_tokens=old_tokens,
@@ -573,6 +575,7 @@ class Agent:
         metadata = {
             "old_tokens": self.stats.context_tokens,
             "threshold": self.config.get_compaction_threshold(),
+            "compact_reason": "overflow",
         }
         try:
             async for event in self._handle_middleware_result(
@@ -1876,10 +1879,14 @@ class Agent:
                 self.message_observer(msg)
             self._last_observed_message_index = len(self.messages)
 
-    async def compact(self, instructions: str | None = None) -> str:
+    async def compact(
+        self, instructions: str | None = None, *, reason: CompactionReason = "manual"
+    ) -> str:
         self._record_metric(COUNTER_COMPACTIONS)
         try:
-            result = await self.compactor.compact(instructions=instructions, force=True)
+            result = await self.compactor.compact(
+                instructions=instructions, force=True, reason=reason
+            )
             return result.summary
         except Exception:
             await self._recorder.flush()

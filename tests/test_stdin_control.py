@@ -10,6 +10,7 @@ import pytest
 
 from vibe.core.agent import Agent
 from vibe.core.config import ThinkingLevel
+from vibe.core.context.compactor import CompactionReason
 from vibe.core.output_formatters import EventJsonlFormatter
 from vibe.core.programmatic import (
     StdinChannel,
@@ -51,7 +52,9 @@ class ControlAgent(Agent):
     def record_custom(self, key: str, value: dict[str, Any]) -> None:
         self.custom_entries.append((key, value))
 
-    async def compact(self, instructions: str | None = None) -> str:
+    async def compact(
+        self, instructions: str | None = None, *, reason: CompactionReason = "manual"
+    ) -> str:
         self.compact_calls.append(instructions)
         self.stats.context_tokens = 3
         return "summary"

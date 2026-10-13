@@ -63,6 +63,25 @@ class AgentEndEvent(HookEvent):
     usage: LLMUsage
 
 
+class BeforeCompactEvent(HookEvent):
+    type: Literal["before_compact"] = "before_compact"
+    messages: list[LLMMessage]
+    tokens_before: int
+    reason: Literal["auto", "manual", "overflow"] = "auto"
+
+
+class AfterCompactEvent(HookEvent):
+    type: Literal["after_compact"] = "after_compact"
+    tokens_before: int
+    tokens_after: int
+    is_update: bool
+
+
+class CompactFailedEvent(HookEvent):
+    type: Literal["compact_failed"] = "compact_failed"
+    error: str
+
+
 class HookDecision(BaseModel):
     """Decision returned by a hook handler for a lifecycle event."""
 
@@ -70,3 +89,4 @@ class HookDecision(BaseModel):
     reason: str | None = None
     replacement_args: dict[str, Any] | None = None
     injected_messages: list[LLMMessage] = Field(default_factory=list)
+    summary_override: str | None = None

@@ -65,14 +65,16 @@ def modify(
     *,
     replacement_args: dict[str, Any] | None = None,
     injected_messages: list[LLMMessage] | None = None,
+    summary_override: str | None = None,
     reason: str | None = None,
 ) -> HookDecision:
-    """Replace tool call arguments and/or inject extra messages."""
+    """Replace tool call arguments, inject messages, or supply a summary."""
     return HookDecision(
         action="modify",
         reason=reason,
         replacement_args=replacement_args,
         injected_messages=list(injected_messages or []),
+        summary_override=summary_override,
     )
 
 

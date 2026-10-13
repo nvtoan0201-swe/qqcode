@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from vibe.core.hooks.api import HookBinding, deny, inject, modify, on_tool_call
 from vibe.core.hooks.events import (
+    AfterCompactEvent,
     AfterResponseEvent,
     AgentEndEvent,
     AgentStartEvent,
+    BeforeCompactEvent,
     BeforeRequestEvent,
+    CompactFailedEvent,
     HookDecision,
     HookEvent,
     ToolCallEventHook,
@@ -20,10 +23,13 @@ from vibe.core.hooks.loader import (
 from vibe.core.hooks.registry import HookHandler, HookRegistry
 
 __all__ = [
+    "AfterCompactEvent",
     "AfterResponseEvent",
     "AgentEndEvent",
     "AgentStartEvent",
+    "BeforeCompactEvent",
     "BeforeRequestEvent",
+    "CompactFailedEvent",
     "HookBinding",
     "HookDecision",
     "HookEvent",

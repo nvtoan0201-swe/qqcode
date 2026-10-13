@@ -15,7 +15,12 @@ DEFAULT_HOOK_TIMEOUT = 5.0
 
 # Events whose decisions the agent acts on. Other events are fire-and-forget:
 # handlers still run, but the dispatch result is always ``allow``.
-DECISION_EVENT_TYPES = frozenset({"agent_start", "before_request", "tool_call"})
+DECISION_EVENT_TYPES = frozenset({
+    "agent_start",
+    "before_request",
+    "tool_call",
+    "before_compact",
+})
 
 type HookHandler = Callable[[Any], HookDecision | None | Awaitable[HookDecision | None]]
 
@@ -52,6 +57,11 @@ def _merge_decisions(base: HookDecision, new: HookDecision) -> HookDecision:
         reason=reason,
         replacement_args=replacement_args,
         injected_messages=[*base.injected_messages, *new.injected_messages],
+        summary_override=(
+            new.summary_override
+            if new.summary_override is not None
+            else base.summary_override
+        ),
     )
 
 
