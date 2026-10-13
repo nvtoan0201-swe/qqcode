@@ -9,7 +9,7 @@ import subprocess
 from typing import Any, ClassVar, assert_never
 
 from textual.app import App, ComposeResult
-from textual.binding import Binding, BindingType
+from textual.binding import BindingsMap, BindingType
 from textual.containers import Horizontal, VerticalScroll
 from textual.events import MouseUp
 from textual.widget import Widget
@@ -17,6 +17,15 @@ from textual.widgets import Static
 
 from vibe.cli.clipboard import copy_selection_to_clipboard, copy_text_to_clipboard
 from vibe.cli.commands import CommandRegistry
+from vibe.cli.keybindings import (
+    KEY_ACTIONS,
+    build_bindings,
+    describe_actions,
+    ensure_keybindings_file,
+    format_key_display,
+    keybinding_files,
+    load_overrides,
+)
 from vibe.cli.textual_ui.handlers.event_handler import EventHandler
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
@@ -126,15 +135,9 @@ class VibeApp(App):
     ENABLE_COMMAND_PALETTE = False
     CSS_PATH = "app.tcss"
 
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("ctrl+c", "force_quit", "Quit", show=False),
-        Binding("escape", "interrupt", "Interrupt", show=False, priority=True),
-        Binding("ctrl+o", "toggle_tool", "Toggle Tool", show=False),
-        Binding("ctrl+p", "cycle_model", "Next Model", show=False),
-        Binding("shift+ctrl+p", "cycle_model_previous", "Previous Model", show=False),
-        Binding("ctrl+y", "cycle_thinking", "Cycle Thinking", show=False),
-        Binding("shift+tab", "cycle_mode", "Cycle Mode", show=False, priority=True),
-    ]
+    # Defaults live in the action registry; the instance rebuilds this map from
+    # the user's overrides before the app starts.
+    BINDINGS: ClassVar[list[BindingType]] = list(build_bindings({})[0])
 
     def __init__(
         self,
@@ -154,6 +157,8 @@ class VibeApp(App):
     ) -> None:
         super().__init__(**kwargs)
         self.config = config
+        self._keybinding_warnings: list[str] = []
+        self._keybindings_watch_task: asyncio.Task[None] | None = None
         self._session_name = resume.name if resume else None
         self._initial_thinking_level = resume.thinking_level if resume else None
         self._trust_request = resume.trust_request if resume else None
@@ -189,6 +194,7 @@ class VibeApp(App):
         self._context_progress: ContextProgress | None = None
         self._current_bottom_app: BottomApp = BottomApp.Input
         self.theme = config.textual_theme
+        self._apply_keybindings()
 
         self.history_file = HISTORY_FILE
 
@@ -253,6 +259,14 @@ class VibeApp(App):
         chat_input_container = self.query_one(ChatInputContainer)
         chat_input_container.focus_input()
         await self._show_dangerous_directory_warning()
+        if self._keybinding_warnings:
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "Keybinding warnings:\n"
+                    + "\n".join(f"- {warning}" for warning in self._keybinding_warnings)
+                )
+            )
+        self._start_keybindings_watcher()
         self._schedule_update_notification()
 
         if self._session_info:
@@ -326,6 +340,9 @@ class VibeApp(App):
             )
 
     async def on_unmount(self) -> None:
+        if self._keybindings_watch_task is not None:
+            self._keybindings_watch_task.cancel()
+            self._keybindings_watch_task = None
         if self.mcp_manager is not None:
             await self.mcp_manager.stop()
             self.mcp_manager = None
@@ -721,6 +738,85 @@ class VibeApp(App):
         if global_dir.is_dir():
             dirs.append(global_dir)
         return dirs
+
+    def _apply_keybindings(self) -> None:
+        """Rebuild the app bindings from the registry and the user overrides."""
+        overrides, warnings = load_overrides(self.config)
+        bindings, binding_warnings = build_bindings(overrides)
+        self._bindings = BindingsMap(bindings)
+        self._keybinding_warnings = [*warnings, *binding_warnings]
+
+    def keybinding_help_lines(self) -> list[str]:
+        """Current keys per action, for the help screen."""
+        return describe_actions(self._effective_keybinding_keys())
+
+    def _effective_keybinding_keys(self) -> dict[str, list[str]]:
+        keys: dict[str, list[str]] = {}
+        for key, bindings in self._bindings.key_to_bindings.items():
+            for binding in bindings:
+                keys.setdefault(binding.action, []).append(key)
+        return keys
+
+    def _hotkeys_text(self) -> str:
+        effective = self._effective_keybinding_keys()
+        lines = ["### Keybindings", ""]
+        for action in KEY_ACTIONS:
+            keys = effective.get(action.name, list(action.default))
+            rendered = ", ".join(f"`{format_key_display(key)}`" for key in keys)
+            changed = tuple(keys) != action.default
+            custom = " (custom)" if changed else ""
+            lines.append(f"- {rendered} {action.description}{custom}")
+
+        if self._keybinding_warnings:
+            lines.extend(["", "### Warnings", ""])
+            lines.extend(f"- {warning}" for warning in self._keybinding_warnings)
+        lines.extend(["", "Use `/hotkeys edit` to open the keybindings file."])
+        return "\n".join(lines)
+
+    async def _show_hotkeys(self, user_input: str = "") -> None:
+        match user_input.split(maxsplit=1):
+            case [_, "edit"]:
+                await self._edit_keybindings()
+            case _:
+                await self._mount_and_scroll(UserCommandMessage(self._hotkeys_text()))
+
+    async def _edit_keybindings(self) -> None:
+        path = ensure_keybindings_file(self.config)
+        self._start_keybindings_watcher()
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                f"Keybindings file: {path}\n"
+                f"Edit it (for example `$EDITOR {path}`); changes reload "
+                "automatically while QQcode is running."
+            )
+        )
+
+    def _start_keybindings_watcher(self) -> None:
+        if self._keybindings_watch_task is not None:
+            return
+        watched = [path for path in keybinding_files(self.config) if path.exists()]
+        if not watched:
+            return
+        self._keybindings_watch_task = asyncio.create_task(
+            self._watch_keybindings(watched)
+        )
+
+    async def _watch_keybindings(self, paths: list[Path]) -> None:
+        from watchfiles import awatch
+
+        try:
+            async for _changes in awatch(*paths):
+                if not self.is_running:
+                    return
+                self.run_worker(self._reload_keybindings(), exclusive=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Keybindings watcher stopped: %s", exc)
+
+    async def _reload_keybindings(self) -> None:
+        self._apply_keybindings()
+        await self._mount_and_scroll(UserCommandMessage("Keybindings reloaded."))
 
     def _register_dynamic_commands(self) -> None:
         for template in self.prompt_templates.values():
@@ -1120,7 +1216,7 @@ class VibeApp(App):
         self._interrupt_requested = False
 
     async def _show_help(self) -> None:
-        help_text = self.commands.get_help_text()
+        help_text = self.commands.get_help_text(self.keybinding_help_lines())
         await self._mount_and_scroll(UserCommandMessage(help_text))
 
     async def _show_status(self) -> None:

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from logging import getLogger
 from typing import TYPE_CHECKING
 
+from vibe.cli.keybindings import DEFAULT_HELP_LINES as DEFAULT_KEYBINDING_HELP_LINES
+
 if TYPE_CHECKING:
     from vibe.core.prompts.templates import PromptTemplate
     from vibe.core.skills.manager import SkillInfo
@@ -136,6 +138,11 @@ class CommandRegistry:
                 description="Add directory context to the conversation",
                 handler="_add_directory_context",
             ),
+            "hotkeys": Command(
+                aliases=frozenset(["/hotkeys", "/keys"]),
+                description="Show keyboard shortcuts (use /hotkeys edit to customize)",
+                handler="_show_hotkeys",
+            ),
         }
 
         for command in excluded_commands:
@@ -213,20 +220,17 @@ class CommandRegistry:
             for alias in sorted(command.aliases)
         ]
 
-    def get_help_text(self) -> str:
+    def get_help_text(self, keybinding_lines: list[str] | None = None) -> str:
         lines: list[str] = [
             "### Keyboard Shortcuts",
             "",
             "- `Enter` Submit message",
             "- `Ctrl+J` / `Shift+Enter` Insert newline",
-            "- `Escape` Interrupt agent or close dialogs",
-            "- `Ctrl+C` Quit (or clear input if text present)",
-            "- `Ctrl+O` Toggle tool output view",
-            "- `Ctrl+T` Toggle todo view",
-            "- `Ctrl+P` Cycle to the next model in scope",
-            "- `Shift+Ctrl+P` Cycle to the previous model in scope",
-            "- `Ctrl+Y` Cycle the thinking level",
-            "- `Shift+Tab` Toggle auto-approve mode",
+            *(
+                keybinding_lines
+                if keybinding_lines is not None
+                else DEFAULT_KEYBINDING_HELP_LINES
+            ),
             "",
             "### Special Features",
             "",

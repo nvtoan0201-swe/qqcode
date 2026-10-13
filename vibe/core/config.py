@@ -817,6 +817,42 @@ class ToolRuntimeConfig(BaseModel):
     )
 
 
+class KeybindingsConfig(BaseModel):
+    """Overrides for the interactive keybindings."""
+
+    enabled: bool = True
+    path: Path | None = Field(
+        default=None,
+        description="Keybindings file to use instead of the default locations.",
+    )
+    bindings: dict[str, str | list[str]] = Field(
+        default_factory=dict,
+        description="Action name to key (or list of keys) overrides.",
+    )
+
+    @field_validator("bindings")
+    @classmethod
+    def _validate_bindings(
+        cls, value: dict[str, str | list[str]]
+    ) -> dict[str, str | list[str]]:
+        for action, keys in value.items():
+            if not action.strip():
+                raise ValueError("Keybinding actions must not be empty")
+            match keys:
+                case str() as single if single.strip():
+                    continue
+                case [*parts] if parts and all(
+                    isinstance(part, str) and part.strip() for part in parts
+                ):
+                    continue
+                case _:
+                    raise ValueError(
+                        f"Keybinding '{action}' must map to a key or a "
+                        "non-empty list of keys"
+                    )
+        return value
+
+
 class VibeConfig(BaseSettings):
     active_model: str = "devstral-2"
     enabled_models: list[str] = Field(
@@ -837,6 +873,7 @@ class VibeConfig(BaseSettings):
         description="Extra text appended to the system prompt (CLI --append-system-prompt).",
     )
     vim_keybindings: bool = False
+    keybindings: KeybindingsConfig = Field(default_factory=KeybindingsConfig)
     disable_welcome_banner_animation: bool = False
     displayed_workdir: str = ""
     auto_compact_threshold: int = 200_000

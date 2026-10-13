@@ -161,6 +161,18 @@ Add `disable-model-invocation: true` to a skill's frontmatter to hide it from th
 
 QQcode is configured via a `config.toml` file. It looks for this file first in `./.qqcode/config.toml` and then falls back to `~/.qqcode/config.toml`.
 
+### Keybindings
+
+Change the interactive shortcuts without editing code. Overrides live in `~/.qqcode/keybindings.toml` (or `.qqcode/keybindings.toml` for a trusted project) and merge with the built-in defaults:
+
+```toml
+[bindings]
+toggle_tool = "f4"
+cycle_model = ["ctrl+p", "f3"]
+```
+
+Run `/hotkeys` to list every action with its current keys; `/hotkeys edit` creates the file and prints its path. Conflicts and invalid keys warn instead of breaking the TUI, and edits reload while QQcode is running. See [docs/keybindings.md](docs/keybindings.md).
+
 ### Supported Providers
 
 QQcode supports multiple AI providers:
