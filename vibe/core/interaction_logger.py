@@ -30,6 +30,7 @@ from vibe.core.types import (
     Role,
     SessionInfo,
     SessionMetadata,
+    message_for_storage,
 )
 from vibe.core.utils import is_windows
 
@@ -190,7 +191,7 @@ class InteractionLogger:
             id=new_entry_id(),
             parent_id=parent_id if parent_id is not None else self._last_entry_id,
             timestamp=now_iso(),
-            message=message,
+            message=message_for_storage(message),
         )
         entry_id = self._append_entry(entry)
         if entry_id is not None:
@@ -414,7 +415,9 @@ class InteractionLogger:
                 if additional_directory_contexts
                 else [],
             },
-            "messages": [m.model_dump(exclude_none=True) for m in messages],
+            "messages": [
+                message_for_storage(m).model_dump(exclude_none=True) for m in messages
+            ],
         }
 
         try:

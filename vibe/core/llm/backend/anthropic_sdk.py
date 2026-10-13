@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import types
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import anthropic
 import httpx
@@ -18,6 +18,7 @@ from vibe.core.config import (
     resolve_thinking_level,
     save_oauth_token,
 )
+from vibe.core.images import resolve_messages
 from vibe.core.llm.cache import CachePlan
 from vibe.core.llm.capabilities import clamp_max_tokens
 from vibe.core.llm.exceptions import BackendErrorBuilder
@@ -25,6 +26,7 @@ from vibe.core.oauth.registry import get_flow
 from vibe.core.types import (
     AvailableTool,
     FunctionCall,
+    ImagePart,
     LLMChunk,
     LLMMessage,
     LLMUsage,
@@ -146,10 +148,7 @@ class AnthropicMapper:
                     if msg.content:
                         system_parts.append(msg.content)
                 case Role.user:
-                    anthropic_messages.append({
-                        "role": "user",
-                        "content": msg.content or "",
-                    })
+                    anthropic_messages.append(self._convert_user_message(msg))
                 case Role.assistant:
                     anthropic_messages.append(self._convert_assistant_message(msg))
                 case Role.tool:
@@ -163,6 +162,28 @@ class AnthropicMapper:
                     )
 
         return system_parts, anthropic_messages
+
+    def _convert_user_message(self, msg: LLMMessage) -> anthropic.types.MessageParam:
+        if not msg.images:
+            return {"role": "user", "content": msg.content or ""}
+
+        content: list[anthropic.types.ContentBlockParam] = []
+        if msg.content:
+            content.append({"type": "text", "text": msg.content})
+        content.extend(self._convert_image(image) for image in msg.images)
+        return {"role": "user", "content": content}
+
+    @staticmethod
+    def _convert_image(image: ImagePart) -> anthropic.types.ContentBlockParam:
+        block: anthropic.types.ImageBlockParam = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": cast(Any, image.media_type),
+                "data": image.data,
+            },
+        }
+        return block
 
     def _convert_assistant_message(
         self, msg: LLMMessage
@@ -695,6 +716,7 @@ class AnthropicBackend:
         max_tokens: int | None,
         plan: CachePlan,
     ) -> dict[str, Any]:
+        messages = resolve_messages(messages, vision=model.capabilities.vision)
         system_parts, anthropic_messages = self._mapper.prepare_messages(
             messages, is_oauth=self._is_oauth()
         )

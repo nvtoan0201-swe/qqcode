@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import httpx
 
 from vibe.core.config import ThinkingLevel, resolve_thinking_level, save_oauth_token
+from vibe.core.images import resolve_messages
 from vibe.core.llm.backend.adapters import (
     ADAPTER_REGISTRY,
     BACKEND_ADAPTERS,
@@ -223,7 +224,7 @@ class GenericBackend:
 
         endpoint, headers, body = adapter.prepare_request(
             model_name=model.name,
-            messages=messages,
+            messages=resolve_messages(messages, vision=model.capabilities.vision),
             temperature=temperature,
             tools=tools,
             max_tokens=clamp_max_tokens(model, max_tokens),
@@ -299,7 +300,7 @@ class GenericBackend:
 
         endpoint, headers, body = adapter.prepare_request(
             model_name=model.name,
-            messages=messages,
+            messages=resolve_messages(messages, vision=model.capabilities.vision),
             temperature=temperature,
             tools=tools,
             max_tokens=clamp_max_tokens(model, max_tokens),

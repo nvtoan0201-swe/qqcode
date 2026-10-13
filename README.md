@@ -234,6 +234,14 @@ Then run `/pr "feature branch"` to expand the placeholders and send the result
 as a user message. See [docs/prompt-templates.md](docs/prompt-templates.md) for
 the full placeholder reference.
 
+### Images
+
+`read_file` understands image files (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`,
+`.bmp`). Vision-capable models receive the image itself; text-only models get a
+placeholder with the path and size instead. Install the optional Pillow extra
+(`pip install "qqcode[images]"`) to resize images over 5 MiB automatically. See
+[docs/images.md](docs/images.md).
+
 ### Custom Agent Configurations
 
 You can create custom agent configurations for specific use cases (e.g., red-teaming, specialized tasks) by adding agent-specific TOML files in the `~/.qqcode/agents/` directory.

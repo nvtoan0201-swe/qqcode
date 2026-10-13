@@ -20,6 +20,7 @@ def estimate_message_tokens(message: LLMMessage) -> int:
     total = MESSAGE_OVERHEAD_TOKENS
     total += estimate_text_tokens(message.content)
     total += estimate_text_tokens(message.reasoning_content)
+    total += IMAGE_CHARS * len(message.images)
     if message.tool_calls:
         tool_calls_json = "".join(
             tool_call.model_dump_json(exclude_none=True)

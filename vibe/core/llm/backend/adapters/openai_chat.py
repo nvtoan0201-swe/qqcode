@@ -132,6 +132,25 @@ class OpenAIAdapter(APIAdapter):
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
+    @staticmethod
+    def _message_to_payload(message: LLMMessage) -> dict[str, Any]:
+        """Convert a message, folding attached images into content blocks."""
+        data = message.model_dump(exclude_none=True)
+        data.pop("images", None)
+        if not message.images:
+            return data
+
+        parts: list[dict[str, Any]] = []
+        if message.content:
+            parts.append({"type": "text", "text": message.content})
+        parts.extend(
+            {"type": "image_url", "image_url": {"url": image.data_uri()}}
+            for image in message.images
+            if image.is_loaded
+        )
+        data["content"] = parts
+        return data
+
     def prepare_request(
         self,
         *,
@@ -148,7 +167,7 @@ class OpenAIAdapter(APIAdapter):
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
     ) -> PreparedRequest:
-        converted_messages = [msg.model_dump(exclude_none=True) for msg in messages]
+        converted_messages = [self._message_to_payload(msg) for msg in messages]
 
         # Enable explicit cache control for providers that support it (e.g., Qwen)
         if provider.name == "qwen" and not (cache_plan and not cache_plan.enabled):

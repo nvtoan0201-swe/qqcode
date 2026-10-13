@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 import mistralai
 
+from vibe.core.images import resolve_messages
 from vibe.core.llm.capabilities import clamp_max_tokens
 from vibe.core.llm.exceptions import BackendErrorBuilder
 from vibe.core.types import (
@@ -186,6 +187,8 @@ class MistralBackend:
         elif not model.capabilities.tool_choice:
             tool_choice = None
 
+        messages = resolve_messages(messages, vision=False)
+
         try:
             response = await self._get_client().chat.complete_async(
                 model=model.name,
@@ -265,6 +268,8 @@ class MistralBackend:
             tool_choice = None
         elif not model.capabilities.tool_choice:
             tool_choice = None
+
+        messages = resolve_messages(messages, vision=False)
 
         try:
             async for chunk in await self._get_client().chat.stream_async(

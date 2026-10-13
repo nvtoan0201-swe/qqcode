@@ -46,6 +46,11 @@ dependencies = [
     "anthropic>=0.75.0",
 ]
 
+[project.optional-dependencies]
+# Resizes oversized images and probes their dimensions before sending them
+# to vision models. QQcode works without it.
+images = ["pillow>=10.0"]
+
 [project.urls]
 Homepage = "https://github.com/qnguyen3/qqcode"
 Repository = "https://github.com/qnguyen3/qqcode"

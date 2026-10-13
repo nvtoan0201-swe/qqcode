@@ -226,6 +226,51 @@ def _content_before(v: Any) -> str:
 Content = Annotated[str, BeforeValidator(_content_before)]
 
 
+class ImagePart(BaseModel):
+    """An image attached to a message.
+
+    ``data`` holds base64 without a prefix and may be empty when the part only
+    references a file on disk (``source_path``); adapters load it lazily.
+    """
+
+    media_type: str
+    data: str = ""
+    source_path: str | None = None
+    size_bytes: int | None = None
+    width: int | None = None
+    height: int | None = None
+
+    @property
+    def is_loaded(self) -> bool:
+        return bool(self.data)
+
+    def data_uri(self) -> str:
+        return f"data:{self.media_type};base64,{self.data}"
+
+    def describe(self) -> str:
+        size = (
+            f"{self.size_bytes} bytes"
+            if self.size_bytes is not None
+            else "unknown size"
+        )
+        dimensions = (
+            f", {self.width}x{self.height}" if self.width and self.height else ""
+        )
+        origin = f" from {self.source_path}" if self.source_path else ""
+        return f"[image {self.media_type}, {size}{dimensions}]{origin}"
+
+
+def message_for_storage(message: LLMMessage) -> LLMMessage:
+    """Return a copy safe to persist: image bytes are dropped, refs are kept."""
+    if not message.images:
+        return message
+    return message.model_copy(
+        update={
+            "images": [part.model_copy(update={"data": ""}) for part in message.images]
+        }
+    )
+
+
 class Role(StrEnum):
     system = auto()
     user = auto()
@@ -245,6 +290,7 @@ class LLMMessage(BaseModel):
     tool_calls: list[ToolCall] | None = None
     name: str | None = None
     tool_call_id: str | None = None
+    images: list[ImagePart] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod

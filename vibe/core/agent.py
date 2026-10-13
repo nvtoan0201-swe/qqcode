@@ -85,6 +85,7 @@ from vibe.core.types import (
     CompactEndEvent,
     CompactStartEvent,
     ContextUsageEvent,
+    ImagePart,
     LLMChunk,
     LLMMessage,
     LLMUsage,
@@ -1369,6 +1370,8 @@ class Agent:
             )
         )
 
+        self._attach_result_images(result_model, call.tool_call.tool_name)
+
         yield ToolResultEvent(
             tool_name=call.tool_call.tool_name,
             tool_class=call.tool_call.tool_class,
@@ -1414,6 +1417,26 @@ class Agent:
         if callable(format_for_model):
             return cast(str, format_for_model())
         return "\n".join(f"{k}: {v}" for k, v in result_model.model_dump().items())
+
+    @staticmethod
+    def _image_parts_from_result(result_model: BaseModel) -> list[ImagePart]:
+        match getattr(result_model, "image", None):
+            case ImagePart() as image:
+                return [image]
+        images = getattr(result_model, "images", None)
+        if isinstance(images, list) and all(
+            isinstance(image, ImagePart) for image in images
+        ):
+            return list(images)
+        return []
+
+    def _attach_result_images(self, result_model: BaseModel, tool_name: str) -> None:
+        if images := self._image_parts_from_result(result_model):
+            self._append_message(
+                LLMMessage(
+                    role=Role.user, content=f"Images read by {tool_name}", images=images
+                )
+            )
 
     async def _chat(
         self,

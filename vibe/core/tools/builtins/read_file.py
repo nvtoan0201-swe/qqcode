@@ -7,6 +7,13 @@ from typing import TYPE_CHECKING, ClassVar, NamedTuple, final
 import aiofiles
 from pydantic import BaseModel, Field
 
+from vibe.core.images import (
+    MAX_IMAGE_BYTES,
+    ImageError,
+    describe_image,
+    is_image_path,
+    pillow_available,
+)
 from vibe.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -19,6 +26,7 @@ from vibe.core.tools.base import (
 )
 from vibe.core.tools.truncate import DEFAULT_MAX_LINES, format_notice, truncate_head
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
+from vibe.core.types import ImagePart
 
 if TYPE_CHECKING:
     from vibe.core.types import ToolCallEvent, ToolResultEvent
@@ -47,6 +55,7 @@ class ReadFileResult(BaseToolResult):
     content: str
     lines_read: int
     notice: str | None = None
+    image: ImagePart | None = None
 
     @property
     def was_truncated(self) -> bool:
@@ -83,6 +92,11 @@ class ReadFile(
     @final
     async def run(self, args: ReadFileArgs) -> ReadFileResult:
         file_path = self._prepare_and_validate_path(args)
+
+        if is_image_path(file_path):
+            result = self._read_image(file_path)
+            self._update_state_history(file_path)
+            return result
 
         read_result = await self._read_file(args, file_path)
 
@@ -205,6 +219,37 @@ class ReadFile(
         if resolved_path.is_dir():
             raise ToolError(f"Path is a directory, not a file: {file_path}")
 
+    def _read_image(self, file_path: Path) -> ReadFileResult:
+        try:
+            image = describe_image(file_path)
+        except ImageError as exc:
+            raise ToolError(str(exc)) from exc
+
+        if (
+            image.size_bytes is not None
+            and image.size_bytes > MAX_IMAGE_BYTES
+            and not pillow_available()
+        ):
+            raise ToolError(
+                f"Image {file_path} is {image.size_bytes} bytes, over the "
+                f"{MAX_IMAGE_BYTES} byte limit. Install Pillow to resize it "
+                "automatically."
+            )
+
+        dimensions = (
+            f", {image.width}x{image.height}" if image.width and image.height else ""
+        )
+        size = f"{image.size_bytes} bytes" if image.size_bytes else "unknown size"
+        return ReadFileResult(
+            path=str(file_path),
+            content=(
+                f"Image {file_path.name} ({image.media_type}, {size}{dimensions}). "
+                "The image is attached when the active model supports vision."
+            ),
+            lines_read=0,
+            image=image,
+        )
+
     def _update_state_history(self, file_path: Path) -> None:
         self.state.recently_read_files.append(str(file_path.resolve()))
         if len(self.state.recently_read_files) > self.config.max_state_history:
@@ -241,6 +286,25 @@ class ReadFile(
             )
 
         path_obj = Path(event.result.path)
+        if event.result.image is not None:
+            image = event.result.image
+            size = f"{image.size_bytes} bytes" if image.size_bytes else "image"
+            return ToolResultDisplay(
+                success=True,
+                message=f"Read {image.media_type} image from {path_obj.name} ({size})",
+                details={
+                    "path": str(event.result.path),
+                    "media_type": image.media_type,
+                    "size_bytes": image.size_bytes,
+                    "width": image.width,
+                    "height": image.height,
+                    "content": event.result.content,
+                    "file_extension": path_obj.suffix.lstrip(".")
+                    if path_obj.suffix
+                    else "image",
+                },
+            )
+
         message = f"Read {event.result.lines_read} line{'' if event.result.lines_read <= 1 else 's'} from {path_obj.name}"
         warnings: list[str] = []
         if event.result.was_truncated:

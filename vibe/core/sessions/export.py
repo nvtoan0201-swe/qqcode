@@ -16,7 +16,7 @@ from vibe.core.sessions.entries import (
     now_iso,
 )
 from vibe.core.sessions.store import JSONL_SUFFIX, JsonlSessionStore
-from vibe.core.types import AgentStats, LLMMessage, Role
+from vibe.core.types import AgentStats, LLMMessage, Role, message_for_storage
 
 __all__ = [
     "ImportedSession",
@@ -192,7 +192,10 @@ def _write_synthetic_jsonl(
     parent_id = header.id
     for message in messages:
         entry = MessageEntry(
-            id=new_entry_id(), parent_id=parent_id, timestamp=now_iso(), message=message
+            id=new_entry_id(),
+            parent_id=parent_id,
+            timestamp=now_iso(),
+            message=message_for_storage(message),
         )
         entries.append(entry)
         parent_id = entry.id

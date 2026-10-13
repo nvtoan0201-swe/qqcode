@@ -147,11 +147,21 @@ class AnthropicAdapter(APIAdapter):
                     anthropic_messages.append(self._convert_assistant_message(msg))
                 case "user":
                     content = msg.get("content", "")
+                    blocks: list[dict[str, Any]] = []
+                    if content:
+                        blocks.append({"type": "text", "text": content})
+                    for image in msg.get("images") or []:
+                        blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.get("media_type", "image/png"),
+                                "data": image.get("data", ""),
+                            },
+                        })
                     anthropic_messages.append({
                         "role": "user",
-                        "content": [{"type": "text", "text": content}]
-                        if content
-                        else [{"type": "text", "text": ""}],
+                        "content": blocks or [{"type": "text", "text": ""}],
                     })
                 case "tool":
                     self._append_tool_result(
