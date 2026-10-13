@@ -56,6 +56,24 @@ _config_file_override: ContextVar[Path | None] = ContextVar(
     "qqcode_config_file_override", default=None
 )
 
+_skip_api_key_check: ContextVar[bool] = ContextVar(
+    "qqcode_skip_api_key_check", default=False
+)
+
+
+@contextmanager
+def skip_api_key_check() -> Iterator[None]:
+    """Temporarily load a config whose active model has no credential.
+
+    Used by the login/logout commands: a missing API key is exactly the
+    situation they exist to fix, so loading must not fail on it.
+    """
+    token = _skip_api_key_check.set(True)
+    try:
+        yield
+    finally:
+        _skip_api_key_check.reset(token)
+
 
 @contextmanager
 def config_file_override(path: Path | None) -> Iterator[None]:
@@ -1122,6 +1140,8 @@ class VibeConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _check_api_key(self) -> VibeConfig:
+        if _skip_api_key_check.get():
+            return self
         try:
             active_model = self.get_active_model()
             provider = self.get_provider_for_model(active_model)

@@ -17,10 +17,13 @@ from vibe.core.auth import (
 )
 from vibe.core.config import (
     Backend,
+    MissingAPIKeyError,
+    ModelConfig,
     ProviderConfig,
     VibeConfig,
     clear_oauth_token,
     config_file_override,
+    skip_api_key_check,
 )
 from vibe.core.oauth import AnthropicOAuthToken
 
@@ -210,6 +213,45 @@ def test_logout_command_removes_named_credential(
     assert login_cli.run_logout_command(["mistral"]) == 0
 
     assert "MISTRAL_API_KEY" not in dotenv_values(env_file)
+
+
+def test_skip_api_key_check_allows_config_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ACME_API_KEY", raising=False)
+    providers = [
+        ProviderConfig(
+            name="acme", api_base="https://acme.test/v1", api_key_env_var="ACME_API_KEY"
+        )
+    ]
+    models = [ModelConfig(name="acme-1", provider="acme", alias="acme-1")]
+
+    with pytest.raises(MissingAPIKeyError):
+        VibeConfig(active_model="acme-1", providers=providers, models=models)
+
+    with skip_api_key_check():
+        config = VibeConfig(active_model="acme-1", providers=providers, models=models)
+
+    assert config.active_model == "acme-1"
+
+
+def test_login_loads_config_without_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ACME_API_KEY", raising=False)
+    providers = [
+        ProviderConfig(
+            name="acme", api_base="https://acme.test/v1", api_key_env_var="ACME_API_KEY"
+        )
+    ]
+    models = [ModelConfig(name="acme-1", provider="acme", alias="acme-1")]
+
+    def fake_load(cls: type[VibeConfig], **_: object) -> VibeConfig:
+        return VibeConfig(active_model="acme-1", providers=providers, models=models)
+
+    monkeypatch.setattr(VibeConfig, "load", classmethod(fake_load))
+
+    config = login_cli._load_login_config()
+
+    assert config.active_model == "acme-1"
 
 
 def test_entrypoint_routes_login_and_logout(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -15,7 +15,12 @@ from vibe.core.auth import (
     provider_auths,
     save_api_key,
 )
-from vibe.core.config import ProviderConfig, VibeConfig, save_oauth_token
+from vibe.core.config import (
+    ProviderConfig,
+    VibeConfig,
+    save_oauth_token,
+    skip_api_key_check,
+)
 from vibe.core.oauth import (
     exchange_token,
     get_authorize_url,
@@ -233,9 +238,15 @@ def _select_and_login(config: VibeConfig, kind: AuthKind) -> None:
     _run_auth(config, auths[index])
 
 
+def _load_login_config() -> VibeConfig:
+    """Load the configuration without requiring a usable API key."""
+    with skip_api_key_check():
+        return VibeConfig.load()
+
+
 def run_login_command(argv: list[str]) -> int:
     """Run ``qqcode login [provider]``."""
-    config = VibeConfig.load()
+    config = _load_login_config()
 
     match argv:
         case [name]:
@@ -278,7 +289,7 @@ def _logout(config: VibeConfig, name: str) -> None:
 
 def run_logout_command(argv: list[str]) -> int:
     """Run ``qqcode logout [provider]``."""
-    config = VibeConfig.load()
+    config = _load_login_config()
 
     match argv:
         case [name]:
