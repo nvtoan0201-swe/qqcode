@@ -1570,3 +1570,21 @@ def save_oauth_token(
             current_config["providers"] = providers
 
     _atomic_write_toml(CONFIG_FILE, current_config)
+
+
+def clear_oauth_token(provider_name: str) -> bool:
+    """Remove a stored OAuth token from the config file.
+
+    Returns:
+        ``True`` when a token was removed.
+    """
+    file = _config_file_override.get() or CONFIG_FILE
+    current_config = TomlFileSettingsSource(VibeConfig).toml_data
+
+    providers = current_config.get("providers", [])
+    for provider in providers:
+        if provider.get("name") == provider_name and "oauth_token" in provider:
+            provider.pop("oauth_token", None)
+            _atomic_write_toml(file, current_config)
+            return True
+    return False

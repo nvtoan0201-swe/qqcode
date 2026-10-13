@@ -177,7 +177,8 @@ Run `/hotkeys` to list every action with its current keys; `/hotkeys edit` creat
 
 QQcode supports multiple AI providers:
 
-- **Anthropic Claude Max subscription**: Access Claude models with your Claude.ai subscription (run `qqcode --login anthropic`)
+- **Anthropic Claude Max subscription**: Access Claude models with your Claude.ai subscription (run `qqcode login anthropic`, or `qqcode --login anthropic`)
+- **Qwen subscription**: Sign in with your Qwen account (run `qqcode login qwen`)
 - **OpenRouter**: Access multiple AI models through a single API
 - **Mistral AI**: Use Mistral's AI models directly
 
@@ -185,15 +186,25 @@ QQcode supports multiple AI providers:
 
 QQcode supports multiple ways to configure your API keys:
 
-1. **Interactive Setup (Recommended for first-time users)**: When you run QQcode for the first time or if your API key is missing, QQcode will prompt you to enter it. The key will be securely saved to `~/.qqcode/.env` for future sessions.
+1. **`qqcode login` (Recommended)**: An interactive command that lists every configured provider and how it authenticates. Subscription providers (Anthropic Claude Max, Qwen) run their sign-in flow; API-key providers ask for the key and store it securely:
 
-2. **Environment Variables**: Set your API key as an environment variable:
+   ```bash
+   qqcode login              # pick a method, then a provider
+   qqcode login openrouter   # go straight to one provider
+   qqcode logout             # remove a stored credential
+   ```
+
+   Keys are saved to `~/.qqcode/.env`; run `qqcode login` with no argument at any time to see what is already configured.
+
+2. **Interactive Setup (first run)**: When you run QQcode for the first time or if your API key is missing, QQcode will prompt you to enter it. The key will be securely saved to `~/.qqcode/.env` for future sessions.
+
+3. **Environment Variables**: Set your API key as an environment variable:
 
    ```bash
    export OPENROUTER_API_KEY="your_openrouter_api_key"
    ```
 
-3. **`.env` File**: Create a `.env` file in `~/.qqcode/` and add your API keys:
+4. **`.env` File**: Create a `.env` file in `~/.qqcode/` and add your API keys:
 
    ```bash
    OPENROUTER_API_KEY=your_openrouter_api_key
@@ -201,7 +212,7 @@ QQcode supports multiple ways to configure your API keys:
 
    QQcode automatically loads API keys from `~/.qqcode/.env` on startup. Environment variables take precedence over the `.env` file if both are set.
 
-**Note**: The `.env` file is specifically for API keys and other provider credentials. General QQcode configuration should be done in `config.toml`.
+**Note**: The `.env` file is specifically for API keys and other provider credentials. General QQcode configuration should be done in `config.toml`. Custom providers added to `config.toml` appear in `qqcode login` automatically as long as they define an `api_key_env_var`.
 
 ### Custom System Prompts
 

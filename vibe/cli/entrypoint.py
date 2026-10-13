@@ -11,6 +11,7 @@ from typing import Any
 from rich import print as rprint
 from rich.table import Table
 
+from vibe.cli.login import run_login_command, run_logout_command
 from vibe.cli.mcp_cli import run_mcp_command
 from vibe.cli.textual_ui.app import UISessionOptions, run_textual_ui
 from vibe.core.config import (
@@ -54,9 +55,11 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the QQcode interactive CLI",
         epilog=(
-            "Use 'qqcode sessions [list|repair|migrate]' to manage saved sessions, "
-            "'qqcode models [list|validate]' to inspect the model catalog, or "
-            "'qqcode mcp [list|add|remove|login|logout]' to manage MCP servers."
+            "Use 'qqcode login [provider]' to store API keys or sign in to a "
+            "subscription, 'qqcode sessions [list|repair|migrate]' to manage "
+            "saved sessions, 'qqcode models [list|validate]' to inspect the "
+            "model catalog, or 'qqcode mcp [list|add|remove|login|logout]' to "
+            "manage MCP servers."
         ),
     )
     parser.add_argument(
@@ -655,6 +658,10 @@ def _handle_subcommands() -> None:
             sys.exit(run_packages_command(sys.argv[2:]))
         case ["mcp"]:
             sys.exit(run_mcp_command(sys.argv[2:]))
+        case ["login"]:
+            sys.exit(run_login_command(sys.argv[2:]))
+        case ["logout"]:
+            sys.exit(run_logout_command(sys.argv[2:]))
         case ["install"] | ["list"] | ["remove"] | ["update"]:
             sys.exit(run_packages_command(sys.argv[1:]))
         case _:
