@@ -80,8 +80,9 @@ model sees:
   full name (for example from hooks or custom code).
 - `deferred`: tools are hidden by default and an `mcp_search` tool is added.
   `mcp_search {query}` runs a dependency-free BM25 search over tool names and
-  descriptions, returns the top matches, and activates them for the next
-  request.
+  descriptions, returns the top matches, and activates them for the rest of the
+  current turn. Activation is one-shot: the tools are hidden again when the
+  next turn starts.
 
 Resource tools are always exposed with `direct` servers:
 

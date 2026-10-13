@@ -600,6 +600,7 @@ class Agent:
             )
 
     def _begin_conversation_turn(self, user_msg: str) -> None:
+        self.tool_manager.reset_deferred_exposure()
         self._append_message(LLMMessage(role=Role.user, content=user_msg))
         self.stats.steps += 1
         self._record_metric(COUNTER_TURNS)

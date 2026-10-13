@@ -91,7 +91,7 @@ def get_active_tool_classes(
     if active_model is not None and not active_model.capabilities.tools:
         return []
 
-    all_tools = list(tool_manager.available_tools().values())
+    all_tools = tool_manager.model_visible_tools()
 
     if not config.subagent.enabled:
         all_tools = [

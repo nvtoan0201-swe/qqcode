@@ -98,6 +98,10 @@ class DeferredToolRegistry:
         self._entries.clear()
         self._active.clear()
 
+    def reset(self) -> None:
+        """Drop all activations while keeping the deferred tool pool."""
+        self._active.clear()
+
     def is_empty(self) -> bool:
         return not self._entries
 

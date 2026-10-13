@@ -57,6 +57,7 @@ class ToolManager:
         self._mcp_manager = mcp_manager
         self._tools_changed_callback = tools_changed_callback
         self._mcp_tool_names: set[str] = set()
+        self._model_hidden_names: set[str] = set()
         self._instances: dict[str, BaseTool] = {}
         self._search_paths: list[Path] = self._compute_search_paths(config)
         self.file_mutation_queue = FileMutationQueue()
@@ -179,6 +180,22 @@ class ToolManager:
     def available_tools(self) -> dict[str, type[BaseTool]]:
         return dict(self._available)
 
+    def model_visible_tools(self) -> list[type[BaseTool]]:
+        """Tool classes whose schemas may be sent to the model."""
+        return [
+            tool_class
+            for name, tool_class in self._available.items()
+            if name not in self._model_hidden_names
+        ]
+
+    def model_hidden_tools(self) -> set[str]:
+        return set(self._model_hidden_names)
+
+    def reset_deferred_exposure(self) -> None:
+        """Expire one-shot exposure of deferred MCP tools."""
+        if self._mcp_manager is not None:
+            self._mcp_manager.reset_deferred_activation()
+
     def apply_mcp_tools(self) -> None:
         """Re-sync MCP tool classes from the manager (also used as a callback)."""
         self._apply_mcp_tools()
@@ -187,8 +204,10 @@ class ToolManager:
         manager = self._mcp_manager
         if manager is None:
             return
-        classes = {cls.get_name(): cls for cls in manager.cached_tool_classes()}
-        changed = False
+        classes = {cls.get_name(): cls for cls in manager.registered_tool_classes()}
+        hidden_names = manager.hidden_tool_names()
+        changed = hidden_names != self._model_hidden_names
+        self._model_hidden_names = hidden_names
 
         for name in list(self._mcp_tool_names):
             if name not in classes:

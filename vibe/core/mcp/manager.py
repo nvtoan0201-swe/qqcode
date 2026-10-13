@@ -52,6 +52,7 @@ class MCPManager:
             str, dict[str, type[BaseTool[Any, Any, Any, Any]]]
         ] = {}
         self._visible: list[type[BaseTool[Any, Any, Any, Any]]] = []
+        self._hidden: dict[str, type[BaseTool[Any, Any, Any, Any]]] = {}
         self._listeners: list[Callable[[], None]] = []
         self._refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._registry = DeferredToolRegistry()
@@ -110,7 +111,19 @@ class MCPManager:
         return self.cached_tool_classes()
 
     def cached_tool_classes(self) -> list[type[BaseTool[Any, Any, Any, Any]]]:
+        """Tool classes eligible for the model's tool schema."""
         return list(self._visible)
+
+    def registered_tool_classes(self) -> list[type[BaseTool[Any, Any, Any, Any]]]:
+        """Every discovered tool class, including servers set to ``hidden``.
+
+        Hidden tools are registered so callers can invoke them by name while
+        their schemas stay out of model requests.
+        """
+        return [*self._visible, *self._hidden.values()]
+
+    def hidden_tool_names(self) -> set[str]:
+        return set(self._hidden)
 
     async def refresh(self, server_name: str | None = None) -> None:
         """Rebuild the tool cache, optionally for a single server."""
@@ -138,6 +151,19 @@ class MCPManager:
             self._recompute_visible()
             self._notify()
         return activated
+
+    def reset_deferred_activation(self) -> None:
+        """Return deferred tools to their hidden state.
+
+        Deferred exposure is one-shot: tools activated by ``mcp_search`` stay
+        in the tool schema for the current turn and disappear at the start of
+        the next one.
+        """
+        if not self._registry.active():
+            return
+        self._registry.reset()
+        self._recompute_visible()
+        self._notify()
 
     async def server_statuses(self) -> list[MCPServerStatus]:
         statuses: list[MCPServerStatus] = []
@@ -186,13 +212,14 @@ class MCPManager:
         deferred: dict[
             str, tuple[str, str | None, type[BaseTool[Any, Any, Any, Any]]]
         ] = {}
+        hidden: dict[str, type[BaseTool[Any, Any, Any, Any]]] = {}
         for name, classes in self._server_tools.items():
             server = self._servers.get(name)
             if server is None:
                 continue
             match server.tool_exposure:
                 case "hidden":
-                    continue
+                    hidden.update(classes)
                 case "deferred":
                     for tool_name, tool_class in classes.items():
                         deferred[tool_name] = (
@@ -210,6 +237,7 @@ class MCPManager:
         if not self._registry.is_empty():
             visible[MCP_SEARCH_TOOL_NAME] = self._search_tool_class
         self._visible = list(visible.values())
+        self._hidden = hidden
 
     def _make_change_handler(self, server_name: str) -> Callable[[], None]:
         def handler() -> None:
