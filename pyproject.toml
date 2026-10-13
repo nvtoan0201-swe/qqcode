@@ -133,8 +133,11 @@ ignore = ["D203", "D205", "D213", "ANN401", "PLR6301"]
 "tests/*" = ["ANN", "PLR"]
 # Adapters keep the frozen legacy prepare_request signature (12 args).
 "vibe/core/llm/backend/adapters/*.py" = ["PLR0913"]
-# Textual requires public `on_*`/`action_*` handler names on the App class.
-"vibe/cli/textual_ui/app.py" = ["PLR0904"]
+# Textual requires public `on_*`/`action_*` handler names on the App class,
+# and the App constructor mirrors the CLI startup options.
+"vibe/cli/textual_ui/app.py" = ["PLR0904", "PLR0913", "PLR0917"]
+# Agent accepts its full construction surface through one constructor.
+"vibe/core/agent.py" = ["PLR0913", "PLR0917"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

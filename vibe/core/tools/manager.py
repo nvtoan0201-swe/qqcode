@@ -360,16 +360,15 @@ class ToolManager:
 
         # Special handling for the Skill tool - inject SkillManager
         if tool_name == "skill" and self._skill_manager is not None:
-            from vibe.core.tools.builtins.skill import Skill
+            from vibe.core.tools.builtins.skill import Skill, SkillConfig
 
-            # Cast config to SkillConfig type (get_tool_config returns correct type)
-            skill_config = tool_config  # type: ignore[assignment]
-            instance = Skill.create_with_skill_manager(
-                skill_config, self._skill_manager
-            )
-            instance.state.file_mutation_queue = self.file_mutation_queue
-            self._instances[tool_name] = instance
-            return self._instances[tool_name]
+            if isinstance(tool_config, SkillConfig):
+                instance = Skill.create_with_skill_manager(
+                    tool_config, self._skill_manager
+                )
+                instance.state.file_mutation_queue = self.file_mutation_queue
+                self._instances[tool_name] = instance
+                return self._instances[tool_name]
 
         instance = tool_class.from_config(tool_config)
         instance.state.file_mutation_queue = self.file_mutation_queue

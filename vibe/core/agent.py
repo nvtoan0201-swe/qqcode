@@ -832,41 +832,40 @@ class Agent:
             last_chunk = chunks[-1] if chunks else None
             yield self._create_assistant_event(content_buffer, last_chunk)
 
-        full_content = ""
-        full_reasoning_content = ""
-        full_thinking_signature = ""
-        full_tool_calls_map = OrderedDict[int, ToolCall]()
-        for chunk in chunks:
-            full_content += chunk.message.content or ""
-            full_reasoning_content += chunk.message.reasoning_content or ""
-            full_thinking_signature += chunk.message.thinking_signature or ""
-            if not chunk.message.tool_calls:
-                continue
-
-            for tc in chunk.message.tool_calls:
-                if tc.index is None:
-                    raise LLMResponseError("Tool call chunk missing index")
-                if tc.index not in full_tool_calls_map:
-                    full_tool_calls_map[tc.index] = tc
-                else:
-                    new_args_str = (
-                        full_tool_calls_map[tc.index].function.arguments or ""
-                    ) + (tc.function.arguments or "")
-                    full_tool_calls_map[tc.index].function.arguments = new_args_str
-
-        full_tool_calls = list(full_tool_calls_map.values()) or None
-        last_message = LLMMessage(
-            role=Role.assistant,
-            content=full_content,
-            reasoning_content=full_reasoning_content or None,
-            thinking_signature=full_thinking_signature or None,
-            tool_calls=full_tool_calls,
-        )
+        last_message = self._merge_streamed_chunks(chunks)
         self._append_message(last_message)
         finish_reason = next(
             (c.finish_reason for c in chunks if c.finish_reason is not None), None
         )
         self._finalize_assistant_stats(last_message, chunks[-1].usage, finish_reason)
+
+    @staticmethod
+    def _merge_streamed_chunks(chunks: list[LLMChunk]) -> LLMMessage:
+        content = "".join(chunk.message.content or "" for chunk in chunks)
+        reasoning = "".join(chunk.message.reasoning_content or "" for chunk in chunks)
+        signature = "".join(chunk.message.thinking_signature or "" for chunk in chunks)
+        return LLMMessage(
+            role=Role.assistant,
+            content=content,
+            reasoning_content=reasoning or None,
+            thinking_signature=signature or None,
+            tool_calls=Agent._merge_tool_calls(chunks),
+        )
+
+    @staticmethod
+    def _merge_tool_calls(chunks: list[LLMChunk]) -> list[ToolCall] | None:
+        merged = OrderedDict[int, ToolCall]()
+        for chunk in chunks:
+            for tool_call in chunk.message.tool_calls or []:
+                if tool_call.index is None:
+                    raise LLMResponseError("Tool call chunk missing index")
+                if tool_call.index not in merged:
+                    merged[tool_call.index] = tool_call
+                    continue
+                merged[tool_call.index].function.arguments = (
+                    merged[tool_call.index].function.arguments or ""
+                ) + (tool_call.function.arguments or "")
+        return list(merged.values()) or None
 
     def _finalize_assistant_stats(
         self, message: LLMMessage, usage: LLMUsage | None, finish_reason: str | None

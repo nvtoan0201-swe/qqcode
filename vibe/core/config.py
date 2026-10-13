@@ -1131,15 +1131,15 @@ class VibeConfig(BaseSettings):
             # Check backend compatibility
             if is_mistral_api and provider.backend != Backend.MISTRAL:
                 raise WrongBackendError(provider.backend, is_mistral_api)
-            elif is_anthropic_api and provider.backend not in (
+            elif is_anthropic_api and provider.backend not in {
                 Backend.ANTHROPIC,
                 Backend.GENERIC,
-            ):
+            }:
                 raise WrongBackendError(provider.backend, is_mistral_api)
             elif (
                 not is_mistral_api
                 and not is_anthropic_api
-                and provider.backend not in (Backend.GENERIC,)
+                and provider.backend != Backend.GENERIC
             ):
                 raise WrongBackendError(provider.backend, is_mistral_api)
 

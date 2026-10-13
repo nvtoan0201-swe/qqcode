@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 from enum import StrEnum, auto
+import json
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field, field_validator

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -38,12 +39,13 @@ from vibe.core.programmatic import run_programmatic
 from vibe.core.sessions.migrate import migrate_directory
 from vibe.core.sessions.store import JsonlSessionStore
 from vibe.core.trust import (
+    ProjectResources,
     TrustPrompt,
     TrustStore,
     pending_trust,
     read_default_project_trust,
 )
-from vibe.core.types import OutputFormat, ResumeSessionInfo
+from vibe.core.types import LLMMessage, OutputFormat, ResumeSessionInfo
 from vibe.core.utils import ConversationLimitException
 from vibe.setup.onboarding import run_onboarding
 
@@ -642,343 +644,396 @@ def run_packages_command(argv: list[str]) -> int:
         return 1
 
 
-def main() -> None:  # noqa: PLR0912, PLR0915
-    load_api_keys_from_env()
-    if sys.argv[1:2] == ["sessions"]:
-        sys.exit(run_sessions_command(sys.argv[2:]))
-    if sys.argv[1:2] == ["models"]:
-        sys.exit(run_models_command(sys.argv[2:]))
-    if sys.argv[1:2] == ["packages"]:
-        sys.exit(run_packages_command(sys.argv[2:]))
-    if sys.argv[1:2] == ["mcp"]:
-        sys.exit(run_mcp_command(sys.argv[2:]))
-    if sys.argv[1:2] in (["install"], ["list"], ["remove"], ["update"]):
-        sys.exit(run_packages_command(sys.argv[1:]))
-    args = parse_arguments()
+def _handle_subcommands() -> None:
+    """Dispatch package/session/model/MCP subcommands before parsing flags."""
+    match sys.argv[1:2]:
+        case ["sessions"]:
+            sys.exit(run_sessions_command(sys.argv[2:]))
+        case ["models"]:
+            sys.exit(run_models_command(sys.argv[2:]))
+        case ["packages"]:
+            sys.exit(run_packages_command(sys.argv[2:]))
+        case ["mcp"]:
+            sys.exit(run_mcp_command(sys.argv[2:]))
+        case ["install"] | ["list"] | ["remove"] | ["update"]:
+            sys.exit(run_packages_command(sys.argv[1:]))
+        case _:
+            return
 
+
+def _handle_setup_and_login(args: argparse.Namespace) -> None:
     if args.setup:
         run_onboarding()
         sys.exit(0)
 
-    if args.login:
-        if args.login == "anthropic":
+    if not args.login:
+        return
+
+    match args.login:
+        case "anthropic":
             from vibe.cli.login import login_anthropic
 
             login_anthropic()
-        elif args.login == "qwen":
+        case "qwen":
             from vibe.cli.login import login_qwen
 
             login_qwen()
+    sys.exit(0)
+
+
+def _ensure_default_files() -> None:
+    """Create the config, instructions and history files on first run."""
+    if not CONFIG_FILE.exists():
+        try:
+            VibeConfig.save_updates(VibeConfig.create_default())
+        except Exception as e:
+            rprint(f"[yellow]Could not create default config file: {e}[/]")
+
+    if not INSTRUCTIONS_FILE.exists():
+        try:
+            INSTRUCTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            INSTRUCTIONS_FILE.touch()
+        except Exception as e:
+            rprint(f"[yellow]Could not create instructions file: {e}[/]")
+
+    if not HISTORY_FILE.exists():
+        try:
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            HISTORY_FILE.write_text("Hello Vibe!\n", "utf-8")
+        except Exception as e:
+            rprint(f"[yellow]Could not create history file: {e}[/]")
+
+
+def _resolve_pending_trust(args: argparse.Namespace) -> ProjectResources | None:
+    """Ask for project trust in the interactive UI; never prompt headless."""
+    if args.prompt is not None or args.trust is not None:
+        return None
+    return pending_trust(
+        Path.cwd(),
+        store=TrustStore.load(),
+        default_project_trust=read_default_project_trust(),
+    )
+
+
+def _model_exists(config: VibeConfig, alias: str) -> bool:
+    return any(model.alias == alias for model in config.models)
+
+
+def _apply_model_override(config: VibeConfig, args: argparse.Namespace) -> None:
+    """Apply ``--model`` and ``QQCODE_MODEL_OVERRIDE`` to the active model."""
+    if args.model:
+        if not _model_exists(config, args.model):
+            error_msg = {"error": f"Model '{args.model}' not found"}
+            print(json.dumps(error_msg), file=sys.stderr)
+            sys.exit(1)
+        os.environ["QQCODE_MODEL_OVERRIDE"] = args.model
+
+    override_model = os.environ.get("QQCODE_MODEL_OVERRIDE")
+    if not override_model:
+        return
+    if not _model_exists(config, override_model):
+        rprint(f"[red]Model '{override_model}' not found in configuration[/]")
+        sys.exit(1)
+    config.active_model = override_model
+
+
+def _print_session_list(config: VibeConfig) -> None:
+    if not config.session_logging.enabled:
+        print(json.dumps([]))
         sys.exit(0)
+
+    sessions = InteractionLogger.list_sessions(
+        config.session_logging, limit=20, workdir=config.effective_workdir
+    )
+    result = [
+        {
+            "session_id": summary.get("session_id", ""),
+            "end_time": summary.get("end_time", ""),
+            "last_user_message": summary.get("last_user_message", ""),
+        }
+        for _, summary in sessions
+    ]
+    print(json.dumps(result))
+    sys.exit(0)
+
+
+def _print_session(config: VibeConfig, session_id: str) -> None:
+    if not config.session_logging.enabled:
+        error_msg = {"error": "Session logging is disabled"}
+        print(json.dumps(error_msg), file=sys.stderr)
+        sys.exit(1)
+
+    session_path = InteractionLogger.find_session_by_id(
+        session_id, config.session_logging
+    )
+    if not session_path:
+        error_msg = {"error": f"Session '{session_id}' not found"}
+        print(json.dumps(error_msg), file=sys.stderr)
+        sys.exit(1)
+
     try:
-        if not CONFIG_FILE.exists():
-            try:
-                VibeConfig.save_updates(VibeConfig.create_default())
-            except Exception as e:
-                rprint(f"[yellow]Could not create default config file: {e}[/]")
+        messages, metadata = InteractionLogger.load_session(session_path)
+    except Exception as e:
+        error_msg = {"error": f"Failed to load session: {e!s}"}
+        print(json.dumps(error_msg), file=sys.stderr)
+        sys.exit(1)
 
-        if not INSTRUCTIONS_FILE.exists():
-            try:
-                INSTRUCTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-                INSTRUCTIONS_FILE.touch()
-            except Exception as e:
-                rprint(f"[yellow]Could not create instructions file: {e}[/]")
+    result = {
+        "metadata": metadata,
+        "messages": [msg.model_dump(mode="json") for msg in messages],
+    }
+    print(json.dumps(result))
+    sys.exit(0)
 
-        if not HISTORY_FILE.exists():
-            try:
-                HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-                HISTORY_FILE.write_text("Hello Vibe!\n", "utf-8")
-            except Exception as e:
-                rprint(f"[yellow]Could not create history file: {e}[/]")
 
-        # In the interactive Textual UI we can ask before loading project
-        # resources; headless/programmatic runs never prompt (safe default).
-        pending = None
-        if args.prompt is None and args.trust is None:
-            pending = pending_trust(
-                Path.cwd(),
-                store=TrustStore.load(),
-                default_project_trust=read_default_project_trust(),
+def _handle_inspection_flags(config: VibeConfig, args: argparse.Namespace) -> None:
+    """Handle one-shot session/model inspection flags and exit."""
+    if args.list_sessions:
+        _print_session_list(config)
+    if args.get_session:
+        _print_session(config, args.get_session)
+    if args.list_models:
+        result = {
+            "current_model": config.active_model,
+            "models": [_model_catalog_entry(model) for model in config.models],
+        }
+        print(json.dumps(result))
+        sys.exit(0)
+    if args.get_model:
+        result = {"current_model": config.active_model}
+        print(json.dumps(result))
+        sys.exit(0)
+
+
+@dataclass
+class _ResumeState:
+    """Conversation restored from a saved session, handed to the UI."""
+
+    messages: list[LLMMessage] | None = None
+    session_info: ResumeSessionInfo | None = None
+    session_id: str | None = None
+    additional_directory_contexts: list[Path] | None = None
+    thinking_level: ThinkingLevel | None = None
+    resumed_name: str | None = None
+
+
+def _restore_directory_contexts(metadata: dict[str, Any]) -> list[Path]:
+    contexts: list[Path] = []
+    for raw in metadata.get("additional_directory_contexts", []):
+        try:
+            context_path = Path(raw)
+            if context_path.exists() and context_path.is_dir():
+                contexts.append(context_path)
+        except Exception:
+            # Skip invalid paths
+            continue
+    return contexts
+
+
+def _load_saved_session(config: VibeConfig, args: argparse.Namespace) -> _ResumeState:
+    if not config.session_logging.enabled:
+        rprint(
+            "[red]Session logging is disabled. "
+            "Enable it in config to use --continue or --resume[/]"
+        )
+        sys.exit(1)
+
+    if args.continue_session:
+        session_to_load = InteractionLogger.find_latest_session(config.session_logging)
+        if not session_to_load:
+            rprint(
+                f"[red]No previous sessions found in "
+                f"{config.session_logging.save_dir}[/]"
             )
+            sys.exit(1)
+    else:
+        session_to_load = InteractionLogger.find_session_by_id(
+            args.resume, config.session_logging
+        )
+        if not session_to_load:
+            rprint(
+                f"[red]Session '{args.resume}' not found in "
+                f"{config.session_logging.save_dir}[/]"
+            )
+            sys.exit(1)
 
+    try:
+        messages, metadata = InteractionLogger.load_session(session_to_load)
+    except Exception as e:
+        rprint(f"[red]Failed to load session: {e}[/]")
+        sys.exit(1)
+
+    session_id = metadata.get("session_id")
+    thinking_level, resumed_name = _restore_session_preferences(config, metadata)
+    return _ResumeState(
+        messages=messages,
+        session_info=ResumeSessionInfo(
+            type="continue" if args.continue_session else "resume",
+            session_id=(session_id or "unknown")[:8],
+            session_time=metadata.get("start_time", "unknown time"),
+        ),
+        session_id=session_id,
+        additional_directory_contexts=_restore_directory_contexts(metadata),
+        thinking_level=thinking_level,
+        resumed_name=resumed_name,
+    )
+
+
+def _fork_saved_session(config: VibeConfig, args: argparse.Namespace) -> _ResumeState:
+    if not config.session_logging.enabled:
+        rprint("[red]Session logging is disabled. Enable it in config to use --fork[/]")
+        sys.exit(1)
+
+    store = JsonlSessionStore(config.session_logging)
+    fork_source = (
+        InteractionLogger.find_session_by_id(args.fork, config.session_logging)
+        if args.fork
+        else InteractionLogger.find_latest_session(config.session_logging)
+    )
+    if fork_source is None:
+        rprint("[red]No session found to fork[/]")
+        sys.exit(1)
+    if fork_source.suffix != ".jsonl":
+        rprint("[red]Only .jsonl sessions can be forked[/]")
+        sys.exit(1)
+
+    try:
+        view = store.read(fork_source)
+        if not view.entries:
+            rprint("[red]Cannot fork an empty session[/]")
+            sys.exit(1)
+        forked_path = store.fork(
+            fork_source, view.entries[-1].id, workdir=config.effective_workdir
+        )
+        messages, metadata = InteractionLogger.load_session(forked_path)
+    except Exception as e:
+        rprint(f"[red]Failed to fork session: {e}[/]")
+        sys.exit(1)
+
+    thinking_level, resumed_name = _restore_session_preferences(config, metadata)
+    return _ResumeState(
+        messages=messages,
+        session_info=ResumeSessionInfo(
+            type="resume",
+            session_id=str(metadata.get("session_id", "unknown"))[:8],
+            session_time=str(metadata.get("start_time", "unknown time")),
+        ),
+        session_id=metadata.get("session_id"),
+        thinking_level=thinking_level,
+        resumed_name=resumed_name,
+    )
+
+
+def _resolve_session_state(
+    config: VibeConfig, args: argparse.Namespace
+) -> _ResumeState:
+    state = _ResumeState()
+    if args.continue_session or args.resume:
+        state = _load_saved_session(config, args)
+    if args.fork is not None:
+        forked = _fork_saved_session(config, args)
+        forked.additional_directory_contexts = state.additional_directory_contexts
+        state = forked
+    return state
+
+
+def _run_programmatic_mode(
+    config: VibeConfig, args: argparse.Namespace, state: _ResumeState
+) -> None:
+    stdin_prompt = get_prompt_from_stdin() if not args.prompt else None
+    programmatic_prompt = args.prompt or stdin_prompt
+    if not programmatic_prompt:
+        print("Error: No prompt provided for programmatic mode", file=sys.stderr)
+        sys.exit(1)
+    output_format = OutputFormat(args.output if hasattr(args, "output") else "text")
+
+    # --auto-approve takes precedence for backward compatibility;
+    # --mode allows explicit control; plan mode is the default.
+    execution_mode = "plan"
+    if args.auto_approve:
+        execution_mode = "auto-approve"
+    elif args.mode:
+        execution_mode = args.mode
+
+    try:
+        final_response = run_programmatic(
+            config=config,
+            prompt=programmatic_prompt,
+            max_turns=args.max_turns,
+            max_price=args.max_price,
+            output_format=output_format,
+            previous_messages=state.messages,
+            mode=execution_mode,
+            session_id=state.session_id,
+            session_name=args.name,
+        )
+        if final_response:
+            print(final_response)
+        sys.exit(0)
+    except ConversationLimitException as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_agent(
+    *,
+    config: VibeConfig,
+    args: argparse.Namespace,
+    state: _ResumeState,
+    pending: ProjectResources | None,
+    prompt_template_dirs: list[Path],
+) -> None:
+    if args.prompt is not None:
+        _run_programmatic_mode(config, args, state)
+        return
+
+    # For interactive mode, try reading from stdin
+    stdin_prompt = get_prompt_from_stdin()
+    run_textual_ui(
+        config,
+        auto_approve=args.auto_approve,
+        enable_streaming=True,
+        initial_prompt=args.initial_prompt or stdin_prompt,
+        loaded_messages=state.messages,
+        session_info=state.session_info,
+        additional_directory_contexts=state.additional_directory_contexts,
+        prompt_template_dirs=prompt_template_dirs,
+        resume=UISessionOptions(
+            name=args.name or state.resumed_name,
+            thinking_level=state.thinking_level,
+            trust_request=pending,
+        ),
+    )
+
+
+def main() -> None:
+    load_api_keys_from_env()
+    _handle_subcommands()
+    args = parse_arguments()
+    _handle_setup_and_login(args)
+
+    try:
+        _ensure_default_files()
+        pending = _resolve_pending_trust(args)
         config = load_config_or_exit(
             args.agent, trust=False if pending is not None else args.trust
         )
         prompt_template_dirs = apply_runtime_flags(config, args)
 
-        # Handle model override from environment variable
-        if "QQCODE_MODEL_OVERRIDE" in os.environ:
-            # Validate model exists
-            override_model = os.environ["QQCODE_MODEL_OVERRIDE"]
-            model_exists = any(model.alias == override_model for model in config.models)
-            if not model_exists:
-                rprint(f"[red]Model '{override_model}' not found in configuration[/]")
-                sys.exit(1)
-            # Temporarily override the active model
-            config.active_model = override_model
+        _apply_model_override(config, args)
+        _handle_inspection_flags(config, args)
 
-        # Handle --list-sessions flag
-        if args.list_sessions:
-            if not config.session_logging.enabled:
-                print(json.dumps([]))
-                sys.exit(0)
-
-            sessions = InteractionLogger.list_sessions(
-                config.session_logging, limit=20, workdir=config.effective_workdir
-            )
-            result = [
-                {
-                    "session_id": summary.get("session_id", ""),
-                    "end_time": summary.get("end_time", ""),
-                    "last_user_message": summary.get("last_user_message", ""),
-                }
-                for _, summary in sessions
-            ]
-            print(json.dumps(result))
-            sys.exit(0)
-
-        # Handle --get-session flag
-        if args.get_session:
-            if not config.session_logging.enabled:
-                error_msg = {"error": "Session logging is disabled"}
-                print(json.dumps(error_msg), file=sys.stderr)
-                sys.exit(1)
-
-            session_path = InteractionLogger.find_session_by_id(
-                args.get_session, config.session_logging
-            )
-            if not session_path:
-                error_msg = {"error": f"Session '{args.get_session}' not found"}
-                print(json.dumps(error_msg), file=sys.stderr)
-                sys.exit(1)
-
-            try:
-                messages, metadata = InteractionLogger.load_session(session_path)
-                result = {
-                    "metadata": metadata,
-                    "messages": [msg.model_dump(mode="json") for msg in messages],
-                }
-                print(json.dumps(result))
-                sys.exit(0)
-            except Exception as e:
-                error_msg = {"error": f"Failed to load session: {str(e)}"}
-                print(json.dumps(error_msg), file=sys.stderr)
-                sys.exit(1)
-
-        # Handle --list-models flag
-        if args.list_models:
-            result = {
-                "current_model": config.active_model,
-                "models": [_model_catalog_entry(model) for model in config.models],
-            }
-            print(json.dumps(result))
-            sys.exit(0)
-
-        # Handle --get-model flag
-        if args.get_model:
-            result = {"current_model": config.active_model}
-            print(json.dumps(result))
-            sys.exit(0)
-
-        # Handle model override for session
-        if args.model:
-            # Validate model exists
-            model_exists = any(model.alias == args.model for model in config.models)
-            if not model_exists:
-                error_msg = {"error": f"Model '{args.model}' not found"}
-                print(json.dumps(error_msg), file=sys.stderr)
-                sys.exit(1)
-
-            # Set environment variable for temporary override
-            os.environ["QQCODE_MODEL_OVERRIDE"] = args.model
-
-        # Handle model override from environment variable (set by --model flag or passed directly)
-        if "QQCODE_MODEL_OVERRIDE" in os.environ:
-            # Validate model exists
-            override_model = os.environ["QQCODE_MODEL_OVERRIDE"]
-            model_exists = any(model.alias == override_model for model in config.models)
-            if not model_exists:
-                rprint(f"[red]Model '{override_model}' not found in configuration[/]")
-                sys.exit(1)
-            # Temporarily override the active model
-            config.active_model = override_model
-
-        loaded_messages = None
-        session_info = None
-        full_session_id = None
-        additional_directory_contexts = None
-        initial_thinking_level: ThinkingLevel | None = None
-        resumed_name: str | None = None
-
-        if args.continue_session or args.resume:
-            if not config.session_logging.enabled:
-                rprint(
-                    "[red]Session logging is disabled. "
-                    "Enable it in config to use --continue or --resume[/]"
-                )
-                sys.exit(1)
-
-            session_to_load = None
-            if args.continue_session:
-                session_to_load = InteractionLogger.find_latest_session(
-                    config.session_logging
-                )
-                if not session_to_load:
-                    rprint(
-                        f"[red]No previous sessions found in "
-                        f"{config.session_logging.save_dir}[/]"
-                    )
-                    sys.exit(1)
-            else:
-                session_to_load = InteractionLogger.find_session_by_id(
-                    args.resume, config.session_logging
-                )
-                if not session_to_load:
-                    rprint(
-                        f"[red]Session '{args.resume}' not found in "
-                        f"{config.session_logging.save_dir}[/]"
-                    )
-                    sys.exit(1)
-
-            try:
-                loaded_messages, metadata = InteractionLogger.load_session(
-                    session_to_load
-                )
-                full_session_id = metadata.get("session_id")
-                session_id_display = (full_session_id or "unknown")[:8]
-                session_time = metadata.get("start_time", "unknown time")
-
-                # Extract additional directory contexts from metadata
-                additional_contexts = metadata.get("additional_directory_contexts", [])
-                additional_directory_contexts = []
-                for context_path_str in additional_contexts:
-                    try:
-                        context_path = Path(context_path_str)
-                        if context_path.exists() and context_path.is_dir():
-                            additional_directory_contexts.append(context_path)
-                    except Exception:
-                        # Skip invalid paths
-                        continue
-
-                session_info = ResumeSessionInfo(
-                    type="continue" if args.continue_session else "resume",
-                    session_id=session_id_display,
-                    session_time=session_time,
-                )
-                initial_thinking_level, resumed_name = _restore_session_preferences(
-                    config, metadata
-                )
-            except Exception as e:
-                rprint(f"[red]Failed to load session: {e}[/]")
-                sys.exit(1)
-
-        if args.fork is not None:
-            if not config.session_logging.enabled:
-                rprint(
-                    "[red]Session logging is disabled. "
-                    "Enable it in config to use --fork[/]"
-                )
-                sys.exit(1)
-
-            store = JsonlSessionStore(config.session_logging)
-            fork_source = (
-                InteractionLogger.find_session_by_id(args.fork, config.session_logging)
-                if args.fork
-                else InteractionLogger.find_latest_session(config.session_logging)
-            )
-            if fork_source is None:
-                rprint("[red]No session found to fork[/]")
-                sys.exit(1)
-            if fork_source.suffix != ".jsonl":
-                rprint("[red]Only .jsonl sessions can be forked[/]")
-                sys.exit(1)
-
-            try:
-                view = store.read(fork_source)
-                if not view.entries:
-                    rprint("[red]Cannot fork an empty session[/]")
-                    sys.exit(1)
-                forked_path = store.fork(
-                    fork_source, view.entries[-1].id, workdir=config.effective_workdir
-                )
-                loaded_messages, metadata = InteractionLogger.load_session(forked_path)
-            except Exception as e:
-                rprint(f"[red]Failed to fork session: {e}[/]")
-                sys.exit(1)
-
-            forked_id = str(metadata.get("session_id", "unknown"))
-            session_info = ResumeSessionInfo(
-                type="resume",
-                session_id=forked_id[:8],
-                session_time=str(metadata.get("start_time", "unknown time")),
-            )
-            full_session_id = metadata.get("session_id")
-            initial_thinking_level, resumed_name = _restore_session_preferences(
-                config, metadata
-            )
-
-        # Only try to read from stdin if --prompt flag is used but empty,
-        # or for interactive mode. Don't block on stdin.read() when prompt is provided.
-        if args.prompt is not None:
-            stdin_prompt = get_prompt_from_stdin() if not args.prompt else None
-            programmatic_prompt = args.prompt or stdin_prompt
-            if not programmatic_prompt:
-                print(
-                    "Error: No prompt provided for programmatic mode", file=sys.stderr
-                )
-                sys.exit(1)
-            output_format = OutputFormat(
-                args.output if hasattr(args, "output") else "text"
-            )
-
-            # Determine execution mode
-            # --auto-approve flag takes precedence for backward compatibility
-            # --mode flag allows explicit control
-            execution_mode = "plan"  # default
-            if args.auto_approve:
-                execution_mode = "auto-approve"
-            elif args.mode:
-                execution_mode = args.mode
-
-            try:
-                final_response = run_programmatic(
-                    config=config,
-                    prompt=programmatic_prompt,
-                    max_turns=args.max_turns,
-                    max_price=args.max_price,
-                    output_format=output_format,
-                    previous_messages=loaded_messages,
-                    mode=execution_mode,
-                    session_id=full_session_id,
-                    session_name=args.name,
-                )
-                if final_response:
-                    print(final_response)
-                sys.exit(0)
-            except ConversationLimitException as e:
-                print(e, file=sys.stderr)
-                sys.exit(1)
-            except RuntimeError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            # For interactive mode, try reading from stdin
-            stdin_prompt = get_prompt_from_stdin()
-            run_textual_ui(
-                config,
-                auto_approve=args.auto_approve,
-                enable_streaming=True,
-                initial_prompt=args.initial_prompt or stdin_prompt,
-                loaded_messages=loaded_messages,
-                session_info=session_info,
-                additional_directory_contexts=additional_directory_contexts,
-                prompt_template_dirs=prompt_template_dirs,
-                resume=UISessionOptions(
-                    name=args.name or resumed_name,
-                    thinking_level=initial_thinking_level,
-                    trust_request=pending,
-                ),
-            )
+        state = _resolve_session_state(config, args)
+        _run_agent(
+            config=config,
+            args=args,
+            state=state,
+            pending=pending,
+            prompt_template_dirs=prompt_template_dirs,
+        )
 
     except (KeyboardInterrupt, EOFError):
         rprint("\n[dim]Bye![/]")
