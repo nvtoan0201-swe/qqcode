@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from fnmatch import fnmatch
 import importlib.util
 import inspect
 from logging import getLogger
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 from vibe import VIBE_ROOT
 from vibe.core.config import get_vibe_home
 from vibe.core.packages import package_resource_dirs
-from vibe.core.tools.base import BaseTool, BaseToolConfig
+from vibe.core.tools.base import BaseTool, BaseToolConfig, ToolExposure
 from vibe.core.tools.file_mutation_queue import FileMutationQueue
 from vibe.core.tools.mcp import (
     RemoteTool,
@@ -21,6 +22,7 @@ from vibe.core.tools.mcp import (
     list_tools_http,
     list_tools_stdio,
 )
+from vibe.core.tools.search import TOOL_SEARCH_TOOL_NAME
 from vibe.core.utils import run_sync
 
 logger = getLogger("vibe")
@@ -57,7 +59,8 @@ class ToolManager:
         self._mcp_manager = mcp_manager
         self._tools_changed_callback = tools_changed_callback
         self._mcp_tool_names: set[str] = set()
-        self._model_hidden_names: set[str] = set()
+        self._exposure: dict[str, ToolExposure] = {}
+        self._exposed: set[str] = set()
         self._instances: dict[str, BaseTool] = {}
         self._search_paths: list[Path] = self._compute_search_paths(config)
         self.file_mutation_queue = FileMutationQueue()
@@ -79,6 +82,7 @@ class ToolManager:
             # Compatibility shim: connect-per-call discovery when no manager
             # is provided by the caller.
             self._integrate_mcp()
+        self._recompute_exposure()
 
     @staticmethod
     def _compute_search_paths(config: VibeConfig) -> list[Path]:
@@ -180,19 +184,48 @@ class ToolManager:
     def available_tools(self) -> dict[str, type[BaseTool]]:
         return dict(self._available)
 
+    def exposure_for(self, name: str) -> ToolExposure:
+        """Return the resolved exposure for a registered tool."""
+        return self._exposure.get(name, "direct")
+
+    def deferred_pool(self) -> dict[str, str]:
+        """Deferred tools available to ``tool_search``, keyed by name."""
+        return {
+            name: (tool_class.description or "")
+            for name, tool_class in self._available.items()
+            if self._exposure.get(name) == "deferred"
+        }
+
+    def tool_search_class(self) -> type[BaseTool] | None:
+        """The ``tool_search`` builtin when at least one tool is deferred."""
+        if not self.deferred_pool():
+            return None
+        return self._available.get(TOOL_SEARCH_TOOL_NAME)
+
+    def expose(self, names: list[str]) -> list[str]:
+        """Expose deferred tools for the current turn (one-shot)."""
+        pool = self.deferred_pool()
+        exposed = [name for name in names if name in pool]
+        self._exposed.update(exposed)
+        return exposed
+
     def model_visible_tools(self) -> list[type[BaseTool]]:
         """Tool classes whose schemas may be sent to the model."""
-        return [
-            tool_class
-            for name, tool_class in self._available.items()
-            if name not in self._model_hidden_names
-        ]
-
-    def model_hidden_tools(self) -> set[str]:
-        return set(self._model_hidden_names)
+        visible: list[type[BaseTool]] = []
+        for name, tool_class in self._available.items():
+            match self._exposure.get(name, "direct"):
+                case "hidden":
+                    continue
+                case "deferred":
+                    if name in self._exposed:
+                        visible.append(tool_class)
+                case _:
+                    visible.append(tool_class)
+        return visible
 
     def reset_deferred_exposure(self) -> None:
-        """Expire one-shot exposure of deferred MCP tools."""
+        """Expire one-shot exposure of deferred tools."""
+        self._exposed.clear()
         if self._mcp_manager is not None:
             self._mcp_manager.reset_deferred_activation()
 
@@ -205,9 +238,7 @@ class ToolManager:
         if manager is None:
             return
         classes = {cls.get_name(): cls for cls in manager.registered_tool_classes()}
-        hidden_names = manager.hidden_tool_names()
-        changed = hidden_names != self._model_hidden_names
-        self._model_hidden_names = hidden_names
+        changed = False
 
         for name in list(self._mcp_tool_names):
             if name not in classes:
@@ -223,8 +254,59 @@ class ToolManager:
                 self._mcp_tool_names.add(name)
                 changed = True
 
+        self._recompute_exposure()
         if changed and self._tools_changed_callback is not None:
             self._tools_changed_callback()
+
+    def _config_exposure(self, name: str) -> ToolExposure | None:
+        """Resolve ``[tools.exposure]`` globs; the last match wins."""
+        resolved: ToolExposure | None = None
+        for pattern, exposure in self._config.tool_runtime.exposure.items():
+            if fnmatch(name, pattern):
+                resolved = exposure
+        return resolved
+
+    def _recompute_exposure(self) -> None:
+        """Resolve the exposure of every registered tool.
+
+        Priority: ``[tools.exposure]`` overrides, MCP server exposure, then the
+        tool class default. Large MCP tool sets are deferred automatically.
+        """
+        hidden = self._mcp_manager.hidden_tool_names() if self._mcp_manager else set()
+        mcp_direct = [
+            name
+            for name in self._mcp_tool_names
+            if name not in hidden
+            and self._config_exposure(name) is None
+            and self._available[name].exposure in {"direct", "model_only"}
+        ]
+        auto_defer = len(mcp_direct) > self._config.tool_runtime.defer_when_more_than
+
+        self._exposure = {
+            name: self._resolve_exposure(
+                name,
+                hidden=name in hidden,
+                auto_defer=auto_defer and name in mcp_direct,
+            )
+            for name in self._available
+        }
+        if not self.deferred_pool():
+            self._exposed.clear()
+        if TOOL_SEARCH_TOOL_NAME in self._available:
+            self._exposure[TOOL_SEARCH_TOOL_NAME] = (
+                "direct" if self.deferred_pool() else "hidden"
+            )
+
+    def _resolve_exposure(
+        self, name: str, *, hidden: bool, auto_defer: bool
+    ) -> ToolExposure:
+        if (override := self._config_exposure(name)) is not None:
+            return override
+        if hidden:
+            return "hidden"
+        if auto_defer:
+            return "deferred"
+        return self._available[name].exposure
 
     def _integrate_mcp(self) -> None:
         if not self._config.mcp_servers:
@@ -369,6 +451,15 @@ class ToolManager:
                 instance.state.file_mutation_queue = self.file_mutation_queue
                 self._instances[tool_name] = instance
                 return self._instances[tool_name]
+
+        # Special handling for tool_search - it reads the deferred tool pool
+        if tool_name == TOOL_SEARCH_TOOL_NAME:
+            from vibe.core.tools.builtins.tool_search import ToolSearch
+
+            search = ToolSearch.create_with_manager(tool_config, self)
+            search.state.file_mutation_queue = self.file_mutation_queue
+            self._instances[tool_name] = search
+            return self._instances[tool_name]
 
         instance = tool_class.from_config(tool_config)
         instance.state.file_mutation_queue = self.file_mutation_queue

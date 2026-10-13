@@ -108,6 +108,7 @@ from vibe.core.utils import (
     get_user_agent,
     get_user_cancellation_message,
     is_user_cancellation_event,
+    logger,
 )
 
 if TYPE_CHECKING:
@@ -561,6 +562,10 @@ class Agent:
         self.stats.context_tokens = estimate_context_tokens(
             self.messages, tools, self._last_usage, self.stats.last_usage_message_index
         )
+        if deferred := self.tool_manager.deferred_pool():
+            logger.debug(
+                "Tool schema: %d visible, %d deferred", len(tools), len(deferred)
+            )
 
     def _context_usage_event(self) -> ContextUsageEvent:
         return ContextUsageEvent(

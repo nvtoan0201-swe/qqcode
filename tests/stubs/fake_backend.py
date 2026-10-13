@@ -5,7 +5,7 @@ from collections.abc import AsyncGenerator, Callable, Iterable
 from tests.mock.utils import mock_llm_chunk
 from vibe.core.config import ThinkingLevel
 from vibe.core.llm.cache import CachePlan
-from vibe.core.types import LLMChunk, LLMMessage
+from vibe.core.types import AvailableTool, LLMChunk, LLMMessage
 
 
 class FakeBackend:
@@ -25,6 +25,7 @@ class FakeBackend:
     ) -> None:
         self._chunks = list(results or [])
         self._requests_messages: list[list[LLMMessage]] = []
+        self._requests_tools: list[list[AvailableTool] | None] = []
         self._requests_extra_headers: list[dict[str, str] | None] = []
         self._requests_cache_plans: list[CachePlan | None] = []
         self._requests_thinking_levels: list[ThinkingLevel | None] = []
@@ -45,6 +46,10 @@ class FakeBackend:
     @property
     def requests_messages(self) -> list[list[LLMMessage]]:
         return self._requests_messages
+
+    @property
+    def requests_tools(self) -> list[list[AvailableTool] | None]:
+        return self._requests_tools
 
     @property
     def requests_extra_headers(self) -> list[dict[str, str] | None]:
@@ -85,6 +90,7 @@ class FakeBackend:
             raise exception
 
         self._requests_messages.append(messages)
+        self._requests_tools.append(tools)
         self._requests_extra_headers.append(extra_headers)
         self._requests_cache_plans.append(cache_plan)
         self._requests_thinking_levels.append(thinking_level)
@@ -112,6 +118,7 @@ class FakeBackend:
             raise exception
 
         self._requests_messages.append(messages)
+        self._requests_tools.append(tools)
         self._requests_extra_headers.append(extra_headers)
         self._requests_cache_plans.append(cache_plan)
         self._requests_thinking_levels.append(thinking_level)

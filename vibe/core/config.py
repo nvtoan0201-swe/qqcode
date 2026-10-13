@@ -27,7 +27,7 @@ import tomli_w
 
 from vibe.core.oauth.token import AnthropicOAuthToken, QwenOAuthToken
 from vibe.core.prompts import SystemPrompt
-from vibe.core.tools.base import BaseToolConfig
+from vibe.core.tools.base import BaseToolConfig, ToolExposure
 from vibe.core.trust import (
     ProjectResources,
     TrustDecision,
@@ -815,6 +815,21 @@ class ToolRuntimeConfig(BaseModel):
         default_factory=list,
         description="Tool names that must run sequentially, outside parallel batches.",
     )
+    exposure: dict[str, ToolExposure] = Field(
+        default_factory=dict,
+        description=(
+            "Per-tool exposure overrides by name or glob pattern "
+            "(direct, model_only, deferred or hidden)."
+        ),
+    )
+    defer_when_more_than: int = Field(
+        default=30,
+        ge=0,
+        description=(
+            "Defer MCP tools automatically when a server exposes more tools "
+            "than this. Set a large value to keep every tool direct."
+        ),
+    )
 
 
 class KeybindingsConfig(BaseModel):
@@ -1211,7 +1226,13 @@ class VibeConfig(BaseSettings):
         if not isinstance(raw_tools, dict):
             return data
 
-        runtime_keys = ("parallel", "max_parallel_tools", "sequential")
+        runtime_keys = (
+            "parallel",
+            "max_parallel_tools",
+            "sequential",
+            "exposure",
+            "defer_when_more_than",
+        )
         runtime = {key: raw_tools[key] for key in runtime_keys if key in raw_tools}
         if not runtime:
             return data

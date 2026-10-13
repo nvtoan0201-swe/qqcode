@@ -164,6 +164,9 @@ class BaseToolState(BaseModel):
     file_mutation_queue: FileMutationQueue | None = Field(default=None, exclude=True)
 
 
+ToolExposure = Literal["direct", "model_only", "deferred", "hidden"]
+
+
 class BaseTool[
     ToolArgs: BaseModel,
     ToolResult: BaseModel,
@@ -178,6 +181,7 @@ class BaseTool[
 
     prompt_path: ClassVar[Path] | None = None
     execution_mode: ClassVar[Literal["parallel", "sequential"]] = "parallel"
+    exposure: ClassVar[ToolExposure] = "direct"
 
     def __init__(self, config: ToolConfig, state: ToolState) -> None:
         self.config = config
