@@ -38,6 +38,11 @@ from vibe.cli.textual_ui.widgets.history_message import (
     HistoricalToolResult,
 )
 from vibe.cli.textual_ui.widgets.loading import LoadingWidget
+from vibe.cli.textual_ui.widgets.login_screen import (
+    LoginScreen,
+    SecretScreen,
+    SelectorEntry,
+)
 from vibe.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     BashOutputMessage,
@@ -61,6 +66,15 @@ from vibe.cli.update_notifier import (
 from vibe.cli.update_notifier.version_update_gateway import VersionUpdateGateway
 from vibe.core import __version__ as CORE_VERSION
 from vibe.core.agent import Agent
+from vibe.core.auth import (
+    AuthKind,
+    ProviderAuth,
+    all_provider_auths,
+    find_provider,
+    logout,
+    provider_auths,
+    save_api_key,
+)
 from vibe.core.autocompletion.path_prompt_adapter import render_path_prompt
 from vibe.core.config import HISTORY_FILE, ThinkingLevel, VibeConfig, get_vibe_home
 from vibe.core.interaction_logger import InteractionLogger
@@ -817,6 +831,197 @@ class VibeApp(App):
     async def _reload_keybindings(self) -> None:
         self._apply_keybindings()
         await self._mount_and_scroll(UserCommandMessage("Keybindings reloaded."))
+
+    @staticmethod
+    def _command_argument(user_input: str) -> str:
+        parts = user_input.split(maxsplit=1)
+        return parts[1].strip() if len(parts) > 1 else ""
+
+    @staticmethod
+    def _auth_detail(auth: ProviderAuth) -> str:
+        status = f"✓ {auth.source}" if auth.source else "not configured"
+        return f"{auth.label} · {status}"
+
+    async def _login_command(self, user_input: str = "") -> None:
+        """``/login [provider]``: sign in or store an API key."""
+        self.run_worker(self._login_flow(user_input), exclusive=False, group="login")
+
+    async def _login_flow(self, user_input: str) -> None:
+        name = self._command_argument(user_input)
+        if name:
+            auths = provider_auths(self.config, name)
+            if not auths:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Unknown provider '{name}'. Run /login to list the "
+                        "configured providers.",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            if len(auths) == 1:
+                await self._run_auth(auths[0])
+                return
+            chosen = await self.push_screen_wait(
+                LoginScreen(
+                    f"Select authentication method for {name}:",
+                    [
+                        SelectorEntry(
+                            label=auth.label,
+                            value=auth,
+                            detail=self._auth_detail(auth),
+                            configured=auth.configured,
+                        )
+                        for auth in auths
+                    ],
+                )
+            )
+            if isinstance(chosen, ProviderAuth):
+                await self._run_auth(chosen)
+            return
+
+        auths = all_provider_auths(self.config)
+        if not auths:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "No providers are configured.", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        kinds: set[AuthKind] = {auth.kind for auth in auths}
+        kind: AuthKind
+        if len(kinds) > 1:
+            choice = await self.push_screen_wait(
+                LoginScreen(
+                    "Select authentication method:",
+                    [
+                        SelectorEntry(
+                            "Sign in with a subscription or account", "oauth"
+                        ),
+                        SelectorEntry("Sign in with an API key", "api_key"),
+                    ],
+                )
+            )
+            if choice not in {"oauth", "api_key"}:
+                return
+            kind = choice
+        else:
+            kind = next(iter(kinds))
+
+        entries = [
+            SelectorEntry(
+                label=auth.provider,
+                value=auth,
+                detail=self._auth_detail(auth),
+                configured=auth.configured,
+            )
+            for auth in auths
+            if auth.kind == kind
+        ]
+        chosen = await self.push_screen_wait(LoginScreen("Select provider:", entries))
+        if isinstance(chosen, ProviderAuth):
+            await self._run_auth(chosen)
+
+    async def _run_auth(self, auth: ProviderAuth) -> None:
+        provider = find_provider(self.config, auth.provider)
+        if provider is None:
+            return
+
+        match auth.kind:
+            case "oauth":
+                await self._run_oauth_login(provider.name)
+            case "api_key":
+                env_var = provider.api_key_env_var or "API key"
+                secret = await self.push_screen_wait(
+                    SecretScreen(f"Enter {env_var} for {provider.name}", env_var)
+                )
+                if not secret:
+                    return
+                try:
+                    path = save_api_key(provider, secret)
+                except (OSError, ValueError) as exc:
+                    await self._mount_and_scroll(
+                        ErrorMessage(
+                            f"Failed to save API key: {exc}",
+                            collapsed=self._tools_collapsed,
+                        )
+                    )
+                    return
+                await self._mount_and_scroll(
+                    UserCommandMessage(
+                        f"Saved {env_var} to {path}. New requests use it now."
+                    )
+                )
+
+    async def _run_oauth_login(self, provider_name: str) -> None:
+        from vibe.cli.login import login_provider
+
+        try:
+            if self._driver is not None and self._driver.can_suspend:
+                with self.suspend():
+                    await asyncio.to_thread(login_provider, self.config, provider_name)
+            else:
+                await asyncio.to_thread(login_provider, self.config, provider_name)
+        except Exception as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Login failed for {provider_name}: {exc}",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        await self._reload_config()
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Signed in to {provider_name}.")
+        )
+
+    async def _logout_command(self, user_input: str = "") -> None:
+        """``/logout [provider]``: remove stored credentials."""
+        self.run_worker(self._logout_flow(user_input), exclusive=False, group="login")
+
+    async def _logout_flow(self, user_input: str) -> None:
+        name = self._command_argument(user_input)
+        if name:
+            notes = logout(self.config, name)
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    "; ".join(notes)
+                    if notes
+                    else f"No stored credentials found for '{name}'."
+                )
+            )
+            return
+
+        auths = [auth for auth in all_provider_auths(self.config) if auth.configured]
+        if not auths:
+            await self._mount_and_scroll(
+                UserCommandMessage("No stored credentials to remove.")
+            )
+            return
+
+        chosen = await self.push_screen_wait(
+            LoginScreen(
+                "Select credential to remove:",
+                [
+                    SelectorEntry(
+                        label=auth.provider,
+                        value=auth.provider,
+                        detail=self._auth_detail(auth),
+                    )
+                    for auth in auths
+                ],
+            )
+        )
+        if not isinstance(chosen, str):
+            return
+        notes = logout(self.config, chosen)
+        await self._mount_and_scroll(
+            UserCommandMessage(
+                "; ".join(notes) if notes else f"Nothing stored for '{chosen}'."
+            )
+        )
 
     def _register_dynamic_commands(self) -> None:
         for template in self.prompt_templates.values():

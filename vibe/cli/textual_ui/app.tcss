@@ -861,3 +861,60 @@ TrustScreen {
 #trust-buttons Button {
     margin: 0 1;
 }
+
+LoginScreen, SecretScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+.login-dialog {
+    width: 76;
+    height: auto;
+    max-height: 80%;
+    background: $surface;
+    border: round $primary;
+    padding: 1 2;
+}
+
+.login-title {
+    width: 100%;
+    height: auto;
+    text-style: bold;
+    color: $primary;
+}
+
+.login-search {
+    width: 100%;
+    margin: 1 0 0 0;
+    border: none;
+    background: $surface;
+}
+
+.login-list {
+    width: 100%;
+    height: auto;
+    max-height: 16;
+    margin: 1 0;
+}
+
+.login-option {
+    width: 100%;
+    height: auto;
+    color: $foreground;
+}
+
+.login-option-selected {
+    color: $primary;
+    text-style: bold;
+}
+
+.login-empty {
+    width: 100%;
+    color: $foreground 50%;
+}
+
+.login-help {
+    width: 100%;
+    height: auto;
+    color: $foreground 50%;
+}

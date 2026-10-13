@@ -194,6 +194,8 @@ QQcode supports multiple ways to configure your API keys:
    qqcode logout             # remove a stored credential
    ```
 
+   Inside the TUI the same flows are available as `/login [provider]` and `/logout`: a searchable selector lists each provider with its auth method (`subscription`, `account` or `API key`) and whether it is already configured, then asks for the API key or starts the sign-in flow.
+
    Keys are saved to `~/.qqcode/.env`; run `qqcode login` with no argument at any time to see what is already configured.
 
 2. **Interactive Setup (first run)**: When you run QQcode for the first time or if your API key is missing, QQcode will prompt you to enter it. The key will be securely saved to `~/.qqcode/.env` for future sessions.

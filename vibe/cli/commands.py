@@ -143,6 +143,16 @@ class CommandRegistry:
                 description="Show keyboard shortcuts (use /hotkeys edit to customize)",
                 handler="_show_hotkeys",
             ),
+            "login": Command(
+                aliases=frozenset(["/login", "/signin"]),
+                description="Sign in to a provider or store an API key",
+                handler="_login_command",
+            ),
+            "logout": Command(
+                aliases=frozenset(["/logout"]),
+                description="Remove a stored provider credential",
+                handler="_logout_command",
+            ),
         }
 
         for command in excluded_commands:
