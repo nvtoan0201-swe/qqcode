@@ -212,7 +212,7 @@ class GenericBackend:
     ) -> LLMChunk:
         api_key, oauth_headers, api_base_override = await self._get_auth_info()
 
-        api_style = getattr(self._provider, "api_style", "openai")
+        api_style = model.api_style or self._provider.api_style
         adapter = get_adapter(api_style)
 
         extra_body = getattr(model, "extra_body", None) or None
@@ -288,7 +288,7 @@ class GenericBackend:
     ) -> AsyncGenerator[LLMChunk, None]:
         api_key, oauth_headers, api_base_override = await self._get_auth_info()
 
-        api_style = getattr(self._provider, "api_style", "openai")
+        api_style = model.api_style or self._provider.api_style
         adapter = get_adapter(api_style)
 
         extra_body = getattr(model, "extra_body", None) or None

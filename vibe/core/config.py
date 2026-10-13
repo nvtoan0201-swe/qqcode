@@ -540,6 +540,13 @@ class ModelConfig(BaseModel):
     name: str
     provider: str
     alias: str
+    api_style: str | None = Field(
+        default=None,
+        description=(
+            "Per-model api_style overriding the provider default; lets one "
+            "provider serve several request/response styles."
+        ),
+    )
     temperature: float = 0.2
     context_window: int = 200_000
     max_output_tokens: int | None = None
