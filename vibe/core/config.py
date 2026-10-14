@@ -977,6 +977,329 @@ DEFAULT_MODELS = [
         context_window=256_000,
         pricing=ModelPricing(input_per_million=0.1, output_per_million=0.3),
     ),
+    # OpenAI (Responses API)
+    ModelConfig(
+        name="gpt-5.4",
+        provider="openai",
+        alias="openai/gpt-5.4",
+        context_window=400_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gpt-5.4-mini",
+        provider="openai",
+        alias="openai/gpt-5.4-mini",
+        context_window=400_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gpt-4o",
+        provider="openai",
+        alias="openai/gpt-4o",
+        context_window=128_000,
+        capabilities=ModelCapabilities(vision=True),
+    ),
+    # DeepSeek
+    ModelConfig(
+        name="deepseek-v4-pro",
+        provider="deepseek",
+        alias="deepseek/deepseek-v4-pro",
+        context_window=128_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    ModelConfig(
+        name="deepseek-flash",
+        provider="deepseek",
+        alias="deepseek/deepseek-flash",
+        context_window=128_000,
+    ),
+    # NVIDIA NIM
+    ModelConfig(
+        name="nvidia/nemotron-3-ultra-550b-a55b",
+        provider="nvidia",
+        alias="nvidia/nemotron-3-ultra",
+        context_window=128_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    # Google Gemini (OpenAI-compatible endpoint)
+    ModelConfig(
+        name="gemini-2.5-flash",
+        provider="google",
+        alias="google/gemini-2.5-flash",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gemini-3-flash-preview",
+        provider="google",
+        alias="google/gemini-3-flash",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    # GitHub Copilot
+    ModelConfig(
+        name="gpt-4o",
+        provider="github-copilot",
+        alias="github-copilot/gpt-4o",
+        api_style="openai-responses",
+        context_window=128_000,
+        capabilities=ModelCapabilities(vision=True),
+    ),
+    ModelConfig(
+        name="claude-sonnet-4-5",
+        provider="github-copilot",
+        alias="github-copilot/claude-sonnet-4.5",
+        api_style="anthropic",
+        context_window=200_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    # Groq
+    ModelConfig(
+        name="llama-3.3-70b-versatile",
+        provider="groq",
+        alias="groq/llama-3.3-70b",
+        context_window=128_000,
+    ),
+    ModelConfig(
+        name="openai/gpt-oss-120b",
+        provider="groq",
+        alias="groq/gpt-oss-120b",
+        context_window=128_000,
+    ),
+    # Cerebras
+    ModelConfig(
+        name="gpt-oss-120b",
+        provider="cerebras",
+        alias="cerebras/gpt-oss-120b",
+        context_window=128_000,
+    ),
+    # xAI
+    ModelConfig(
+        name="grok-4.7",
+        provider="xai",
+        alias="xai/grok-4.7",
+        context_window=256_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    ModelConfig(
+        name="grok-4.6",
+        provider="xai",
+        alias="xai/grok-4.6",
+        context_window=256_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    # Vercel AI Gateway (Anthropic Messages)
+    ModelConfig(
+        name="anthropic/claude-haiku-4.5",
+        provider="vercel-ai-gateway",
+        alias="vercel/claude-haiku-4.5",
+        context_window=200_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="google/gemini-2.5-flash",
+        provider="vercel-ai-gateway",
+        alias="vercel/gemini-2.5-flash",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    # Z.AI Coding CN
+    ModelConfig(
+        name="glm-4.7",
+        provider="zai-coding-cn",
+        alias="zai-cn/glm-4.7",
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    # Hugging Face
+    ModelConfig(
+        name="moonshotai/Kimi-K2.5",
+        provider="huggingface",
+        alias="hf/kimi-k2.5",
+        context_window=256_000,
+    ),
+    # Fireworks
+    ModelConfig(
+        name="accounts/fireworks/models/kimi-k3",
+        provider="fireworks",
+        alias="fireworks/kimi-k3",
+        context_window=256_000,
+    ),
+    ModelConfig(
+        name="accounts/fireworks/models/glm-5p3",
+        provider="fireworks",
+        alias="fireworks/glm-5.3",
+        context_window=200_000,
+    ),
+    # Together
+    ModelConfig(
+        name="moonshotai/Kimi-K3",
+        provider="together",
+        alias="together/kimi-k3",
+        context_window=256_000,
+    ),
+    ModelConfig(
+        name="openai/gpt-oss-120b",
+        provider="together",
+        alias="together/gpt-oss-120b",
+        context_window=128_000,
+    ),
+    # Baseten
+    ModelConfig(
+        name="zai-org/GLM-5.2",
+        provider="baseten",
+        alias="baseten/glm-5.2",
+        context_window=200_000,
+    ),
+    ModelConfig(
+        name="moonshotai/Kimi-K2.6",
+        provider="baseten",
+        alias="baseten/kimi-k2.6",
+        context_window=256_000,
+    ),
+    # Kimi For Coding (Anthropic Messages)
+    ModelConfig(
+        name="k3",
+        provider="kimi-coding",
+        alias="kimi/k3",
+        context_window=256_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    ModelConfig(
+        name="kimi-for-coding",
+        provider="kimi-coding",
+        alias="kimi/kimi-for-coding",
+        context_window=256_000,
+    ),
+    # Meta (Responses API)
+    ModelConfig(
+        name="muse-spark-1.3",
+        provider="meta",
+        alias="meta/muse-spark-1.3",
+        context_window=128_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    # MiniMax (Anthropic Messages)
+    ModelConfig(
+        name="MiniMax-M2.7",
+        provider="minimax",
+        alias="minimax/minimax-m2.7",
+        context_window=204_800,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    ModelConfig(
+        name="MiniMax-M2.7",
+        provider="minimax-cn",
+        alias="minimax-cn/minimax-m2.7",
+        context_window=204_800,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    # Moonshot AI
+    ModelConfig(
+        name="kimi-k2.7-code",
+        provider="moonshotai",
+        alias="moonshot/kimi-k2.7-code",
+        context_window=256_000,
+    ),
+    ModelConfig(
+        name="kimi-k2.7-code",
+        provider="moonshotai-cn",
+        alias="moonshot-cn/kimi-k2.7-code",
+        context_window=256_000,
+    ),
+    # Qwen Token Plan
+    ModelConfig(
+        name="qwen3.7-max",
+        provider="qwen-token-plan",
+        alias="qwen-token-plan/qwen3.7-max",
+        context_window=262_144,
+    ),
+    ModelConfig(
+        name="qwen3.7-max",
+        provider="qwen-token-plan-cn",
+        alias="qwen-token-plan-cn/qwen3.7-max",
+        context_window=262_144,
+    ),
+    # Ant Ling
+    ModelConfig(
+        name="Ling-2.6-flash",
+        provider="ant-ling",
+        alias="ant-ling/ling-2.6-flash",
+        context_window=262_144,
+    ),
+    ModelConfig(
+        name="Ring-2.6-1T",
+        provider="ant-ling",
+        alias="ant-ling/ring-2.6-1t",
+        context_window=262_144,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    # OpenCode Zen
+    ModelConfig(
+        name="gpt-5.4",
+        provider="opencode",
+        alias="opencode/gpt-5.4",
+        api_style="openai-responses",
+        context_window=400_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="claude-sonnet-4-5",
+        provider="opencode",
+        alias="opencode/claude-sonnet-4.5",
+        api_style="anthropic",
+        context_window=200_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="kimi-k2.6",
+        provider="opencode",
+        alias="opencode/kimi-k2.6",
+        context_window=256_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    ModelConfig(
+        name="grok-build-0.1",
+        provider="opencode",
+        alias="opencode/grok-build-0.1",
+        context_window=256_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    # OpenCode Go
+    ModelConfig(
+        name="gpt-5.6-luna",
+        provider="opencode-go",
+        alias="opencode-go/gpt-5.6-luna",
+        api_style="openai-responses",
+        context_window=400_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="kimi-k3",
+        provider="opencode-go",
+        alias="opencode-go/kimi-k3",
+        context_window=256_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    ModelConfig(
+        name="deepseek-v4-flash",
+        provider="opencode-go",
+        alias="opencode-go/deepseek-v4-flash",
+        context_window=256_000,
+    ),
+    ModelConfig(
+        name="deepseek-v4.1-flash",
+        provider="opencode-go",
+        alias="opencode-go/deepseek-v4.1-flash",
+        context_window=256_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
+    ModelConfig(
+        name="kimi-k2.6",
+        provider="opencode-go",
+        alias="opencode-go/kimi-k2.6",
+        context_window=256_000,
+        capabilities=ModelCapabilities(reasoning=True),
+    ),
 ]
 
 
