@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import base64
-import hashlib
-import secrets
 from typing import ClassVar
 from urllib.parse import urlencode
 
 import httpx
 
+from vibe.core.oauth.base import AuthInteraction
+from vibe.core.oauth.pkce import generate_pkce
 from vibe.core.oauth.registry import register_flow
 from vibe.core.oauth.token import AnthropicOAuthToken
 
@@ -19,26 +18,13 @@ REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
 SCOPES = "org:create_api_key user:profile user:inference"
 
 
-def _base64_url_encode(data: bytes) -> str:
-    """Encode bytes to URL-safe base64 without padding."""
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
 def get_pkce_challenge() -> tuple[str, str]:
     """Generate PKCE verifier and challenge.
 
     Returns:
         Tuple of (verifier, challenge) strings.
     """
-    # Generate 32 random bytes for verifier
-    verifier_bytes = secrets.token_bytes(32)
-    verifier = _base64_url_encode(verifier_bytes)
-
-    # Create challenge by SHA-256 hashing the verifier
-    challenge_hash = hashlib.sha256(verifier.encode("ascii")).digest()
-    challenge = _base64_url_encode(challenge_hash)
-
-    return verifier, challenge
+    return generate_pkce()
 
 
 def get_authorize_url(challenge: str, state: str) -> str:
@@ -181,6 +167,23 @@ class ClaudeOAuthFlow:
 
     name: ClassVar[str] = "anthropic"
     is_subscription: ClassVar[bool] = True
+    login_label: ClassVar[str] = "Sign in with Claude"
+
+    async def login(self, interaction: AuthInteraction) -> AnthropicOAuthToken:
+        verifier, challenge = get_pkce_challenge()
+        await interaction.show_auth_url(
+            get_authorize_url(challenge, state=verifier),
+            instructions=(
+                "Complete login in your browser, then paste the code Anthropic shows."
+            ),
+        )
+        code = await interaction.prompt_text(
+            "Paste the authorization code from the browser"
+        )
+        if not code.strip():
+            raise ValueError("No authorization code provided. Login cancelled.")
+        await interaction.progress("Exchanging code for tokens...")
+        return await exchange_token(code, verifier)
 
     async def refresh(self, refresh_token: str) -> AnthropicOAuthToken:
         return await _refresh_access_token(refresh_token)
