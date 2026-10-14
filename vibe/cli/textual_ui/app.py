@@ -70,6 +70,7 @@ from vibe.cli.update_notifier import (
 from vibe.cli.update_notifier.version_update_gateway import VersionUpdateGateway
 from vibe.core import __version__ as CORE_VERSION
 from vibe.core.agent import Agent
+from vibe.core.ambient import ambient_setup
 from vibe.core.auth import (
     AuthKind,
     ProviderAuth,
@@ -909,18 +910,21 @@ class VibeApp(App):
         kinds: set[AuthKind] = {auth.kind for auth in auths}
         kind: AuthKind
         if len(kinds) > 1:
-            choice = await self.push_screen_wait(
-                LoginScreen(
-                    "Select authentication method:",
-                    [
-                        SelectorEntry(
-                            "Sign in with a subscription or account", "oauth"
-                        ),
-                        SelectorEntry("Sign in with an API key", "api_key"),
-                    ],
+            choices: list[SelectorEntry] = []
+            if "oauth" in kinds:
+                choices.append(
+                    SelectorEntry("Sign in with a subscription or account", "oauth")
                 )
+            if "api_key" in kinds:
+                choices.append(SelectorEntry("Sign in with an API key", "api_key"))
+            if "ambient" in kinds:
+                choices.append(
+                    SelectorEntry("Configure ambient credentials", "ambient")
+                )
+            choice = await self.push_screen_wait(
+                LoginScreen("Select authentication method:", choices)
             )
-            if choice not in {"oauth", "api_key"}:
+            if choice not in {"oauth", "api_key", "ambient"}:
                 return
             kind = choice
         else:
@@ -988,6 +992,14 @@ class VibeApp(App):
                     )
                 )
                 return False
+            case "ambient":
+                await self._mount_and_scroll(
+                    UserCommandMessage(
+                        f"{provider.name} uses ambient credentials. "
+                        f"{ambient_setup(provider.ambient)}"
+                    )
+                )
+                return False
 
     async def _run_oauth_login(self, provider_name: str) -> LoginResult:
         try:
@@ -1047,7 +1059,11 @@ class VibeApp(App):
             )
             return
 
-        auths = [auth for auth in all_provider_auths(self.config) if auth.configured]
+        auths = [
+            auth
+            for auth in all_provider_auths(self.config)
+            if auth.configured and auth.kind != "ambient"
+        ]
         if not auths:
             await self._mount_and_scroll(
                 UserCommandMessage("No stored credentials to remove.")

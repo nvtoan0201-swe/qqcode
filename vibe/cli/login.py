@@ -7,6 +7,7 @@ import webbrowser
 from rich import print as rprint
 from rich.prompt import Prompt
 
+from vibe.core.ambient import ambient_setup
 from vibe.core.auth import (
     AuthKind,
     ProviderAuth,
@@ -180,6 +181,15 @@ def _login_api_key(provider: ProviderConfig) -> None:
     rprint("[dim]New QQcode sessions will use this key.[/dim]\n")
 
 
+def _login_ambient(provider: ProviderConfig) -> None:
+    rprint(f"\n[bold blue]{provider.name} uses ambient credentials.[/bold blue]\n")
+    rprint(f"{ambient_setup(provider.ambient)}")
+    rprint(
+        "[dim]QQcode does not store a key for this provider; configure the "
+        "credentials above and restart.[/dim]\n"
+    )
+
+
 def _run_auth(config: VibeConfig, auth: ProviderAuth) -> None:
     provider = find_provider(config, auth.provider)
     if provider is None:
@@ -190,6 +200,8 @@ def _run_auth(config: VibeConfig, auth: ProviderAuth) -> None:
             _login_oauth(provider.name)
         case "api_key":
             _login_api_key(provider)
+        case "ambient":
+            _login_ambient(provider)
 
 
 def login_provider(config: VibeConfig, name: str) -> None:
@@ -248,14 +260,17 @@ def run_login_command(argv: list[str]) -> int:
             kinds: set[AuthKind] = {auth.kind for auth in auths}
             kind: AuthKind
             if len(kinds) > 1:
+                options: list[tuple[AuthKind, str]] = []
+                if "oauth" in kinds:
+                    options.append(("oauth", "Sign in with a subscription or account"))
+                if "api_key" in kinds:
+                    options.append(("api_key", "Sign in with an API key"))
+                if "ambient" in kinds:
+                    options.append(("ambient", "Configure ambient credentials"))
                 index = _select(
-                    "Select authentication method:",
-                    [
-                        "Sign in with a subscription or account",
-                        "Sign in with an API key",
-                    ],
+                    "Select authentication method:", [label for _, label in options]
                 )
-                kind = "oauth" if index == 0 else "api_key"
+                kind = options[index][0]
             else:
                 kind = next(iter(kinds))
             _select_and_login(config, kind)
@@ -284,7 +299,11 @@ def run_logout_command(argv: list[str]) -> int:
             _logout(config, name)
             return 0
         case []:
-            auths = [auth for auth in all_provider_auths(config) if auth.configured]
+            auths = [
+                auth
+                for auth in all_provider_auths(config)
+                if auth.configured and auth.kind != "ambient"
+            ]
             if not auths:
                 rprint("[dim]No stored credentials to remove.[/dim]")
                 return 0

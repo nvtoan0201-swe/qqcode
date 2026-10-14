@@ -178,6 +178,22 @@ def test_login_command_saves_key_for_named_provider(
     assert dotenv_values(env_file)["MISTRAL_API_KEY"] == "typed-key"
 
 
+def test_login_command_prints_ambient_setup(
+    config: VibeConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("CLOUDFLARE_API_KEY", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
+    monkeypatch.setattr(VibeConfig, "load", classmethod(lambda cls, **_: config))
+
+    assert login_cli.run_login_command(["cloudflare-workers-ai"]) == 0
+
+    output = capsys.readouterr().out
+    assert "ambient credentials" in output
+    assert "CLOUDFLARE_API_KEY" in output
+
+
 def test_login_command_dispatches_oauth_flows(
     config: VibeConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

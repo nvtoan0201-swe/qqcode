@@ -207,6 +207,29 @@ async def test_login_reports_unknown_provider(vibe_config: VibeConfig) -> None:
 
 
 @pytest.mark.asyncio
+async def test_login_ambient_provider_shows_setup_without_secret(
+    vibe_config: VibeConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in (
+        "CLOUDFLARE_API_KEY",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_GATEWAY_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    app = VibeApp(config=vibe_config)
+
+    async with app.run_test() as pilot:
+        await type_and_submit(pilot, "/login cloudflare-workers-ai")
+        await pilot.pause()
+
+        assert not isinstance(app.screen, SecretScreen)
+        assert not isinstance(app.screen, LoginScreen)
+        messages = [message._content for message in app.query(UserCommandMessage)]
+
+    assert any("ambient credentials" in str(message) for message in messages)
+
+
+@pytest.mark.asyncio
 async def test_logout_removes_a_configured_credential(
     vibe_config: VibeConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
