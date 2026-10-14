@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 import webbrowser
 
 from rich import print as rprint
@@ -22,128 +23,118 @@ from vibe.core.config import (
     skip_api_key_check,
 )
 from vibe.core.oauth import (
-    exchange_token,
-    get_authorize_url,
-    get_pkce_challenge,
-    qwen_get_pkce_challenge,
-    qwen_poll_for_token,
-    qwen_request_device_code,
+    DeviceCodeInfo,
+    OAuthFlow,
+    SelectOption,
+    UnknownOAuthFlowError,
+    get_flow,
 )
 
 
-async def _login_anthropic_async() -> None:
-    """Interactive OAuth login flow for Anthropic."""
-    rprint("\n[bold blue]Anthropic Claude Max Login[/bold blue]\n")
+class RichAuthInteraction:
+    """Rich-based ``AuthInteraction`` driving any registered OAuth flow."""
 
-    # Generate PKCE challenge
-    verifier, challenge = get_pkce_challenge()
-    url = get_authorize_url(challenge, state=verifier)
+    def __init__(self) -> None:
+        self.cancel_event = asyncio.Event()
 
-    rprint("[dim]Opening browser for authentication...[/dim]\n")
-    rprint(f"If the browser doesn't open, visit this URL:\n[link={url}]{url}[/link]\n")
-
-    # Try to open browser
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
-
-    # Get authorization code from user
-    code = Prompt.ask("\n[bold]Paste the authorization code from the browser[/bold]")
-    code = code.strip()
-
-    if not code:
-        rprint("[red]No authorization code provided. Login cancelled.[/red]")
-        return
-
-    rprint("\n[dim]Exchanging code for tokens...[/dim]")
-
-    try:
-        token = await exchange_token(code, verifier)
-    except Exception as e:
-        rprint(f"[red]Failed to exchange token: {e}[/red]")
-        return
-
-    # Save to config
-    try:
-        save_oauth_token("anthropic", token)
-        rprint("\n[bold green]Successfully logged in to Anthropic![/bold green]")
-        rprint(
-            "[dim]You can now use Claude models. Run 'qqcode' and use /models to select a model.[/dim]\n"
+    async def prompt_secret(self, message: str) -> str:
+        return await asyncio.to_thread(
+            Prompt.ask, f"[bold]{message}[/bold]", password=True
         )
-    except Exception as e:
-        rprint(f"[red]Failed to save token: {e}[/red]")
+
+    async def prompt_text(self, message: str, placeholder: str | None = None) -> str:
+        prompt = f"[bold]{message}[/bold]"
+        if placeholder:
+            prompt = f"{prompt} [dim]({placeholder})[/dim]"
+        return await asyncio.to_thread(Prompt.ask, prompt)
+
+    async def select(self, message: str, options: Sequence[SelectOption]) -> str:
+        def ask() -> str:
+            for index, option in enumerate(options, start=1):
+                description = (
+                    f" [dim]{option.description}[/dim]" if option.description else ""
+                )
+                rprint(f"  [bold]{index}.[/] {option.label}{description}")
+            choices = [str(index) for index in range(1, len(options) + 1)]
+            answer = Prompt.ask(f"\n{message}", choices=choices, default="1")
+            return options[int(answer) - 1].id
+
+        return await asyncio.to_thread(ask)
+
+    async def show_auth_url(self, url: str, instructions: str | None = None) -> None:
+        if instructions:
+            rprint(f"[dim]{instructions}[/dim]")
+        rprint(
+            f"If the browser doesn't open, visit this URL:\n[link={url}]{url}[/link]\n"
+        )
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    async def show_device_code(self, info: DeviceCodeInfo) -> None:
+        rprint(
+            "Please visit this URL to authorize:\n"
+            f"[link={info.verification_uri}]{info.verification_uri}[/link]\n"
+            f"and enter the code: [bold]{info.user_code}[/bold]\n"
+        )
+        try:
+            webbrowser.open(info.verification_uri)
+        except Exception:
+            pass
+
+    async def progress(self, message: str) -> None:
+        rprint(f"[dim]{message}[/dim]")
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+
+async def _login_registered_flow_async(flow: OAuthFlow, provider_name: str) -> None:
+    rprint(f"\n[bold blue]{provider_name} Login[/bold blue]\n")
+    interaction = RichAuthInteraction()
+    try:
+        token = await flow.login(interaction)
+    except KeyboardInterrupt:
+        rprint("\n[yellow]Login cancelled.[/yellow]")
+        return
+    except Exception as exc:
+        rprint(f"[red]Login failed: {exc}[/red]")
+        return
+
+    try:
+        save_oauth_token(provider_name, token)
+    except Exception as exc:
+        rprint(f"[red]Failed to save token: {exc}[/red]")
+        return
+
+    rprint(f"\n[bold green]Successfully logged in to {provider_name}![/bold green]")
+    rprint(
+        "[dim]You can now use this provider. Run 'qqcode' and use /models to "
+        "select a model.[/dim]\n"
+    )
+
+
+def _login_registered_flow(provider_name: str) -> None:
+    try:
+        flow = get_flow(provider_name)
+    except UnknownOAuthFlowError:
+        rprint(
+            f"[red]No interactive login flow is available for '{provider_name}'.[/red]"
+        )
+        return
+    asyncio.run(_login_registered_flow_async(flow, provider_name))
 
 
 def login_anthropic() -> None:
     """Run the Anthropic OAuth login flow."""
-    asyncio.run(_login_anthropic_async())
-
-
-async def _login_qwen_async() -> None:
-    """Interactive OAuth login flow for Qwen (device authorization)."""
-    rprint("\n[bold blue]Qwen OAuth Login[/bold blue]\n")
-
-    # Generate PKCE challenge
-    verifier, challenge = qwen_get_pkce_challenge()
-
-    rprint("[dim]Requesting device authorization...[/dim]\n")
-
-    try:
-        device_response = await qwen_request_device_code(challenge)
-    except Exception as e:
-        rprint(f"[red]Failed to get device code: {e}[/red]")
-        return
-
-    # Show verification URL
-    url = device_response.verification_uri_complete
-    rprint(f"Please visit this URL to authorize:\n[link={url}]{url}[/link]\n")
-
-    # Try to open browser
-    try:
-        webbrowser.open(url)
-        rprint("[dim]Browser opened. Please complete authorization...[/dim]\n")
-    except Exception:
-        rprint("[dim]Could not open browser. Please visit the URL manually.[/dim]\n")
-
-    # Define status callback for progress updates
-    def status_callback(status: str) -> None:
-        rprint(f"[dim]{status}[/dim]")
-
-    rprint("[dim]Waiting for authorization (press Ctrl+C to cancel)...[/dim]\n")
-
-    try:
-        token = await qwen_poll_for_token(
-            device_code=device_response.device_code,
-            verifier=verifier,
-            expires_in=device_response.expires_in,
-            status_callback=status_callback,
-        )
-    except KeyboardInterrupt:
-        rprint("\n[yellow]Login cancelled.[/yellow]")
-        return
-    except Exception as e:
-        error_msg = str(e)
-        if "timeout" in error_msg.lower():
-            rprint("\n[red]Authorization timed out. Please try again.[/red]")
-        else:
-            rprint(f"\n[red]Failed to get token: {e}[/red]")
-        return
-
-    # Save to config
-    try:
-        save_oauth_token("qwen", token)
-        rprint("\n[bold green]Successfully logged in to Qwen![/bold green]")
-        rprint(
-            "[dim]You can now use Qwen models. Run 'qqcode' and use /model to select a model.[/dim]\n"
-        )
-    except Exception as e:
-        rprint(f"[red]Failed to save token: {e}[/red]")
+    _login_registered_flow("anthropic")
 
 
 def login_qwen() -> None:
     """Run the Qwen OAuth login flow."""
-    asyncio.run(_login_qwen_async())
+    _login_registered_flow("qwen")
 
 
 def _select(prompt: str, options: list[str]) -> int:
@@ -167,10 +158,7 @@ def _login_oauth(provider_name: str) -> None:
         case "qwen":
             login_qwen()
         case _:
-            rprint(
-                f"[red]No interactive login flow is available for "
-                f"'{provider_name}'.[/red]"
-            )
+            _login_registered_flow(provider_name)
 
 
 def _login_api_key(provider: ProviderConfig) -> None:
