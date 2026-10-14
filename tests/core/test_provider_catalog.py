@@ -18,8 +18,8 @@ def _providers_by_name(config: VibeConfig) -> dict[str, ProviderConfig]:
 def test_default_provider_catalog_matches_expected_count() -> None:
     config = VibeConfig()
 
-    assert len(config.providers) == len(DEFAULT_PROVIDERS) == 34
-    assert len({provider.name for provider in config.providers}) == 34
+    assert len(config.providers) == len(DEFAULT_PROVIDERS) == 35
+    assert len({provider.name for provider in config.providers}) == 35
 
 
 def test_default_providers_load_with_expected_env_var_and_style() -> None:
@@ -27,6 +27,7 @@ def test_default_providers_load_with_expected_env_var_and_style() -> None:
 
     expected = {
         "openai": ("OPENAI_API_KEY", "openai-responses"),
+        "openai-codex": ("", "openai-codex-responses"),
         "deepseek": ("DEEPSEEK_API_KEY", "openai"),
         "nvidia": ("NVIDIA_API_KEY", "openai"),
         "google": ("GEMINI_API_KEY", "google-generative-ai"),

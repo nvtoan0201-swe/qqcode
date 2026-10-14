@@ -685,6 +685,13 @@ DEFAULT_PROVIDERS = [
         api_style="openai-responses",
     ),
     ProviderConfig(
+        name="openai-codex",
+        api_base="https://chatgpt.com/backend-api",
+        api_key_env_var="",
+        api_style="openai-codex-responses",
+        oauth_flow="openai-codex",
+    ),
+    ProviderConfig(
         name="deepseek",
         api_base="https://api.deepseek.com",
         api_key_env_var="DEEPSEEK_API_KEY",
@@ -1000,6 +1007,21 @@ DEFAULT_MODELS = [
         alias="openai/gpt-4o",
         context_window=128_000,
         capabilities=ModelCapabilities(vision=True),
+    ),
+    # OpenAI Codex (ChatGPT subscription Responses backend)
+    ModelConfig(
+        name="gpt-5.1-codex",
+        provider="openai-codex",
+        alias="openai-codex/gpt-5.1-codex",
+        context_window=400_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gpt-5.1-codex-mini",
+        provider="openai-codex",
+        alias="openai-codex/gpt-5.1-codex-mini",
+        context_window=400_000,
+        capabilities=ModelCapabilities(reasoning=True),
     ),
     # DeepSeek
     ModelConfig(

@@ -18,6 +18,9 @@ from vibe.core.llm.backend.adapters.google_generative_ai import (
     GoogleGenerativeAIAdapter,
 )
 from vibe.core.llm.backend.adapters.openai_chat import OpenAIAdapter
+from vibe.core.llm.backend.adapters.openai_codex_responses import (
+    OpenAICodexResponsesAdapter,
+)
 from vibe.core.llm.backend.adapters.openai_responses import OpenAIResponsesAdapter
 
 __all__ = [
@@ -27,6 +30,7 @@ __all__ = [
     "AnthropicAdapter",
     "GoogleGenerativeAIAdapter",
     "OpenAIAdapter",
+    "OpenAICodexResponsesAdapter",
     "OpenAIResponsesAdapter",
     "PreparedRequest",
     "UnknownAPIStyleError",
