@@ -862,7 +862,7 @@ TrustScreen {
     margin: 0 1;
 }
 
-LoginScreen, SecretScreen {
+LoginScreen, SecretScreen, LoginDialogScreen {
     align: center middle;
     background: $background 60%;
 }
@@ -917,4 +917,25 @@ LoginScreen, SecretScreen {
     width: 100%;
     height: auto;
     color: $foreground 50%;
+}
+
+.login-body {
+    width: 100%;
+    height: auto;
+    max-height: 20;
+    margin: 1 0 0 0;
+}
+
+.login-status {
+    width: 100%;
+    height: auto;
+    margin: 1 0 0 0;
+    color: $foreground 50%;
+}
+
+.login-input {
+    width: 100%;
+    margin: 1 0 0 0;
+    border: none;
+    background: $surface;
 }

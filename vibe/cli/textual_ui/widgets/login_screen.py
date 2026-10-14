@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
+import sys
 from typing import Any, ClassVar
+import webbrowser
 
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
@@ -10,6 +14,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 from vibe.core.autocompletion.fuzzy import fuzzy_match
+from vibe.core.oauth.base import DeviceCodeInfo, SelectOption
 
 SELECTED_CLASS = "login-option-selected"
 DIALOG_CLASS = "login-dialog"
@@ -19,6 +24,9 @@ LIST_CLASS = "login-list"
 EMPTY_CLASS = "login-empty"
 HELP_CLASS = "login-help"
 SECRET_CLASS = "login-secret"
+BODY_CLASS = "login-body"
+STATUS_CLASS = "login-status"
+INPUT_CLASS = "login-input"
 
 
 @dataclass(frozen=True)
@@ -153,3 +161,169 @@ class SecretScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class LoginCancelledError(Exception):
+    """Raised inside a login flow when the user cancels the dialog."""
+
+
+@dataclass(frozen=True)
+class LoginResult:
+    """What a modal login reports back to its caller."""
+
+    success: bool
+    message: str | None = None
+    cancelled: bool = False
+
+
+class LoginDialogScreen(ModalScreen[LoginResult]):
+    """Modal login dialog implementing the OAuth ``AuthInteraction`` surface.
+
+    A login flow drives the dialog from a worker: ``show_auth_url`` and
+    ``show_device_code`` fill the body, ``progress`` updates the status line and
+    the prompt methods reuse a single input row, masked for secrets. Escape sets
+    the interaction's cancel event so the flow aborts, then dismisses.
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Cancel", show=False)
+    ]
+
+    def __init__(self, provider_name: str) -> None:
+        super().__init__()
+        self.provider_name = provider_name
+        self.cancel_event = asyncio.Event()
+        self._pending: asyncio.Future[str] | None = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes=DIALOG_CLASS):
+            yield Static(f"Login to {self.provider_name}", classes=TITLE_CLASS)
+            yield Vertical(classes=BODY_CLASS)
+            yield Static("", classes=STATUS_CLASS)
+            yield Input(classes=INPUT_CLASS)
+            yield Static("Enter submit  Esc cancel", classes=HELP_CLASS)
+
+    def on_mount(self) -> None:
+        self._input().display = False
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        pending = self._pending
+        if pending is not None and not pending.done():
+            pending.set_result(event.value)
+
+    async def show_auth_url(self, url: str, instructions: str | None = None) -> None:
+        if self.cancelled:
+            return
+        await self._clear_body()
+        await self._append_body(f'[link="{url}"]{url}[/link]')
+        await self._append_body(f"[dim]{self._click_hint()}[/dim]")
+        if instructions:
+            await self._append_body(f"[yellow]{instructions}[/yellow]")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    async def show_device_code(self, info: DeviceCodeInfo) -> None:
+        if self.cancelled:
+            return
+        await self._clear_body()
+        await self._append_body(
+            f'[link="{info.verification_uri}"]{info.verification_uri}[/link]'
+        )
+        await self._append_body(f"[dim]{self._click_hint()}[/dim]")
+        await self._append_body(f"[yellow]Enter code: {info.user_code}[/yellow]")
+        self._set_status("Waiting for authentication…")
+
+    async def progress(self, message: str) -> None:
+        if self.cancelled:
+            return
+        self._set_status(message)
+
+    async def prompt_secret(self, message: str) -> str:
+        return await self._prompt(message, masked=True, placeholder=None)
+
+    async def prompt_text(self, message: str, placeholder: str | None = None) -> str:
+        return await self._prompt(message, masked=False, placeholder=placeholder)
+
+    async def select(self, message: str, options: Sequence[SelectOption]) -> str:
+        await self._append_body(f"[bold]{message}[/bold]")
+        for index, option in enumerate(options, start=1):
+            detail = f"  [dim]{option.description}[/dim]" if option.description else ""
+            await self._append_body(f"  {index}. {option.label}{detail}")
+        while True:
+            answer = (await self._ask(masked=False, placeholder=None)).strip()
+            match self._match_option(answer, options):
+                case SelectOption() as option:
+                    await self._append_body(f"> {option.id}")
+                    return option.id
+                case None:
+                    self._set_status("Enter one of the numbers above.")
+
+    def action_cancel(self) -> None:
+        self.cancel_event.set()
+        pending = self._pending
+        if pending is not None and not pending.done():
+            pending.set_exception(LoginCancelledError("Login cancelled"))
+        self.dismiss(
+            LoginResult(success=False, message="Login cancelled", cancelled=True)
+        )
+
+    async def _prompt(
+        self, message: str, *, masked: bool, placeholder: str | None
+    ) -> str:
+        await self._append_body(f"[bold]{message}[/bold]")
+        if placeholder:
+            await self._append_body(f"[dim]e.g., {placeholder}[/dim]")
+        return await self._ask(masked=masked, placeholder=placeholder)
+
+    async def _ask(self, *, masked: bool, placeholder: str | None) -> str:
+        if self.cancelled:
+            raise LoginCancelledError("Login cancelled")
+        field = self._input()
+        field.password = masked
+        field.placeholder = placeholder or ""
+        field.value = ""
+        field.display = True
+        field.focus()
+        self._pending = asyncio.get_running_loop().create_future()
+        try:
+            value = await self._pending
+        finally:
+            self._pending = None
+            if field.is_mounted:
+                field.display = False
+        await self._append_body(f"> {'•' * len(value) if masked else value}")
+        return value
+
+    @staticmethod
+    def _match_option(
+        answer: str, options: Sequence[SelectOption]
+    ) -> SelectOption | None:
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return options[int(answer) - 1]
+        return next((option for option in options if option.id == answer), None)
+
+    @staticmethod
+    def _click_hint() -> str:
+        return "Cmd+click to open" if sys.platform == "darwin" else "Ctrl+click to open"
+
+    def _input(self) -> Input:
+        return self.query_one(f".{INPUT_CLASS}", Input)
+
+    async def _clear_body(self) -> None:
+        if self.is_mounted:
+            await self.query_one(f".{BODY_CLASS}", Vertical).remove_children()
+
+    async def _append_body(self, line: str) -> None:
+        if self.is_mounted:
+            await self.query_one(f".{BODY_CLASS}", Vertical).mount(Static(line))
+
+    def _set_status(self, message: str) -> None:
+        if self.is_mounted:
+            self.query_one(f".{STATUS_CLASS}", Static).update(message)
