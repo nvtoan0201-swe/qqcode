@@ -22,6 +22,7 @@ from vibe.core.llm.backend.adapters.openai_codex_responses import (
     OpenAICodexResponsesAdapter,
 )
 from vibe.core.llm.backend.adapters.openai_responses import OpenAIResponsesAdapter
+from vibe.core.llm.backend.adapters.pi_messages import PiMessagesAdapter
 
 __all__ = [
     "ADAPTER_REGISTRY",
@@ -32,6 +33,7 @@ __all__ = [
     "OpenAIAdapter",
     "OpenAICodexResponsesAdapter",
     "OpenAIResponsesAdapter",
+    "PiMessagesAdapter",
     "PreparedRequest",
     "UnknownAPIStyleError",
     "get_adapter",

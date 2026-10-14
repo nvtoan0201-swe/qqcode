@@ -37,7 +37,7 @@ def test_default_providers_load_with_expected_env_var_and_style() -> None:
         "xai": ("XAI_API_KEY", "openai-responses"),
         "vercel-ai-gateway": ("AI_GATEWAY_API_KEY", "anthropic"),
         "zai-coding-cn": ("ZAI_CODING_CN_API_KEY", "openai"),
-        "radius": ("RADIUS_API_KEY", "openai"),
+        "radius": ("RADIUS_API_KEY", "pi-messages"),
         "typesafe": ("TYPESAFE_API_KEY", "openai"),
         "huggingface": ("HF_TOKEN", "openai"),
         "fireworks": ("FIREWORKS_API_KEY", "openai"),
@@ -84,9 +84,23 @@ def test_opencode_models_carry_a_per_model_api_style() -> None:
 
     assert models["opencode/gpt-5.4"].api_style == "openai-responses"
     assert models["opencode/claude-sonnet-4.5"].api_style == "anthropic"
+    assert models["opencode/gemini-3-pro"].api_style == "google-generative-ai"
+    assert models["opencode/gemini-2.5-flash"].api_style == "google-generative-ai"
     assert models["opencode/kimi-k2.6"].api_style is None
     assert models["opencode-go/gpt-5.6-luna"].api_style == "openai-responses"
+    assert models["opencode-go/claude-sonnet-4.5"].api_style == "anthropic"
     assert models["github-copilot/claude-sonnet-4.5"].api_style == "anthropic"
+
+
+def test_new_native_models_are_registered() -> None:
+    config = VibeConfig()
+    models = {model.alias: model for model in config.models}
+    providers = _providers_by_name(config)
+
+    assert models["google/gemini-3-pro"].provider == "google"
+    assert models["google/gemini-2.5-pro"].provider == "google"
+    assert models["openai-codex/gpt-5.1-codex"].provider == "openai-codex"
+    assert providers["openai-codex"].api_style == "openai-codex-responses"
 
 
 def test_legacy_model_without_api_style_still_loads(

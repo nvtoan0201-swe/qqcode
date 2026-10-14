@@ -21,6 +21,7 @@ from vibe.core.llm.backend.adapters import (
     OpenAIAdapter,
     OpenAICodexResponsesAdapter,
     OpenAIResponsesAdapter,
+    PiMessagesAdapter,
     PreparedRequest,
     UnknownAPIStyleError,
     get_adapter,
@@ -30,7 +31,14 @@ from vibe.core.llm.cache import CachePlan
 from vibe.core.llm.capabilities import clamp_max_tokens
 from vibe.core.llm.exceptions import BackendErrorBuilder
 from vibe.core.oauth.registry import get_flow
-from vibe.core.types import AvailableTool, LLMChunk, LLMMessage, Role, StrToolChoice
+from vibe.core.types import (
+    AvailableTool,
+    LLMChunk,
+    LLMMessage,
+    Role,
+    StrToolChoice,
+    ToolCall,
+)
 from vibe.core.utils import _retry_after_seconds, async_generator_retry, async_retry
 
 if TYPE_CHECKING:
@@ -58,6 +66,7 @@ __all__ = [
     "OpenAIAdapter",
     "OpenAICodexResponsesAdapter",
     "OpenAIResponsesAdapter",
+    "PiMessagesAdapter",
     "PreparedRequest",
     "UnknownAPIStyleError",
     "get_adapter",
@@ -217,6 +226,19 @@ class GenericBackend:
         api_style = model.api_style or self._provider.api_style
         adapter = get_adapter(api_style)
 
+        if getattr(adapter, "streaming_only", False):
+            return await self._aggregate_stream(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+                extra_headers=extra_headers,
+                cache_plan=cache_plan,
+                thinking_level=thinking_level,
+            )
+
         extra_body = getattr(model, "extra_body", None) or None
         if not model.capabilities.tools:
             tools = None
@@ -274,6 +296,75 @@ class GenericBackend:
                 has_tools=bool(tools),
                 tool_choice=tool_choice,
             ) from e
+
+    async def _aggregate_stream(
+        self,
+        *,
+        model: ModelConfig,
+        messages: list[LLMMessage],
+        temperature: float,
+        tools: list[AvailableTool] | None,
+        max_tokens: int | None,
+        tool_choice: StrToolChoice | AvailableTool | None,
+        extra_headers: dict[str, str] | None,
+        cache_plan: CachePlan | None,
+        thinking_level: ThinkingLevel | None,
+    ) -> LLMChunk:
+        """Serve a non-streaming caller from an SSE-only adapter."""
+        chunks = [
+            chunk
+            async for chunk in self.complete_streaming(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+                extra_headers=extra_headers,
+                cache_plan=cache_plan,
+                thinking_level=thinking_level,
+            )
+        ]
+        content = "".join(chunk.message.content or "" for chunk in chunks)
+        reasoning = "".join(chunk.message.reasoning_content or "" for chunk in chunks)
+        usage = next(
+            (chunk.usage for chunk in reversed(chunks) if chunk.usage is not None), None
+        )
+        finish_reason = next(
+            (
+                chunk.finish_reason
+                for chunk in chunks
+                if chunk.finish_reason is not None
+            ),
+            None,
+        )
+        return LLMChunk(
+            message=LLMMessage(
+                role=Role.assistant,
+                content=content or None,
+                reasoning_content=reasoning or None,
+                tool_calls=self._merge_tool_calls(chunks),
+            ),
+            usage=usage,
+            finish_reason=finish_reason,
+        )
+
+    @staticmethod
+    def _merge_tool_calls(chunks: list[LLMChunk]) -> list[ToolCall] | None:
+        merged: dict[int, ToolCall] = {}
+        for chunk in chunks:
+            for tool_call in chunk.message.tool_calls or []:
+                index = tool_call.index
+                if index is None:
+                    merged[len(merged)] = tool_call
+                    continue
+                if index not in merged:
+                    merged[index] = tool_call
+                    continue
+                merged[index].function.arguments = (
+                    merged[index].function.arguments or ""
+                ) + (tool_call.function.arguments or "")
+        return list(merged.values()) or None
 
     async def complete_streaming(
         self,

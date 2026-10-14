@@ -750,6 +750,7 @@ DEFAULT_PROVIDERS = [
         name="radius",
         api_base="https://radius.pi.dev/v1",
         api_key_env_var="RADIUS_API_KEY",
+        api_style="pi-messages",
     ),
     ProviderConfig(
         name="typesafe",
@@ -1309,6 +1310,22 @@ DEFAULT_MODELS = [
         context_window=256_000,
         capabilities=ModelCapabilities(reasoning=True),
     ),
+    ModelConfig(
+        name="gemini-3-pro-preview",
+        provider="opencode",
+        alias="opencode/gemini-3-pro",
+        api_style="google-generative-ai",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gemini-2.5-flash",
+        provider="opencode",
+        alias="opencode/gemini-2.5-flash",
+        api_style="google-generative-ai",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
     # OpenCode Go
     ModelConfig(
         name="gpt-5.6-luna",
@@ -1344,6 +1361,29 @@ DEFAULT_MODELS = [
         alias="opencode-go/kimi-k2.6",
         context_window=256_000,
         capabilities=ModelCapabilities(reasoning=True),
+    ),
+    ModelConfig(
+        name="claude-sonnet-4-5",
+        provider="opencode-go",
+        alias="opencode-go/claude-sonnet-4.5",
+        api_style="anthropic",
+        context_window=200_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    # Radius gateway (pi-messages protocol)
+    ModelConfig(
+        name="claude-sonnet-4-5",
+        provider="radius",
+        alias="radius/claude-sonnet-4.5",
+        context_window=200_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gpt-5.1",
+        provider="radius",
+        alias="radius/gpt-5.1",
+        context_window=400_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
     ),
 ]
 
