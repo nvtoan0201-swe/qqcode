@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+import time
+from typing import ClassVar
 
 from dotenv import dotenv_values
 import pytest
@@ -20,12 +22,13 @@ from vibe.core.config import (
     MissingAPIKeyError,
     ModelConfig,
     ProviderConfig,
+    TomlFileSettingsSource,
     VibeConfig,
     clear_oauth_token,
     config_file_override,
     skip_api_key_check,
 )
-from vibe.core.oauth import AnthropicOAuthToken
+from vibe.core.oauth import AnthropicOAuthToken, OAuthToken, register_flow
 
 
 @pytest.fixture
@@ -252,6 +255,136 @@ def test_login_loads_config_without_a_key(monkeypatch: pytest.MonkeyPatch) -> No
     config = login_cli._load_login_config()
 
     assert config.active_model == "acme-1"
+
+
+class _RegistryRefreshFlow:
+    name: ClassVar[str] = "test-registry-flow"
+    is_subscription: ClassVar[bool] = True
+    login_label: ClassVar[str] = "Test"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def login(self, interaction: object) -> OAuthToken:
+        raise NotImplementedError
+
+    async def refresh(self, refresh_token: str) -> AnthropicOAuthToken:
+        self.calls += 1
+        return AnthropicOAuthToken.from_token_response("fresh", refresh_token, 3600)
+
+
+def test_check_api_key_refreshes_via_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    flow = _RegistryRefreshFlow()
+    register_flow(flow)
+    saved: list[tuple[str, OAuthToken]] = []
+    monkeypatch.setattr(
+        "vibe.core.config.save_oauth_token",
+        lambda name, token: saved.append((name, token)),
+    )
+    provider = ProviderConfig(
+        name="acme-oauth",
+        api_base="https://acme.test/v1",
+        oauth_flow="test-registry-flow",
+        oauth_token=OAuthToken(
+            access_token="old",
+            refresh_token="refresh-me",
+            expires_in=3600,
+            expires_at=int(time.time()) - 1,
+        ),
+    )
+    model = ModelConfig(name="m", provider="acme-oauth", alias="acme-oauth-1")
+
+    config = VibeConfig(
+        active_model="acme-oauth-1", providers=[provider], models=[model]
+    )
+
+    token = next(p for p in config.providers if p.name == "acme-oauth").oauth_token
+    assert token is not None
+    assert token.access_token == "fresh"
+    assert flow.calls == 1
+    assert saved == [("acme-oauth", token)]
+
+
+def test_legacy_anthropic_token_config_loads(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        'active_model = "claude-x"\n'
+        "[[providers]]\n"
+        'name = "anthropic"\n'
+        'api_base = "https://api.anthropic.com"\n'
+        'api_key_env_var = "ANTHROPIC_API_KEY"\n'
+        'api_style = "anthropic"\n'
+        'backend = "anthropic"\n'
+        "[providers.oauth_token]\n"
+        'access_token = "legacy-access"\n'
+        'refresh_token = "legacy-refresh"\n'
+        "expires_in = 3600\n"
+        "expires_at = 9999999999\n"
+        "[[models]]\n"
+        'name = "claude-x"\n'
+        'provider = "anthropic"\n'
+        'alias = "claude-x"\n',
+        encoding="utf-8",
+    )
+
+    with config_file_override(config_file):
+        file_data = TomlFileSettingsSource(VibeConfig).toml_data
+    config = VibeConfig(**file_data)
+
+    provider = next(p for p in config.providers if p.name == "anthropic")
+    assert provider.oauth_token is not None
+    assert provider.oauth_token.access_token == "legacy-access"
+    assert provider.oauth_token.refresh_token == "legacy-refresh"
+
+
+def test_legacy_qwen_resource_url_config_loads(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        'active_model = "qwen-x"\n'
+        "[[providers]]\n"
+        'name = "qwen"\n'
+        'api_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"\n'
+        'api_key_env_var = "DASHSCOPE_API_KEY"\n'
+        "[providers.oauth_token]\n"
+        'access_token = "qwen-access"\n'
+        'refresh_token = "qwen-refresh"\n'
+        "expires_in = 3600\n"
+        "expires_at = 9999999999\n"
+        'resource_url = "portal.qwen.ai"\n'
+        "[[models]]\n"
+        'name = "qwen3-coder-plus"\n'
+        'provider = "qwen"\n'
+        'alias = "qwen-x"\n',
+        encoding="utf-8",
+    )
+
+    with config_file_override(config_file):
+        file_data = TomlFileSettingsSource(VibeConfig).toml_data
+    config = VibeConfig(**file_data)
+
+    provider = next(p for p in config.providers if p.name == "qwen")
+    assert provider.oauth_token is not None
+    assert provider.oauth_token.resource_url == "portal.qwen.ai"
+
+
+def test_unregistered_oauth_provider_does_not_crash() -> None:
+    provider = ProviderConfig(
+        name="mystery",
+        api_base="https://mystery.test/v1",
+        oauth_token=OAuthToken(
+            access_token="a",
+            refresh_token="r",
+            expires_in=3600,
+            expires_at=int(time.time()) - 10,
+        ),
+    )
+    model = ModelConfig(name="m", provider="mystery", alias="mystery-1")
+
+    config = VibeConfig(active_model="mystery-1", providers=[provider], models=[model])
+
+    token = next(p for p in config.providers if p.name == "mystery").oauth_token
+    assert token is not None
+    assert token.access_token == "a"
 
 
 def test_entrypoint_routes_login_and_logout(monkeypatch: pytest.MonkeyPatch) -> None:
