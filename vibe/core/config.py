@@ -154,6 +154,17 @@ class MissingAPIKeyError(RuntimeError):
         self.provider_name = provider_name
 
 
+class MissingAmbientCredentialsError(RuntimeError):
+    def __init__(self, ambient: str, provider_name: str, setup: str) -> None:
+        super().__init__(
+            f"No ambient credentials found for {provider_name} provider "
+            f"({ambient}). {setup}"
+        )
+        self.ambient = ambient
+        self.provider_name = provider_name
+        self.setup = setup
+
+
 class MissingPromptFileError(RuntimeError):
     def __init__(self, system_prompt_id: str, prompt_dir: str) -> None:
         super().__init__(
@@ -376,6 +387,13 @@ class ProviderConfig(BaseModel):
     cache_retention: Literal["default", "none", "short", "long"] = "default"
     timeout: float | None = None
     models_path: str | None = None
+    ambient: str = Field(
+        default="",
+        description=(
+            "Ambient credential kind resolved from local configuration "
+            "(e.g. 'google-vertex', 'amazon-bedrock', 'cloudflare-workers-ai')."
+        ),
+    )
 
 
 class MCPOAuthConfig(BaseModel):
@@ -835,6 +853,36 @@ DEFAULT_PROVIDERS = [
         name="opencode-go",
         api_base="https://opencode.ai/zen/go/v1",
         api_key_env_var="OPENCODE_API_KEY",
+    ),
+    ProviderConfig(
+        name="google-vertex",
+        api_base="https://aiplatform.googleapis.com/v1",
+        api_style="google-vertex",
+        ambient="google-vertex",
+    ),
+    ProviderConfig(
+        name="amazon-bedrock",
+        api_base="https://bedrock-runtime.us-east-1.amazonaws.com",
+        api_style="bedrock-converse",
+        ambient="amazon-bedrock",
+    ),
+    ProviderConfig(
+        name="cloudflare-workers-ai",
+        api_base=(
+            "https://api.cloudflare.com/client/v4/accounts"
+            "/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+        ),
+        api_style="openai",
+        ambient="cloudflare-workers-ai",
+    ),
+    ProviderConfig(
+        name="cloudflare-ai-gateway",
+        api_base=(
+            "https://gateway.ai.cloudflare.com/v1"
+            "/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat"
+        ),
+        api_style="openai",
+        ambient="cloudflare-ai-gateway",
     ),
 ]
 
@@ -1385,6 +1433,95 @@ DEFAULT_MODELS = [
         context_window=400_000,
         capabilities=ModelCapabilities(reasoning=True, vision=True),
     ),
+    # Google Vertex AI (Application Default Credentials or an API key)
+    ModelConfig(
+        name="gemini-2.5-pro",
+        provider="google-vertex",
+        alias="vertex/gemini-2.5-pro",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gemini-2.5-flash",
+        provider="google-vertex",
+        alias="vertex/gemini-2.5-flash",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gemini-3-pro-preview",
+        provider="google-vertex",
+        alias="vertex/gemini-3-pro",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gemini-3-flash-preview",
+        provider="google-vertex",
+        alias="vertex/gemini-3-flash",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    # Amazon Bedrock (AWS credential chain or a Bedrock bearer token)
+    ModelConfig(
+        name="anthropic.claude-sonnet-4-5-20250929-v1:0",
+        provider="amazon-bedrock",
+        alias="bedrock/claude-sonnet-4.5",
+        context_window=200_000,
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
+    ),
+    ModelConfig(
+        name="anthropic.claude-3-5-haiku-20241022-v1:0",
+        provider="amazon-bedrock",
+        alias="bedrock/claude-3.5-haiku",
+        context_window=200_000,
+        capabilities=ModelCapabilities(
+            reasoning=True, vision=True, prompt_cache="short"
+        ),
+    ),
+    ModelConfig(
+        name="amazon.nova-pro-v1:0",
+        provider="amazon-bedrock",
+        alias="bedrock/nova-pro",
+        context_window=300_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="amazon.nova-lite-v1:0",
+        provider="amazon-bedrock",
+        alias="bedrock/nova-lite",
+        context_window=300_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    # Cloudflare Workers AI
+    ModelConfig(
+        name="@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        provider="cloudflare-workers-ai",
+        alias="cloudflare/llama-3.3-70b",
+        context_window=128_000,
+    ),
+    ModelConfig(
+        name="@cf/qwen/qwen2.5-coder-32b-instruct",
+        provider="cloudflare-workers-ai",
+        alias="cloudflare/qwen2.5-coder",
+        context_window=128_000,
+    ),
+    ModelConfig(
+        name="@cf/meta/llama-4-scout-17b-16e-instruct",
+        provider="cloudflare-workers-ai",
+        alias="cloudflare/llama-4-scout",
+        context_window=128_000,
+    ),
+    # Cloudflare AI Gateway (OpenAI-compatible endpoint)
+    ModelConfig(
+        name="openai/gpt-4o",
+        provider="cloudflare-ai-gateway",
+        alias="cloudflare-gateway/gpt-4o",
+        context_window=128_000,
+        capabilities=ModelCapabilities(vision=True),
+    ),
 ]
 
 
@@ -1725,6 +1862,14 @@ class VibeConfig(BaseSettings):
                     pass
 
             if provider.oauth_token and not provider.oauth_token.is_expired(skew=60):
+                return self
+            if provider.ambient:
+                from vibe.core.ambient import ambient_setup, resolve_ambient
+
+                if resolve_ambient(provider.ambient) is None:
+                    raise MissingAmbientCredentialsError(
+                        provider.ambient, provider.name, ambient_setup(provider.ambient)
+                    )
                 return self
             api_key_env = provider.api_key_env_var
             if api_key_env and not os.getenv(api_key_env):

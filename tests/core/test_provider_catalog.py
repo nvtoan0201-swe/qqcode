@@ -18,8 +18,8 @@ def _providers_by_name(config: VibeConfig) -> dict[str, ProviderConfig]:
 def test_default_provider_catalog_matches_expected_count() -> None:
     config = VibeConfig()
 
-    assert len(config.providers) == len(DEFAULT_PROVIDERS) == 35
-    assert len({provider.name for provider in config.providers}) == 35
+    assert len(config.providers) == len(DEFAULT_PROVIDERS) == 39
+    assert len({provider.name for provider in config.providers}) == 39
 
 
 def test_default_providers_load_with_expected_env_var_and_style() -> None:

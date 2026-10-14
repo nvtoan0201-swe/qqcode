@@ -17,7 +17,7 @@ from vibe.core.config import (
 from vibe.core.oauth import get_flow
 from vibe.core.oauth.registry import UnknownOAuthFlowError
 
-AuthKind = Literal["oauth", "api_key"]
+AuthKind = Literal["oauth", "api_key", "ambient"]
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,7 @@ class ProviderAuth:
     subscription: bool = False
     env_var: str | None = None
     source: str | None = None
+    setup: str | None = None
 
     @property
     def configured(self) -> bool:
@@ -86,6 +87,20 @@ def provider_auths(config: VibeConfig, name: str) -> list[ProviderAuth]:
                 label="API key",
                 env_var=provider.api_key_env_var,
                 source=_api_key_source(provider.api_key_env_var),
+            )
+        )
+
+    if provider.ambient:
+        from vibe.core.ambient import ambient_setup, resolve_ambient
+
+        credential = resolve_ambient(provider.ambient)
+        auths.append(
+            ProviderAuth(
+                provider=provider.name,
+                kind="ambient",
+                label="ambient credentials",
+                source=credential.source if credential else None,
+                setup=ambient_setup(provider.ambient),
             )
         )
     return auths
