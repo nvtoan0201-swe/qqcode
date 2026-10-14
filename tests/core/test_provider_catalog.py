@@ -29,7 +29,7 @@ def test_default_providers_load_with_expected_env_var_and_style() -> None:
         "openai": ("OPENAI_API_KEY", "openai-responses"),
         "deepseek": ("DEEPSEEK_API_KEY", "openai"),
         "nvidia": ("NVIDIA_API_KEY", "openai"),
-        "google": ("GEMINI_API_KEY", "openai"),
+        "google": ("GEMINI_API_KEY", "google-generative-ai"),
         "github-copilot": ("COPILOT_GITHUB_TOKEN", "openai"),
         "groq": ("GROQ_API_KEY", "openai"),
         "cerebras": ("CEREBRAS_API_KEY", "openai"),

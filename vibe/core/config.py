@@ -697,8 +697,9 @@ DEFAULT_PROVIDERS = [
     ),
     ProviderConfig(
         name="google",
-        api_base="https://generativelanguage.googleapis.com/v1beta/openai",
+        api_base="https://generativelanguage.googleapis.com/v1beta",
         api_key_env_var="GEMINI_API_KEY",
+        api_style="google-generative-ai",
     ),
     ProviderConfig(
         name="github-copilot",
@@ -1022,7 +1023,7 @@ DEFAULT_MODELS = [
         context_window=128_000,
         capabilities=ModelCapabilities(reasoning=True),
     ),
-    # Google Gemini (OpenAI-compatible endpoint)
+    # Google Gemini (native generateContent API)
     ModelConfig(
         name="gemini-2.5-flash",
         provider="google",
@@ -1031,9 +1032,30 @@ DEFAULT_MODELS = [
         capabilities=ModelCapabilities(reasoning=True, vision=True),
     ),
     ModelConfig(
+        name="gemini-2.5-flash-lite",
+        provider="google",
+        alias="google/gemini-2.5-flash-lite",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gemini-2.5-pro",
+        provider="google",
+        alias="google/gemini-2.5-pro",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
         name="gemini-3-flash-preview",
         provider="google",
         alias="google/gemini-3-flash",
+        context_window=1_000_000,
+        capabilities=ModelCapabilities(reasoning=True, vision=True),
+    ),
+    ModelConfig(
+        name="gemini-3-pro-preview",
+        provider="google",
+        alias="google/gemini-3-pro",
         context_window=1_000_000,
         capabilities=ModelCapabilities(reasoning=True, vision=True),
     ),
