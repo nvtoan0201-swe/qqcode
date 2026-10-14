@@ -33,7 +33,7 @@ from vibe.core.utils import _retry_after_seconds, async_generator_retry, async_r
 
 if TYPE_CHECKING:
     from vibe.core.config import ModelConfig, ProviderConfig
-    from vibe.core.oauth.token import AnthropicOAuthToken, QwenOAuthToken
+    from vibe.core.oauth.token import OAuthToken
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +130,7 @@ class GenericBackend:
                 return
             await self._refresh_oauth_token(token)
 
-    async def _refresh_oauth_token(
-        self, token: AnthropicOAuthToken | QwenOAuthToken
-    ) -> None:
+    async def _refresh_oauth_token(self, token: OAuthToken) -> None:
         """Refresh the expired OAuth token through its registered flow."""
         try:
             flow = get_flow(self._provider.oauth_flow or self._provider.name)

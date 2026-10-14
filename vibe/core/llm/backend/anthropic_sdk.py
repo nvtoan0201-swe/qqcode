@@ -37,7 +37,7 @@ from vibe.core.types import (
 
 if TYPE_CHECKING:
     from vibe.core.config import ModelConfig, ProviderConfig
-    from vibe.core.oauth.token import AnthropicOAuthToken, QwenOAuthToken
+    from vibe.core.oauth.token import OAuthToken
 
 logger = logging.getLogger(__name__)
 
@@ -424,9 +424,7 @@ class AnthropicBackend:
             return os.getenv(self._provider.api_key_env_var)
         return None
 
-    async def _refresh_oauth_token(
-        self, token: AnthropicOAuthToken | QwenOAuthToken | None = None
-    ) -> None:
+    async def _refresh_oauth_token(self, token: OAuthToken | None = None) -> None:
         """Refresh the OAuth token if it's expired."""
         token = token or self._provider.oauth_token
         if token is None:

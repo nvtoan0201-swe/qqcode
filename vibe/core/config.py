@@ -25,7 +25,8 @@ from pydantic_settings import (
 )
 import tomli_w
 
-from vibe.core.oauth.token import AnthropicOAuthToken, QwenOAuthToken
+from vibe.core.oauth.registry import get_flow
+from vibe.core.oauth.token import OAuthToken
 from vibe.core.prompts import SystemPrompt
 from vibe.core.tools.base import BaseToolConfig, ToolExposure
 from vibe.core.trust import (
@@ -370,7 +371,7 @@ class ProviderConfig(BaseModel):
     api_style: str = "openai"
     oauth_flow: str = ""
     backend: Backend = Backend.GENERIC
-    oauth_token: AnthropicOAuthToken | QwenOAuthToken | None = None
+    oauth_token: OAuthToken | None = None
     extra_headers: dict[str, str] = Field(default_factory=dict)
     cache_retention: Literal["default", "none", "short", "long"] = "default"
     timeout: float | None = None
@@ -1629,21 +1630,10 @@ class VibeConfig(BaseSettings):
                 try:
                     import asyncio
 
-                    if provider.name == "qwen":
-                        from vibe.core.oauth.qwen import (
-                            refresh_token as qwen_refresh_token,
-                        )
-
-                        new_token = asyncio.run(
-                            qwen_refresh_token(provider.oauth_token.refresh_token)
-                        )
-                    else:
-                        from vibe.core.oauth.claude import refresh_token
-
-                        new_token = asyncio.run(
-                            refresh_token(provider.oauth_token.refresh_token)
-                        )
-
+                    flow = get_flow(provider.oauth_flow or provider.name)
+                    new_token = asyncio.run(
+                        flow.refresh(provider.oauth_token.refresh_token)
+                    )
                     provider.oauth_token = new_token
 
                     save_oauth_token(provider.name, new_token)
@@ -2032,9 +2022,7 @@ def _atomic_write_toml(path: Path, config: dict[str, Any]) -> None:
         raise
 
 
-def save_oauth_token(
-    provider_name: str, token: AnthropicOAuthToken | QwenOAuthToken
-) -> None:
+def save_oauth_token(provider_name: str, token: OAuthToken) -> None:
     """Save an OAuth token to the config file for a specific provider.
 
     Args:
