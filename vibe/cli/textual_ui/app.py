@@ -8,10 +8,12 @@ from pathlib import Path
 import subprocess
 from typing import Any, ClassVar, assert_never
 
+from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import BindingsMap, BindingType
 from textual.containers import Horizontal, VerticalScroll
 from textual.events import MouseUp
+from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import Static
 
@@ -39,6 +41,8 @@ from vibe.cli.textual_ui.widgets.history_message import (
 )
 from vibe.cli.textual_ui.widgets.loading import LoadingWidget
 from vibe.cli.textual_ui.widgets.login_screen import (
+    LoginDialogScreen,
+    LoginResult,
     LoginScreen,
     SecretScreen,
     SelectorEntry,
@@ -76,9 +80,16 @@ from vibe.core.auth import (
     save_api_key,
 )
 from vibe.core.autocompletion.path_prompt_adapter import render_path_prompt
-from vibe.core.config import HISTORY_FILE, ThinkingLevel, VibeConfig, get_vibe_home
+from vibe.core.config import (
+    HISTORY_FILE,
+    ThinkingLevel,
+    VibeConfig,
+    get_vibe_home,
+    save_oauth_token,
+)
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.mcp.manager import MCPManager
+from vibe.core.oauth import UnknownOAuthFlowError, get_flow
 from vibe.core.packages import package_resource_dirs
 from vibe.core.prompts.templates import load_templates, render_template
 from vibe.core.sessions.entries import MessageEntry
@@ -849,37 +860,43 @@ class VibeApp(App):
     async def _login_flow(self, user_input: str) -> None:
         name = self._command_argument(user_input)
         if name:
-            auths = provider_auths(self.config, name)
-            if not auths:
-                await self._mount_and_scroll(
-                    ErrorMessage(
-                        f"Unknown provider '{name}'. Run /login to list the "
-                        "configured providers.",
-                        collapsed=self._tools_collapsed,
-                    )
-                )
-                return
-            if len(auths) == 1:
-                await self._run_auth(auths[0])
-                return
-            chosen = await self.push_screen_wait(
-                LoginScreen(
-                    f"Select authentication method for {name}:",
-                    [
-                        SelectorEntry(
-                            label=auth.label,
-                            value=auth,
-                            detail=self._auth_detail(auth),
-                            configured=auth.configured,
-                        )
-                        for auth in auths
-                    ],
+            await self._login_named_provider(name)
+            return
+        await self._login_interactive()
+
+    async def _login_named_provider(self, name: str) -> None:
+        auths = provider_auths(self.config, name)
+        if not auths:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Unknown provider '{name}'. Run /login to list the "
+                    "configured providers.",
+                    collapsed=self._tools_collapsed,
                 )
             )
-            if isinstance(chosen, ProviderAuth):
-                await self._run_auth(chosen)
             return
+        if len(auths) == 1:
+            await self._run_auth(auths[0])
+            return
+        entries = [
+            SelectorEntry(
+                label=auth.label,
+                value=auth,
+                detail=self._auth_detail(auth),
+                configured=auth.configured,
+            )
+            for auth in auths
+        ]
+        while True:
+            chosen = await self.push_screen_wait(
+                LoginScreen(f"Select authentication method for {name}:", entries)
+            )
+            if not isinstance(chosen, ProviderAuth):
+                return
+            if not await self._run_auth(chosen):
+                return
 
+    async def _login_interactive(self) -> None:
         auths = all_provider_auths(self.config)
         if not auths:
             await self._mount_and_scroll(
@@ -919,25 +936,42 @@ class VibeApp(App):
             for auth in auths
             if auth.kind == kind
         ]
-        chosen = await self.push_screen_wait(LoginScreen("Select provider:", entries))
-        if isinstance(chosen, ProviderAuth):
-            await self._run_auth(chosen)
+        while True:
+            chosen = await self.push_screen_wait(
+                LoginScreen("Select provider:", entries)
+            )
+            if not isinstance(chosen, ProviderAuth):
+                return
+            if not await self._run_auth(chosen):
+                return
 
-    async def _run_auth(self, auth: ProviderAuth) -> None:
+    async def _run_auth(self, auth: ProviderAuth) -> bool:
+        """Run one login method; return whether the user cancelled (go back)."""
         provider = find_provider(self.config, auth.provider)
         if provider is None:
-            return
+            return False
 
         match auth.kind:
             case "oauth":
-                await self._run_oauth_login(provider.name)
+                result = await self._run_oauth_login(provider.name)
+                if result.success:
+                    await self._mount_and_scroll(
+                        UserCommandMessage(
+                            result.message or f"Signed in to {provider.name}."
+                        )
+                    )
+                elif not result.cancelled and result.message:
+                    await self._mount_and_scroll(
+                        ErrorMessage(result.message, collapsed=self._tools_collapsed)
+                    )
+                return result.cancelled
             case "api_key":
                 env_var = provider.api_key_env_var or "API key"
                 secret = await self.push_screen_wait(
                     SecretScreen(f"Enter {env_var} for {provider.name}", env_var)
                 )
                 if not secret:
-                    return
+                    return True
                 try:
                     path = save_api_key(provider, secret)
                 except (OSError, ValueError) as exc:
@@ -947,35 +981,54 @@ class VibeApp(App):
                             collapsed=self._tools_collapsed,
                         )
                     )
-                    return
+                    return False
                 await self._mount_and_scroll(
                     UserCommandMessage(
                         f"Saved {env_var} to {path}. New requests use it now."
                     )
                 )
+                return False
 
-    async def _run_oauth_login(self, provider_name: str) -> None:
-        from vibe.cli.login import login_provider
+    async def _run_oauth_login(self, provider_name: str) -> LoginResult:
+        try:
+            flow = get_flow(provider_name)
+        except UnknownOAuthFlowError as exc:
+            return LoginResult(
+                success=False, message=f"Login failed for {provider_name}: {exc}"
+            )
+
+        dialog = LoginDialogScreen(provider_name)
+        await self.push_screen(dialog)
+        try:
+            token = await flow.login(dialog)
+        except Exception as exc:
+            if dialog.cancelled:
+                return LoginResult(
+                    success=False, message="Login cancelled", cancelled=True
+                )
+            result = LoginResult(
+                success=False, message=f"Login failed for {provider_name}: {exc}"
+            )
+            await dialog.dismiss(result)
+            return result
+
+        if dialog.cancelled:
+            return LoginResult(success=False, message="Login cancelled", cancelled=True)
 
         try:
-            if self._driver is not None and self._driver.can_suspend:
-                with self.suspend():
-                    await asyncio.to_thread(login_provider, self.config, provider_name)
-            else:
-                await asyncio.to_thread(login_provider, self.config, provider_name)
+            save_oauth_token(provider_name, token)
         except Exception as exc:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Login failed for {provider_name}: {exc}",
-                    collapsed=self._tools_collapsed,
-                )
+            result = LoginResult(
+                success=False,
+                message=f"Failed to save credentials for {provider_name}: {exc}",
             )
-            return
+            await dialog.dismiss(result)
+            return result
 
+        result = LoginResult(success=True, message=f"Signed in to {provider_name}.")
+        await dialog.dismiss(result)
         await self._reload_config()
-        await self._mount_and_scroll(
-            UserCommandMessage(f"Signed in to {provider_name}.")
-        )
+        return result
 
     async def _logout_command(self, user_input: str = "") -> None:
         """``/logout [provider]``: remove stored credentials."""
@@ -2356,6 +2409,9 @@ class VibeApp(App):
             pass
 
     def action_interrupt(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            raise SkipAction
+
         if self._current_bottom_app == BottomApp.Config:
             try:
                 config_app = self.query_one(ConfigApp)
