@@ -237,11 +237,11 @@ class RadiusOAuthFlow:
             return await _login_browser(endpoint, interaction)
         raise DeviceFlowError(f"Unknown Radius sign-in method: {method}")
 
-    async def refresh(self, refresh_token: str) -> OAuthToken:
+    async def refresh(self, token: OAuthToken) -> OAuthToken:
         return await _request_token({
             "grant_type": "refresh_token",
             "client_id": OAUTH_CLIENT_ID,
-            "refresh_token": refresh_token,
+            "refresh_token": token.refresh_token,
         })
 
 

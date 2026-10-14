@@ -188,8 +188,8 @@ class GitHubCopilotOAuthFlow:
         await interaction.progress("Exchanging for a GitHub Copilot token...")
         return await _exchange_copilot_token(domain, github_token, enterprise)
 
-    async def refresh(self, refresh_token: str) -> OAuthToken:
-        return await _exchange_copilot_token(DEFAULT_DOMAIN, refresh_token, None)
+    async def refresh(self, token: OAuthToken) -> OAuthToken:
+        return await _exchange_copilot_token(DEFAULT_DOMAIN, token.refresh_token, None)
 
 
 register_flow(GitHubCopilotOAuthFlow())

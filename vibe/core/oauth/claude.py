@@ -8,7 +8,7 @@ import httpx
 from vibe.core.oauth.base import AuthInteraction
 from vibe.core.oauth.pkce import generate_pkce
 from vibe.core.oauth.registry import register_flow
-from vibe.core.oauth.token import AnthropicOAuthToken
+from vibe.core.oauth.token import AnthropicOAuthToken, OAuthToken
 
 # OAuth constants from Crush CLI implementation
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -185,8 +185,8 @@ class ClaudeOAuthFlow:
         await interaction.progress("Exchanging code for tokens...")
         return await exchange_token(code, verifier)
 
-    async def refresh(self, refresh_token: str) -> AnthropicOAuthToken:
-        return await _refresh_access_token(refresh_token)
+    async def refresh(self, token: OAuthToken) -> AnthropicOAuthToken:
+        return await _refresh_access_token(token.refresh_token)
 
 
 register_flow(ClaudeOAuthFlow())

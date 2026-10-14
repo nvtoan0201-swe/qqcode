@@ -21,11 +21,13 @@ class CountingFlow:
         self.calls = 0
         self.requested_names: list[str] = []
 
-    async def refresh(self, refresh_token: str) -> AnthropicOAuthToken:
+    async def refresh(self, token: OAuthToken) -> AnthropicOAuthToken:
         self.calls += 1
         await asyncio.sleep(0.02)
         return AnthropicOAuthToken.from_token_response(
-            access_token="new-access", refresh_token=refresh_token, expires_in=3600
+            access_token="new-access",
+            refresh_token=token.refresh_token,
+            expires_in=3600,
         )
 
 
@@ -33,7 +35,7 @@ class FailingFlow:
     name = FLOW_NAME
     is_subscription = True
 
-    async def refresh(self, refresh_token: str) -> AnthropicOAuthToken:
+    async def refresh(self, token: OAuthToken) -> AnthropicOAuthToken:
         raise ValueError("refresh failed")
 
 

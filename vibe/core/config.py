@@ -1653,9 +1653,7 @@ class VibeConfig(BaseSettings):
                     import asyncio
 
                     flow = get_flow(provider.oauth_flow or provider.name)
-                    new_token = asyncio.run(
-                        flow.refresh(provider.oauth_token.refresh_token)
-                    )
+                    new_token = asyncio.run(flow.refresh(provider.oauth_token))
                     provider.oauth_token = new_token
 
                     save_oauth_token(provider.name, new_token)

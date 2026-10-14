@@ -12,9 +12,17 @@ import respx
 
 from vibe.core.oauth.base import DeviceCodeInfo, SelectOption
 from vibe.core.oauth.callback_server import start_oauth_callback_server
+from vibe.core.oauth.device_code import DeviceFlowError
 from vibe.core.oauth.github_copilot import GitHubCopilotOAuthFlow
+from vibe.core.oauth.openai_chatgpt import (
+    DIRECT_TOKEN_SCOPE,
+    TOKEN_URL as CHATGPT_TOKEN_URL,
+    OpenAIChatGPTOAuthFlow,
+    _credentials,
+)
 from vibe.core.oauth.openai_codex import OpenAICodexOAuthFlow
 from vibe.core.oauth.openrouter import OpenRouterOAuthFlow
+from vibe.core.oauth.token import OAuthToken
 from vibe.core.oauth.xai import XaiOAuthFlow
 
 DEVICE_MIN_INTERVAL = "vibe.core.oauth.device_code.MINIMUM_INTERVAL_SECONDS"
@@ -279,3 +287,52 @@ async def test_callback_server_cancel_resolves_none() -> None:
         assert await server.wait() is None
     finally:
         await server.close()
+
+
+def _chatgpt_token_response(client_id: str) -> dict[str, object]:
+    return {
+        "access_token": "chatgpt-access",
+        "refresh_token": "chatgpt-refresh",
+        "expires_in": 3600,
+        "scope": f"openid {DIRECT_TOKEN_SCOPE}",
+    }
+
+
+def test_openai_chatgpt_login_persists_issued_client_id() -> None:
+    token = _credentials(_chatgpt_token_response("issued-client"), "issued-client")
+
+    assert token.metadata["client_id"] == "issued-client"
+    assert token.metadata["scopes"] == ["openid", DIRECT_TOKEN_SCOPE]
+
+
+@pytest.mark.asyncio
+async def test_openai_chatgpt_refresh_reuses_persisted_client_id() -> None:
+    token = OAuthToken.from_token_response(
+        "chatgpt-access",
+        "chatgpt-refresh",
+        3600,
+        metadata={"client_id": "issued-client"},
+    )
+
+    with respx.mock as mock:
+        route = mock.post(CHATGPT_TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200, json=_chatgpt_token_response("issued-client")
+            )
+        )
+        refreshed = await OpenAIChatGPTOAuthFlow().refresh(token)
+
+    request = route.calls[0].request
+    body = request.content.decode()
+    assert "grant_type=refresh_token" in body
+    assert "client_id=issued-client" in body
+    assert refreshed.access_token == "chatgpt-access"
+    assert refreshed.metadata["client_id"] == "issued-client"
+
+
+@pytest.mark.asyncio
+async def test_openai_chatgpt_refresh_requires_persisted_client_id() -> None:
+    token = OAuthToken.from_token_response("chatgpt-access", "chatgpt-refresh", 3600)
+
+    with pytest.raises(DeviceFlowError, match="client ID"):
+        await OpenAIChatGPTOAuthFlow().refresh(token)

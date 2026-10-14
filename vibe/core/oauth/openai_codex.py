@@ -308,8 +308,8 @@ class OpenAICodexOAuthFlow:
             return await _login_browser(interaction)
         raise DeviceFlowError(f"Unknown OpenAI Codex login method: {method}")
 
-    async def refresh(self, refresh_token: str) -> OAuthToken:
-        return await _refresh(refresh_token)
+    async def refresh(self, token: OAuthToken) -> OAuthToken:
+        return await _refresh(token.refresh_token)
 
 
 register_flow(OpenAICodexOAuthFlow())

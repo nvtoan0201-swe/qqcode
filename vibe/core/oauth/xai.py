@@ -187,8 +187,8 @@ class XaiOAuthFlow:
         await interaction.show_device_code(device.info)
         return await _poll_for_tokens(device, interaction.cancel_event)
 
-    async def refresh(self, refresh_token: str) -> OAuthToken:
-        return await _refresh(refresh_token)
+    async def refresh(self, token: OAuthToken) -> OAuthToken:
+        return await _refresh(token.refresh_token)
 
 
 register_flow(XaiOAuthFlow())

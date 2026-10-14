@@ -108,7 +108,7 @@ class OpenRouterOAuthFlow:
         finally:
             await callback.close()
 
-    async def refresh(self, refresh_token: str) -> OAuthToken:
+    async def refresh(self, token: OAuthToken) -> OAuthToken:
         raise DeviceFlowError(
             "OpenRouter credentials do not expire; sign in again if rejected"
         )

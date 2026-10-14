@@ -127,6 +127,21 @@ async def _exchange(code: str, verifier: str, client_id: str) -> OAuthToken:
     return _credentials(data, client_id)
 
 
+async def _refresh(token: OAuthToken) -> OAuthToken:
+    client_id = token.metadata.get("client_id")
+    if not isinstance(client_id, str) or not client_id.strip():
+        raise DeviceFlowError(
+            "Stored ChatGPT OAuth token has no issued client ID; sign in again"
+        )
+    data = await _request_token({
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "refresh_token": token.refresh_token,
+        "resource": RESOURCE,
+    })
+    return _credentials(data, client_id)
+
+
 async def _start_callback(
     state: str, cancel_event: Any
 ) -> OAuthCallbackServer[_Authorization] | None:
@@ -200,10 +215,8 @@ class OpenAIChatGPTOAuthFlow:
             if callback is not None:
                 await callback.close()
 
-    async def refresh(self, refresh_token: str) -> OAuthToken:
-        raise DeviceFlowError(
-            "ChatGPT OAuth refresh needs the issued client ID; sign in again"
-        )
+    async def refresh(self, token: OAuthToken) -> OAuthToken:
+        return await _refresh(token)
 
 
 register_flow(OpenAIChatGPTOAuthFlow())

@@ -268,9 +268,11 @@ class _RegistryRefreshFlow:
     async def login(self, interaction: object) -> OAuthToken:
         raise NotImplementedError
 
-    async def refresh(self, refresh_token: str) -> AnthropicOAuthToken:
+    async def refresh(self, token: OAuthToken) -> AnthropicOAuthToken:
         self.calls += 1
-        return AnthropicOAuthToken.from_token_response("fresh", refresh_token, 3600)
+        return AnthropicOAuthToken.from_token_response(
+            "fresh", token.refresh_token, 3600
+        )
 
 
 def test_check_api_key_refreshes_via_registry(monkeypatch: pytest.MonkeyPatch) -> None:

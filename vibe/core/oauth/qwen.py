@@ -12,7 +12,7 @@ import httpx
 from vibe.core.oauth.base import AuthInteraction, DeviceCodeInfo
 from vibe.core.oauth.pkce import generate_pkce
 from vibe.core.oauth.registry import register_flow
-from vibe.core.oauth.token import QwenOAuthToken
+from vibe.core.oauth.token import OAuthToken, QwenOAuthToken
 
 # Qwen OAuth constants
 CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
@@ -352,8 +352,8 @@ class QwenOAuthFlow:
             cancel_check=lambda: interaction.cancelled,
         )
 
-    async def refresh(self, refresh_token: str) -> QwenOAuthToken:
-        return await _refresh_access_token(refresh_token)
+    async def refresh(self, token: OAuthToken) -> QwenOAuthToken:
+        return await _refresh_access_token(token.refresh_token)
 
 
 register_flow(QwenOAuthFlow())

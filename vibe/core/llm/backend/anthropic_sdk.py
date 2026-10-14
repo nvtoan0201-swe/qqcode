@@ -432,7 +432,7 @@ class AnthropicBackend:
 
         try:
             flow = get_flow(self._provider.oauth_flow or self._provider.name)
-            new_token = await flow.refresh(token.refresh_token)
+            new_token = await flow.refresh(token)
             # Update in-memory token
             self._provider.oauth_token = new_token
             # Persist to config

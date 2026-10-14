@@ -65,7 +65,7 @@ class FakeOAuthFlow:
         finally:
             self.observed_cancel = interaction.cancelled
 
-    async def refresh(self, refresh_token: str) -> OAuthToken:
+    async def refresh(self, token: OAuthToken) -> OAuthToken:
         raise NotImplementedError
 
 

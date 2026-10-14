@@ -198,8 +198,8 @@ class KimiCodingOAuthFlow:
         await interaction.show_device_code(device.info)
         return await _poll_for_token(host, device, interaction.cancel_event)
 
-    async def refresh(self, refresh_token: str) -> OAuthToken:
-        return await _refresh(_oauth_host(), refresh_token, asyncio.Event())
+    async def refresh(self, token: OAuthToken) -> OAuthToken:
+        return await _refresh(_oauth_host(), token.refresh_token, asyncio.Event())
 
 
 register_flow(KimiCodingOAuthFlow())
