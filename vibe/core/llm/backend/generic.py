@@ -17,7 +17,9 @@ from vibe.core.llm.backend.adapters import (
     BACKEND_ADAPTERS,
     AnthropicAdapter,
     APIAdapter,
+    BedrockConverseAdapter,
     GoogleGenerativeAIAdapter,
+    GoogleVertexAdapter,
     OpenAIAdapter,
     OpenAICodexResponsesAdapter,
     OpenAIResponsesAdapter,
@@ -61,8 +63,10 @@ __all__ = [
     "BACKEND_ADAPTERS",
     "APIAdapter",
     "AnthropicAdapter",
+    "BedrockConverseAdapter",
     "GenericBackend",
     "GoogleGenerativeAIAdapter",
+    "GoogleVertexAdapter",
     "OpenAIAdapter",
     "OpenAICodexResponsesAdapter",
     "OpenAIResponsesAdapter",
@@ -174,6 +178,17 @@ class GenericBackend:
             oauth = self._provider.oauth_token
             if oauth and not oauth.is_expired(skew=60):
                 return self._oauth_auth_info(oauth.access_token)
+
+        if self._provider.ambient:
+            from vibe.core.ambient import resolve_ambient_auth
+
+            credential = await resolve_ambient_auth(self._provider.ambient)
+            if credential is not None:
+                return (
+                    credential.api_key,
+                    dict(credential.headers),
+                    credential.api_base,
+                )
 
         # Fall back to API key from env var
         api_key = (
@@ -383,6 +398,20 @@ class GenericBackend:
 
         api_style = model.api_style or self._provider.api_style
         adapter = get_adapter(api_style)
+
+        if getattr(adapter, "non_streaming_only", False):
+            yield await self.complete(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                tools=tools,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+                extra_headers=extra_headers,
+                cache_plan=cache_plan,
+                thinking_level=thinking_level,
+            )
+            return
 
         extra_body = getattr(model, "extra_body", None) or None
         if not model.capabilities.tools:

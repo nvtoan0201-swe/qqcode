@@ -14,9 +14,11 @@ from vibe.core.llm.backend.adapters.base import (
     get_adapter,
     register_adapter,
 )
+from vibe.core.llm.backend.adapters.bedrock_converse import BedrockConverseAdapter
 from vibe.core.llm.backend.adapters.google_generative_ai import (
     GoogleGenerativeAIAdapter,
 )
+from vibe.core.llm.backend.adapters.google_vertex import GoogleVertexAdapter
 from vibe.core.llm.backend.adapters.openai_chat import OpenAIAdapter
 from vibe.core.llm.backend.adapters.openai_codex_responses import (
     OpenAICodexResponsesAdapter,
@@ -29,7 +31,9 @@ __all__ = [
     "BACKEND_ADAPTERS",
     "APIAdapter",
     "AnthropicAdapter",
+    "BedrockConverseAdapter",
     "GoogleGenerativeAIAdapter",
+    "GoogleVertexAdapter",
     "OpenAIAdapter",
     "OpenAICodexResponsesAdapter",
     "OpenAIResponsesAdapter",
