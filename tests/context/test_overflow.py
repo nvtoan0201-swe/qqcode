@@ -45,6 +45,13 @@ def make_http_status_error(status: int, body: str) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError("request failed", request=request, response=response)
 
 
+def make_streaming_http_status_error(status: int, body: bytes) -> httpx.HTTPStatusError:
+    """An HTTP error whose response stream was never read (as in streaming)."""
+    request = httpx.Request("POST", "https://example.test/chat")
+    response = httpx.Response(status, request=request, stream=httpx.ByteStream(body))
+    return httpx.HTTPStatusError("request failed", request=request, response=response)
+
+
 def make_agent(backend: FakeBackend) -> Agent:
     model = ModelConfig(
         name="test-model",
@@ -93,6 +100,20 @@ def test_backend_error_without_pattern_is_not_overflow() -> None:
 def test_http_status_error_uses_response_body() -> None:
     assert is_context_overflow(make_http_status_error(413, "prompt is too long"))
     assert not is_context_overflow(make_http_status_error(400, "invalid schema"))
+
+
+def test_streaming_http_status_error_does_not_raise() -> None:
+    """An unread SSE response must not crash classification (Regression)."""
+    error = make_streaming_http_status_error(
+        413, b'{"error": {"message": "prompt is too long"}}'
+    )
+
+    # The body is unavailable while the stream is unread, but classifying the
+    # error must not raise httpx.ResponseNotRead.
+    assert is_context_overflow(error) is False
+    assert not is_context_overflow(
+        make_streaming_http_status_error(429, b'{"error": "rate limited"}')
+    )
 
 
 def test_plain_runtime_error_is_classified_by_text() -> None:

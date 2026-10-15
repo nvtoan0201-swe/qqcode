@@ -45,7 +45,11 @@ def _error_text(error: BaseException) -> str:
         if isinstance(value, str):
             parts.append(value)
     if isinstance(error, httpx.HTTPStatusError):
-        parts.append(error.response.text)
+        try:
+            parts.append(error.response.text)
+        except httpx.ResponseNotRead:
+            # Streaming responses must be read before their body is available.
+            pass
     return " ".join(parts).lower()
 
 

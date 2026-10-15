@@ -12,6 +12,7 @@ the tests will be. Always prefer real API data over manually constructed example
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 import json
@@ -540,6 +541,49 @@ def _status_error(headers: dict[str, str]) -> httpx.HTTPStatusError:
     request = httpx.Request("POST", "https://example.com/v1/chat/completions")
     response = httpx.Response(429, headers=headers, request=request)
     return httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+
+class _StreamingBody(httpx.AsyncByteStream):
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._payload
+
+
+@pytest.mark.asyncio
+async def test_streaming_error_reports_the_provider_body() -> None:
+    """A failed stream must surface the provider error body, not drop it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            headers={"content-type": "application/json"},
+            stream=_StreamingBody(b'{"error": {"message": "context length exceeded"}}'),
+        )
+
+    backend = GenericBackend(
+        provider=ProviderConfig(
+            name="provider_name",
+            api_base="https://example.test/v1",
+            api_key_env_var="API_KEY",
+        ),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    model = ModelConfig(
+        name="model_name", provider="provider_name", alias="model_alias"
+    )
+
+    with pytest.raises(BackendError) as excinfo:
+        async for _ in backend.complete_streaming(
+            model=model, messages=[LLMMessage(role=Role.user, content="hi")]
+        ):
+            pass
+
+    error = excinfo.value
+    assert error.status == 400
+    assert error.body_text is not None
+    assert error.parsed_error == "context length exceeded"
 
 
 SIMPLE_JSON_RESPONSE = {

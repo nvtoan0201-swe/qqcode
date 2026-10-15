@@ -493,6 +493,10 @@ class GenericBackend:
         async with client.stream(
             method="POST", url=url, content=data, headers=headers
         ) as response:
+            if response.is_error:
+                # Read the body so error reporting can include the provider
+                # message; httpx forbids reading it after the stream closes.
+                await response.aread()
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if line.strip() == "":
