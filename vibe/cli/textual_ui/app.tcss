@@ -501,6 +501,15 @@ WelcomeBanner {
     height: auto;
 }
 
+#config-list,
+#scoped-models-list,
+#conversations-list,
+#fork-list {
+    width: 100%;
+    height: auto;
+    max-height: 18;
+}
+
 .settings-title {
     height: auto;
     text-style: bold;
@@ -862,9 +871,72 @@ TrustScreen {
     margin: 0 1;
 }
 
-LoginScreen, SecretScreen, LoginDialogScreen {
+LoginScreen, SecretScreen, LoginDialogScreen, ModelSelectorScreen {
     align: center middle;
     background: $background 60%;
+}
+
+.model-dialog {
+    width: 76;
+    height: auto;
+    max-height: 80%;
+    background: $surface;
+    border: round $primary;
+    padding: 1 2;
+}
+
+.model-title {
+    width: 100%;
+    height: auto;
+    text-style: bold;
+    color: $primary;
+}
+
+.model-hint {
+    width: 100%;
+    height: auto;
+    margin: 1 0 0 0;
+    color: $warning;
+}
+
+.model-search {
+    width: 100%;
+    margin: 1 0 0 0;
+    border: none;
+    background: $surface;
+}
+
+.model-list {
+    width: 100%;
+    height: auto;
+    max-height: 16;
+    margin: 1 0;
+}
+
+.model-option {
+    width: 100%;
+    height: auto;
+    color: $foreground;
+}
+
+.model-option-current {
+    color: $text-success;
+}
+
+.model-option-selected {
+    color: $primary;
+    text-style: bold;
+}
+
+.model-empty {
+    width: 100%;
+    color: $foreground 50%;
+}
+
+.model-help {
+    width: 100%;
+    height: auto;
+    color: $foreground 50%;
 }
 
 .login-dialog {

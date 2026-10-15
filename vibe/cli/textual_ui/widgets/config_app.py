@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, ClassVar, TypedDict
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container, Vertical
+from textual.containers import Container, Vertical, VerticalScroll
 from textual.message import Message
 from textual.theme import BUILTIN_THEMES
 from textual.widgets import Static
@@ -102,10 +102,11 @@ class ConfigApp(Container):
 
             yield Static("")
 
-            for _ in self.settings:
-                widget = Static("", classes="settings-option")
-                self.setting_widgets.append(widget)
-                yield widget
+            with VerticalScroll(id="config-list"):
+                for _ in self.settings:
+                    widget = Static("", classes="settings-option")
+                    self.setting_widgets.append(widget)
+                    yield widget
 
             yield Static("")
 
@@ -196,6 +197,7 @@ class ConfigApp(Container):
             self.post_message(self.SettingChanged(key="active_model", value=new_model))
 
     def _update_display(self) -> None:
+        selected_widget: Static | None = None
         for i, (setting, widget) in enumerate(
             zip(self.settings, self.setting_widgets, strict=True)
         ):
@@ -215,8 +217,12 @@ class ConfigApp(Container):
 
             if is_selected:
                 widget.add_class("settings-value-cycle-selected")
+                selected_widget = widget
             else:
                 widget.add_class("settings-value-cycle-unselected")
+
+        if selected_widget is not None:
+            selected_widget.scroll_visible(animate=False)
 
     def action_move_up(self) -> None:
         self.selected_index = (self.selected_index - 1) % len(self.settings)
@@ -300,10 +306,11 @@ class ScopedModelsApp(Container):
 
             yield Static("")
 
-            for _ in self.aliases:
-                widget = Static("", classes="settings-option")
-                self.model_widgets.append(widget)
-                yield widget
+            with VerticalScroll(id="scoped-models-list"):
+                for _ in self.aliases:
+                    widget = Static("", classes="settings-option")
+                    self.model_widgets.append(widget)
+                    yield widget
 
             yield Static("")
 
@@ -318,6 +325,7 @@ class ScopedModelsApp(Container):
         self.focus()
 
     def _update_display(self) -> None:
+        selected_widget: Static | None = None
         for i, (alias, widget) in enumerate(
             zip(self.aliases, self.model_widgets, strict=True)
         ):
@@ -328,8 +336,12 @@ class ScopedModelsApp(Container):
             widget.remove_class("settings-value-cycle-unselected")
             if i == self.selected_index:
                 widget.add_class("settings-value-cycle-selected")
+                selected_widget = widget
             else:
                 widget.add_class("settings-value-cycle-unselected")
+
+        if selected_widget is not None:
+            selected_widget.scroll_visible(animate=False)
 
     def _scopes(self) -> list[str]:
         if len(self.selected) == len(self.aliases):

@@ -56,6 +56,7 @@ from vibe.cli.textual_ui.widgets.messages import (
     UserMessage,
 )
 from vibe.cli.textual_ui.widgets.mode_indicator import ModeIndicator
+from vibe.cli.textual_ui.widgets.model_selector import ModelSelectorScreen
 from vibe.cli.textual_ui.widgets.path_display import PathDisplay
 from vibe.cli.textual_ui.widgets.plan_approval import PlanApprovalWidget
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
@@ -75,6 +76,7 @@ from vibe.core.auth import (
     AuthKind,
     ProviderAuth,
     all_provider_auths,
+    configured_provider_names,
     find_provider,
     logout,
     provider_auths,
@@ -1696,7 +1698,33 @@ class VibeApp(App):
         if len(parts) > 1 and (alias := parts[1].strip()):
             await self._set_model_alias(alias)
             return
-        await self._switch_to_config_app(focus_key="active_model")
+        # ``push_screen_wait`` needs a worker, like the login flow.
+        self.run_worker(
+            self._open_model_selector(), exclusive=False, group="model-selector"
+        )
+
+    async def _open_model_selector(self) -> None:
+        """Open the model picker listing the signed-in providers' models."""
+        if self._current_bottom_app != BottomApp.Input:
+            await self._switch_to_input_app()
+
+        configured = configured_provider_names(self.config)
+        models = [
+            model
+            for model in self.config.models_in_scope()
+            if model.provider in configured
+        ]
+        hint = None
+        if not models:
+            hint = (
+                "Only models from providers you are signed in to are listed. "
+                "Run /login to add a provider."
+            )
+        chosen = await self.push_screen_wait(
+            ModelSelectorScreen(models, self.config.active_model, hint=hint)
+        )
+        if isinstance(chosen, str) and chosen:
+            await self._set_model_alias(chosen)
 
     async def _show_scoped_models(self) -> None:
         await self._switch_to_scoped_models_app()

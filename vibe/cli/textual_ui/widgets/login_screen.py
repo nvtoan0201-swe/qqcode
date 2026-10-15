@@ -98,11 +98,16 @@ class LoginScreen(ModalScreen[Any]):
     def _update_display(self) -> None:
         visible = {id(entry) for entry in self.filtered}
         selected = self.filtered[self.selected_index] if self.filtered else None
+        selected_widget: Static | None = None
         for entry, widget in self.rows:
             is_selected = entry is selected
             widget.display = id(entry) in visible
             widget.update(self._format_entry(entry, selected=is_selected))
             widget.set_class(is_selected, SELECTED_CLASS)
+            if is_selected:
+                selected_widget = widget
+        if selected_widget is not None:
+            selected_widget.scroll_visible(animate=False)
         self.query_one(f".{EMPTY_CLASS}", Static).display = not self.filtered
 
     @staticmethod

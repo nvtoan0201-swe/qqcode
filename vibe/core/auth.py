@@ -120,6 +120,30 @@ def all_provider_auths(
     return [auth for auth in auths if auth.kind == kind]
 
 
+def provider_is_configured(config: VibeConfig, name: str) -> bool:
+    """Whether ``name`` has usable credentials.
+
+    Providers that declare no authentication (for example a local model
+    server) are always usable without credentials. Unknown providers are
+    never configured.
+    """
+    if find_provider(config, name) is None:
+        return False
+    auths = provider_auths(config, name)
+    if not auths:
+        return True
+    return any(auth.configured for auth in auths)
+
+
+def configured_provider_names(config: VibeConfig) -> set[str]:
+    """Names of the providers the user can currently send requests to."""
+    return {
+        provider.name
+        for provider in config.providers
+        if provider_is_configured(config, provider.name)
+    }
+
+
 def save_api_key(provider: ProviderConfig, key: str) -> Path:
     """Store an API key in the global ``.env`` file and the current process.
 

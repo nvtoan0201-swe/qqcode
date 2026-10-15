@@ -7,7 +7,7 @@ from typing import Any, ClassVar
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container, Vertical
+from textual.containers import Container, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Static
 
@@ -73,13 +73,16 @@ class ConversationsApp(Container):
 
             yield Static("")
 
-            if not self.sessions:
-                yield Static("  No past sessions found.", classes="conversations-empty")
-            else:
-                for _ in self.sessions:
-                    widget = Static("", classes="conversations-option")
-                    self.session_widgets.append(widget)
-                    yield widget
+            with VerticalScroll(id="conversations-list"):
+                if not self.sessions:
+                    yield Static(
+                        "  No past sessions found.", classes="conversations-empty"
+                    )
+                else:
+                    for _ in self.sessions:
+                        widget = Static("", classes="conversations-option")
+                        self.session_widgets.append(widget)
+                        yield widget
 
             yield Static("")
 
@@ -94,6 +97,7 @@ class ConversationsApp(Container):
 
     def _update_display(self) -> None:
         """Update the display of all session entries."""
+        selected_widget: Static | None = None
         for i, (widget, (_filepath, summary)) in enumerate(
             zip(self.session_widgets, self.sessions, strict=True)
         ):
@@ -116,8 +120,12 @@ class ConversationsApp(Container):
 
             if is_selected:
                 widget.add_class("conversations-selected")
+                selected_widget = widget
             else:
                 widget.add_class("conversations-unselected")
+
+        if selected_widget is not None:
+            selected_widget.scroll_visible(animate=False)
 
     def action_move_up(self) -> None:
         if not self.sessions:
@@ -182,15 +190,17 @@ class ForkApp(Container):
 
             yield Static("")
 
-            if not self.messages:
-                yield Static(
-                    "  No user messages to fork from.", classes="conversations-empty"
-                )
-            else:
-                for _ in self.messages:
-                    widget = Static("", classes="conversations-option")
-                    self.message_widgets.append(widget)
-                    yield widget
+            with VerticalScroll(id="fork-list"):
+                if not self.messages:
+                    yield Static(
+                        "  No user messages to fork from.",
+                        classes="conversations-empty",
+                    )
+                else:
+                    for _ in self.messages:
+                        widget = Static("", classes="conversations-option")
+                        self.message_widgets.append(widget)
+                        yield widget
 
             yield Static("")
 
@@ -204,6 +214,7 @@ class ForkApp(Container):
         self.focus()
 
     def _update_display(self) -> None:
+        selected_widget: Static | None = None
         for i, (widget, (_entry_id, preview)) in enumerate(
             zip(self.message_widgets, self.messages, strict=True)
         ):
@@ -213,8 +224,12 @@ class ForkApp(Container):
             widget.remove_class("conversations-unselected")
             if i == self.selected_index:
                 widget.add_class("conversations-selected")
+                selected_widget = widget
             else:
                 widget.add_class("conversations-unselected")
+
+        if selected_widget is not None:
+            selected_widget.scroll_visible(animate=False)
 
     def action_move_up(self) -> None:
         if not self.messages:
