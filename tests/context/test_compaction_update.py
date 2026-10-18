@@ -35,12 +35,13 @@ def make_agent(
 
 
 def add_history(agent: Agent) -> None:
-    agent.messages.extend([
+    for message in [
         LLMMessage(role=Role.user, content="old question " * 80),
         LLMMessage(role=Role.assistant, content="old answer " * 80),
         LLMMessage(role=Role.user, content="recent question " * 20),
         LLMMessage(role=Role.assistant, content="recent answer " * 20),
-    ])
+    ]:
+        agent.add_message(message)
 
 
 @pytest.mark.asyncio

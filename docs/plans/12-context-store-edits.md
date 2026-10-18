@@ -124,11 +124,11 @@ class ContextBuilder:
 
 ## 6. DoD
 
-- [ ] `Agent` không còn giữ list messages biến đổi làm nguồn sự thật; context derive từ entry log (grep không còn gán trực tiếp `self._messages = [...]`).
-- [ ] `/clear` không mất log: resume được, stats/cost giữ nguyên.
-- [ ] `omit`/`replace` thay đổi context nhưng file `.jsonl` không bị ghi đè.
-- [ ] Delta read: số entry replay mỗi turn độc lập với độ dài hội thoại (test 200 entry).
-- [ ] Session `.json` legacy và `.jsonl` hiện có đọc ra cùng context như trước; `ruff`, `pyright`, `pytest` xanh.
+- [x] `Agent` không còn giữ list messages biến đổi làm nguồn sự thật; context derive từ entry log (grep không còn gán trực tiếp `self._messages = [...]`).
+- [x] `/clear` không mất log: resume được, stats/cost giữ nguyên.
+- [x] `omit`/`replace` thay đổi context nhưng file `.jsonl` không bị ghi đè.
+- [x] Delta read: số entry replay mỗi turn độc lập với độ dài hội thoại (test 200 entry).
+- [x] Session `.json` legacy và `.jsonl` hiện có đọc ra cùng context như trước; `ruff`, `pyright`, `pytest` xanh.
 
 ## 7. Rủi ro & rollback
 

@@ -27,7 +27,7 @@ from vibe.core.types import AgentStats, LLMMessage, Role
 from vibe.core.utils import logger
 
 JSONL_SUFFIX = ".jsonl"
-SUMMARY_TAG = "conversation_summary"
+_NO_SYSTEM_MESSAGE = LLMMessage(role=Role.system, content="")
 
 
 class SessionEntryNotFoundError(LookupError):
@@ -75,6 +75,12 @@ class SessionView:
     truncated_at: int | None = None
 
     def messages(self, *, include_compacted: bool = False) -> list[LLMMessage]:
+        """Return the messages of the current context, without the system prompt.
+
+        Head markers, compactions and context edits are applied, so the result
+        matches what the model would see if the session continued. With
+        ``include_compacted`` every stored message is returned instead.
+        """
         if include_compacted:
             return [
                 entry.message
@@ -82,38 +88,11 @@ class SessionView:
                 if isinstance(entry, MessageEntry)
             ]
 
-        messages: list[LLMMessage] = []
-        entry_ids: list[str | None] = []
-        for entry in self.entries:
-            if isinstance(entry, CompactionEntry):
-                if entry.first_kept_id is None:
-                    messages = []
-                    entry_ids = []
-                else:
-                    index = next(
-                        (
-                            position
-                            for position, entry_id in enumerate(entry_ids)
-                            if entry_id == entry.first_kept_id
-                        ),
-                        None,
-                    )
-                    if index is None:
-                        messages = []
-                        entry_ids = []
-                    else:
-                        messages = messages[index:]
-                        entry_ids = entry_ids[index:]
-                summary = LLMMessage(
-                    role=Role.user,
-                    content=f"<{SUMMARY_TAG}>\n{entry.summary}\n</{SUMMARY_TAG}>",
-                )
-                messages.insert(0, summary)
-                entry_ids.insert(0, None)
-            elif isinstance(entry, MessageEntry):
-                messages.append(entry.message)
-                entry_ids.append(entry.id)
-        return messages
+        # context.builder imports the entry models from this package, so the
+        # import is deferred to avoid a cycle at module load.
+        from vibe.core.context.builder import ContextBuilder
+
+        return ContextBuilder(_NO_SYSTEM_MESSAGE).build(self.entries).messages[1:]
 
     def stats(self) -> AgentStats:
         stats = AgentStats()
@@ -169,6 +148,21 @@ class RepairResult:
     kept_entries: int
     removed_bytes: int
     backup_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class SessionTail:
+    """Entries written after a known entry, read back from a session file."""
+
+    entries: list[SessionEntry]
+    anchor_found: bool
+
+
+def _matches_entry(line: bytes, entry_id: str) -> bool:
+    try:
+        return parse_entry(line).id == entry_id
+    except ValueError:
+        return False
 
 
 class SessionStore(Protocol):
@@ -268,6 +262,41 @@ class JsonlSessionStore:
                 id=f"corrupt-{path.stem}", timestamp=now_iso(), cwd=""
             )
         return SessionView(header=header, entries=entries, truncated_at=truncated_at)
+
+    def read_since(self, path: Path, after_entry_id: str | None) -> SessionTail:
+        """Return the entries appended after ``after_entry_id``.
+
+        ``None`` returns every entry. When the anchor is missing, for example
+        because the file was rewritten or repaired, ``anchor_found`` is false
+        and no entries are returned, so the caller keeps what it already has.
+        Lines before the anchor are only scanned, not parsed.
+        """
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return SessionTail(entries=[], anchor_found=after_entry_id is None)
+
+        anchored = after_entry_id is None
+        needle = b"" if after_entry_id is None else f'"id":"{after_entry_id}"'.encode()
+        entries: list[SessionEntry] = []
+        for line in data.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not anchored:
+                anchored = (
+                    after_entry_id is not None
+                    and needle in stripped
+                    and _matches_entry(stripped, after_entry_id)
+                )
+                continue
+            try:
+                entry = parse_entry(stripped)
+            except ValueError:
+                break
+            if not isinstance(entry, SessionHeader):
+                entries.append(entry)
+        return SessionTail(entries=entries, anchor_found=anchored)
 
     def list(
         self, *, workdir: Path | None = None, limit: int = 20
@@ -372,7 +401,7 @@ class JsonlSessionStore:
             return None
 
         view = self.read(path)
-        messages = view.messages()
+        messages = view.messages(include_compacted=True)
         last_user_message = next(
             (
                 message.content or ""

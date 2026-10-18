@@ -14,6 +14,7 @@ from vibe.core.hooks.events import (
 from vibe.core.llm.cache import CachePlan
 from vibe.core.middleware import ResetReason
 from vibe.core.prompts import UtilityPrompt
+from vibe.core.sessions.entries import CompactionEntry, new_entry_id, now_iso
 from vibe.core.types import LLMMessage, LLMUsage, Role
 
 if TYPE_CHECKING:
@@ -149,43 +150,59 @@ class Compactor:
             return summary
         return f"{summary}\n\nLast request from user was: {last_user_message}"
 
+    def _estimate_messages(self, messages: list[LLMMessage]) -> int:
+        agent = self._agent
+        tools = agent.format_handler.get_available_tools(
+            agent.tool_manager, agent.config
+        )
+        return estimate_context_tokens(messages, tools, None, -1)
+
     async def _install_summary(
         self,
-        system_message: LLMMessage,
-        conversation: list[LLMMessage],
         summary: str,
+        kept: list[LLMMessage],
         cut_index: int,
         *,
         cut: CutResult,
+        first_kept_id: str | None,
         tokens_before: int,
         usage: LLMUsage | None,
         is_update: bool,
     ) -> CompactionResult:
         agent = self._agent
-        first_kept_id = (
-            agent._recorder.entry_id_for(conversation[cut_index])
-            if cut_index < len(conversation)
-            else None
-        )
         summary_message = LLMMessage(
             role=Role.user, content=f"<{SUMMARY_TAG}>\n{summary}\n</{SUMMARY_TAG}>"
         )
-        agent.messages = [system_message, summary_message, *conversation[cut_index:]]
+        tokens_after = self._estimate_messages([
+            agent._system_message,
+            summary_message,
+            *kept,
+        ])
+        agent._append_entry(
+            CompactionEntry(
+                id=new_entry_id(),
+                parent_id=agent._last_entry_id(),
+                timestamp=now_iso(),
+                first_kept_id=first_kept_id,
+                summary=summary,
+                tokens_before=tokens_before,
+                tokens_after=tokens_after,
+                is_update=is_update,
+            )
+        )
         agent._last_usage = None
         agent.stats.last_usage_message_index = -1
         agent._refresh_context_stats()
         agent.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
 
-        result = CompactionResult(
+        return CompactionResult(
             summary=summary,
             cut=CutResult(first_kept_index=cut_index, is_split_turn=cut.is_split_turn),
             tokens_before=tokens_before,
-            tokens_after_estimate=agent.stats.context_tokens,
+            tokens_after_estimate=tokens_after,
             usage=usage,
             is_update=is_update,
         )
-        agent._recorder.on_compaction(result, first_kept_id)
-        return result
 
     @staticmethod
     def _summary_override(decision: HookDecision) -> str | None:
@@ -249,7 +266,6 @@ class Compactor:
         agent._clean_message_history()
         await agent._recorder.flush()
 
-        system_message = agent.messages[0]
         conversation = agent.messages[1:]
         if not conversation:
             return self._skipped_result(tokens_before)
@@ -260,6 +276,9 @@ class Compactor:
         if not prefix:
             prefix = conversation
             cut_index = len(conversation)
+        first_kept_id = (
+            agent._entry_id_at(cut_index + 1) if cut_index < len(conversation) else None
+        )
 
         previous_summary = self._previous_summary or find_previous_summary(conversation)
         use_update = (
@@ -277,11 +296,11 @@ class Compactor:
         )
 
         result = await self._install_summary(
-            system_message,
-            conversation,
             summary,
+            conversation[cut_index:],
             cut_index,
             cut=cut,
+            first_kept_id=first_kept_id,
             tokens_before=tokens_before,
             usage=usage,
             is_update=use_update,

@@ -380,11 +380,14 @@ def run_programmatic(
     logger.info("USER: %s", prompt)
 
     async def _run_agent() -> str | None:
-        if previous_messages:
+        # A resumed session already replays its own log, so only a fresh agent
+        # adopts the previous messages.
+        if previous_messages and len(agent.messages) == 1:
             non_system_messages = [
                 msg for msg in previous_messages if not (msg.role == Role.system)
             ]
-            agent.messages.extend(non_system_messages)
+            for message in non_system_messages:
+                agent.add_message(message)
             logger.info(
                 "Loaded %d messages from previous session", len(non_system_messages)
             )

@@ -11,23 +11,18 @@ import aiofiles
 
 from vibe.core.llm.format import get_active_tool_classes
 from vibe.core.sessions.entries import (
-    CompactionEntry,
     CustomEntry,
     MessageEntry,
-    ModelChangeEntry,
     SessionEntry,
     SessionHeader,
     ThinkingLevelChangeEntry,
-    UsageEntry,
     new_entry_id,
     now_iso,
 )
-from vibe.core.sessions.store import JSONL_SUFFIX, SUMMARY_TAG, JsonlSessionStore
+from vibe.core.sessions.store import JSONL_SUFFIX, JsonlSessionStore
 from vibe.core.types import (
     AgentStats,
     LLMMessage,
-    LLMUsage,
-    Role,
     SessionInfo,
     SessionMetadata,
     message_for_storage,
@@ -36,7 +31,6 @@ from vibe.core.utils import is_windows
 
 if TYPE_CHECKING:
     from vibe.core.config import SessionLoggingConfig, VibeConfig
-    from vibe.core.context.compactor import CompactionResult
     from vibe.core.tools.manager import ToolManager
 
 
@@ -49,15 +43,6 @@ def _matches_workdir(metadata: dict[str, Any], resolved_workdir: Path) -> bool:
         return Path(session_workdir).resolve() == resolved_workdir
     except (OSError, ValueError):
         return False
-
-
-def _same_message(left: LLMMessage, right: LLMMessage) -> bool:
-    return (
-        left.role == right.role
-        and (left.content or "") == (right.content or "")
-        and (left.name or "") == (right.name or "")
-        and (left.tool_call_id or "") == (right.tool_call_id or "")
-    )
 
 
 def _safe_mtime(path: Path) -> float:
@@ -93,7 +78,6 @@ class InteractionLogger:
         self.format: Literal["json", "jsonl"] = session_config.format
         self._write_format: Literal["json", "jsonl"] = session_config.format
         self._store = JsonlSessionStore(session_config)
-        self._seen_messages: list[tuple[LLMMessage, str]] = []
         self._last_entry_id: str | None = None
         self._header: SessionHeader | None = None
         self._header_written = False
@@ -139,11 +123,6 @@ class InteractionLogger:
         self._header = view.header
         self._header_written = True
         self._last_entry_id = view.entries[-1].id if view.entries else view.header.id
-        self._seen_messages = [
-            (entry.message, entry.id)
-            for entry in view.entries
-            if isinstance(entry, MessageEntry)
-        ]
         self.session_metadata = SessionMetadata(
             session_id=self.session_id,
             start_time=view.header.timestamp,
@@ -181,110 +160,39 @@ class InteractionLogger:
         self._last_entry_id = entry.id
         return entry.id
 
+    @property
+    def writes_entries(self) -> bool:
+        """Whether entries are appended to a ``.jsonl`` session file."""
+        return (
+            self.enabled and self._write_format == "jsonl" and self.filepath is not None
+        )
+
+    def append_entry(self, entry: SessionEntry) -> str | None:
+        """Persist ``entry`` as the next line of the session file.
+
+        The entry keeps the id the agent assigned, so the file and the in-memory
+        context share identities. Image bytes are dropped on the way out.
+        Returns ``None`` when nothing is written (logging disabled or legacy
+        ``.json`` format).
+        """
+        if self._write_format != "jsonl":
+            return None
+        if isinstance(entry, MessageEntry):
+            stored = message_for_storage(entry.message)
+            entry = entry.model_copy(update={"message": stored})
+        return self._append_entry(entry)
+
     def append_message(
         self, message: LLMMessage, parent_id: str | None = None
     ) -> str | None:
-        if self._write_format != "jsonl":
-            return None
-        self._ensure_session_file()
-        entry = MessageEntry(
-            id=new_entry_id(),
-            parent_id=parent_id if parent_id is not None else self._last_entry_id,
-            timestamp=now_iso(),
-            message=message_for_storage(message),
+        return self.append_entry(
+            MessageEntry(
+                id=new_entry_id(),
+                parent_id=parent_id if parent_id is not None else self._last_entry_id,
+                timestamp=now_iso(),
+                message=message,
+            )
         )
-        entry_id = self._append_entry(entry)
-        if entry_id is not None:
-            self._seen_messages.append((message, entry_id))
-        return entry_id
-
-    def append_usage(self, usage: LLMUsage, cost: float = 0.0) -> str | None:
-        if self._write_format != "jsonl":
-            return None
-        self._ensure_session_file()
-        entry = UsageEntry(
-            id=new_entry_id(),
-            parent_id=self._last_entry_id,
-            timestamp=now_iso(),
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
-            cost_usd=cost,
-        )
-        return self._append_entry(entry)
-
-    def append_model_change(self, alias: str, provider: str) -> str | None:
-        if self._write_format != "jsonl":
-            return None
-        self._ensure_session_file()
-        entry = ModelChangeEntry(
-            id=new_entry_id(),
-            parent_id=self._last_entry_id,
-            timestamp=now_iso(),
-            model_alias=alias,
-            provider=provider,
-        )
-        return self._append_entry(entry)
-
-    def append_thinking_level(self, level: str | None) -> str | None:
-        if self._write_format != "jsonl":
-            return None
-        self._ensure_session_file()
-        entry = ThinkingLevelChangeEntry(
-            id=new_entry_id(),
-            parent_id=self._last_entry_id,
-            timestamp=now_iso(),
-            level=level,
-        )
-        return self._append_entry(entry)
-
-    def append_custom(self, key: str, value: dict[str, Any]) -> str | None:
-        if self._write_format != "jsonl":
-            return None
-        self._ensure_session_file()
-        entry = CustomEntry(
-            id=new_entry_id(),
-            parent_id=self._last_entry_id,
-            timestamp=now_iso(),
-            key=key,
-            value=value,
-        )
-        return self._append_entry(entry)
-
-    def append_compaction(
-        self, result: CompactionResult, first_kept_id: str | None = None
-    ) -> str | None:
-        if self._write_format != "jsonl":
-            return None
-        self._ensure_session_file()
-        entry = CompactionEntry(
-            id=new_entry_id(),
-            parent_id=self._last_entry_id,
-            timestamp=now_iso(),
-            first_kept_id=first_kept_id,
-            summary=result.summary,
-            tokens_before=result.tokens_before,
-            tokens_after=result.tokens_after_estimate,
-            is_update=result.is_update,
-        )
-        return self._append_entry(entry)
-
-    def entry_id_for(self, message: LLMMessage) -> str | None:
-        for recorded, entry_id in reversed(self._seen_messages):
-            if recorded is message:
-                return entry_id
-        for recorded, entry_id in reversed(self._seen_messages):
-            if _same_message(recorded, message):
-                return entry_id
-        return None
-
-    def _flush_pending_messages(self, messages: list[LLMMessage]) -> None:
-        for message in messages:
-            if message.role is Role.system:
-                continue
-            if (message.content or "").startswith(f"<{SUMMARY_TAG}>"):
-                continue
-            if self.entry_id_for(message) is None:
-                self.append_message(message)
 
     def _get_save_filepath(self) -> Path:
         if self.save_dir is None or self.session_prefix is None:
@@ -384,7 +292,6 @@ class InteractionLogger:
             return None
 
         if self._write_format == "jsonl":
-            self._flush_pending_messages(messages)
             return str(self.filepath)
 
         active_tools = get_active_tool_classes(tool_manager, config)
@@ -429,22 +336,6 @@ class InteractionLogger:
             return str(self.filepath)
         except Exception:
             return None
-
-    def reset_session(self, session_id: str) -> None:
-        if not self.enabled:
-            return
-
-        self.session_id = session_id
-        self.session_start_time = datetime.now().isoformat()
-        self._seen_messages = []
-        self._last_entry_id = None
-        self._header_written = False
-        if self._write_format == "jsonl":
-            self._header = self._build_header(session_id)
-            self.filepath = self._store.session_path(self.workdir, session_id)
-        else:
-            self.filepath = self._get_save_filepath()
-        self.session_metadata = self._initialize_session_metadata()
 
     def get_session_info(
         self, messages: list[dict[str, Any]], stats: AgentStats

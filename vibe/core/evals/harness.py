@@ -245,8 +245,8 @@ async def run_scenario(
             backend=backend,
             auto_approve=scenario.mode == AgentMode.AUTO_APPROVE,
         )
-        if scenario.preset_messages:
-            agent.messages.extend(scenario.preset_messages)
+        for message in scenario.preset_messages:
+            agent.add_message(message)
         if scenario.configure is not None:
             scenario.configure(agent)
 

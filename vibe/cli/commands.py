@@ -109,8 +109,13 @@ class CommandRegistry:
             ),
             "clear": Command(
                 aliases=frozenset(["/clear", "/reset"]),
-                description="Clear conversation history",
+                description="Clear the context (the session log is kept)",
                 handler="_clear_history",
+            ),
+            "context": Command(
+                aliases=frozenset(["/context"]),
+                description="Show what the model sees: head marker, edits, recent entries",
+                handler="_show_context",
             ),
             "log": Command(
                 aliases=frozenset(["/log", "/logpath"]),

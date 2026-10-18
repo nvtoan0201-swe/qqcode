@@ -36,12 +36,13 @@ def make_agent(backend: FakeBackend, *, keep_recent_tokens: int = 150) -> Agent:
 
 
 def add_history(agent: Agent) -> None:
-    agent.messages.extend([
+    for message in [
         LLMMessage(role=Role.user, content=OLD_USER),
         LLMMessage(role=Role.assistant, content=OLD_ASSISTANT),
         LLMMessage(role=Role.user, content=RECENT_USER),
         LLMMessage(role=Role.assistant, content=RECENT_ASSISTANT),
-    ])
+    ]:
+        agent.add_message(message)
 
 
 def context_estimate(agent: Agent) -> int:

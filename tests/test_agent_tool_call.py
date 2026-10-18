@@ -446,14 +446,13 @@ async def test_fill_missing_tool_responses_inserts_placeholders() -> None:
     assistant_msg = LLMMessage(
         role=Role.assistant, content="Calling tools...", tool_calls=tool_calls_messages
     )
-    agent.messages = [
-        agent.messages[0],
-        assistant_msg,
-        # only one tool responded: the second is missing
+    agent.add_message(assistant_msg)
+    # only one tool responded: the second is missing
+    agent.add_message(
         LLMMessage(
             role=Role.tool, tool_call_id="tc1", name="todo", content="Retrieved 0 todos"
-        ),
-    ]
+        )
+    )
 
     await act_and_collect_events(agent, "Proceed")
 
@@ -478,7 +477,7 @@ async def test_ensure_assistant_after_tool_appends_understood() -> None:
     tool_msg = LLMMessage(
         role=Role.tool, tool_call_id="tc_z", name="todo", content="Done"
     )
-    agent.messages = [agent.messages[0], tool_msg]
+    agent.add_message(tool_msg)
 
     await act_and_collect_events(agent, "Next")
 

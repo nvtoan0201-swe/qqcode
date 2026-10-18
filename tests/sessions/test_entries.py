@@ -7,7 +7,9 @@ import pytest
 
 from vibe.core.sessions.entries import (
     CompactionEntry,
+    ContextEditEntry,
     CustomEntry,
+    HeadMarkerEntry,
     MessageEntry,
     ModelChangeEntry,
     SessionHeader,
@@ -25,6 +27,8 @@ def _all_entries() -> list[
     | ModelChangeEntry
     | UsageEntry
     | CustomEntry
+    | HeadMarkerEntry
+    | ContextEditEntry
 ]:
     return [
         SessionHeader(id="s1", timestamp="2024-01-01T00:00:00Z", cwd="/tmp"),
@@ -56,6 +60,16 @@ def _all_entries() -> list[
         ),
         CustomEntry(
             id="x1", timestamp="2024-01-01T00:00:05Z", key="tag", value={"a": 1}
+        ),
+        HeadMarkerEntry(
+            id="h1", timestamp="2024-01-01T00:00:06Z", keep_from_id=None, reason="clear"
+        ),
+        ContextEditEntry(
+            id="e1",
+            timestamp="2024-01-01T00:00:07Z",
+            target_id="m1",
+            action="replace",
+            replacement="rewritten",
         ),
     ]
 

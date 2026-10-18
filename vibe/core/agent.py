@@ -15,6 +15,14 @@ from pydantic import BaseModel, ValidationError
 
 from vibe.core.audit import AuditDecision, AuditLogger, build_audit_logger
 from vibe.core.config import ModelConfig, ThinkingLevel, VibeConfig
+from vibe.core.context.builder import (
+    BuildResult,
+    ContextBuilder,
+    ContextOverview,
+    EditAction,
+    pending_tool_calls,
+    placeholder_response,
+)
 from vibe.core.context.compactor import CompactionReason, Compactor
 from vibe.core.context.overflow import is_context_overflow
 from vibe.core.context.tokens import estimate_context_tokens
@@ -62,7 +70,20 @@ from vibe.core.middleware import (
 )
 from vibe.core.prompts import UtilityPrompt
 from vibe.core.prompts.sections import PromptSection
+from vibe.core.sessions.entries import (
+    ContextEditEntry,
+    CustomEntry,
+    HeadMarkerEntry,
+    MessageEntry,
+    ModelChangeEntry,
+    SessionEntry,
+    ThinkingLevelChangeEntry,
+    UsageEntry,
+    new_entry_id,
+    now_iso,
+)
 from vibe.core.sessions.recorder import SessionRecorder
+from vibe.core.sessions.store import JsonlSessionStore
 from vibe.core.skills.manager import SkillManager
 from vibe.core.system_prompt import (
     build_additional_contexts,
@@ -265,13 +286,7 @@ class Agent:
             additional_directory_contexts=self._additional_directory_contexts,
         )
 
-        self.messages = [
-            LLMMessage(role=Role.system, content=self._prompt_sections.render())
-        ]
-
-        if self.message_observer:
-            self.message_observer(self.messages[0])
-            self._last_observed_message_index = 1
+        self._set_system_message(self._prompt_sections.render())
 
         self.stats = AgentStats()
         try:
@@ -313,6 +328,8 @@ class Agent:
             parent_session_id=parent_session_id,
         )
         self._recorder = SessionRecorder(self.interaction_logger, agent=self)
+        self._log = self._read_session_entries(existing_filepath)
+        self._observe_system_message()
 
         self._init_observability(config)
 
@@ -377,7 +394,14 @@ class Agent:
         self._thinking_level = level
         if record:
             value = level.value if level is not None else None
-            self._recorder.on_thinking_level_change(value)
+            self._append_entry(
+                ThinkingLevelChangeEntry(
+                    id=new_entry_id(),
+                    parent_id=self._last_entry_id(),
+                    timestamp=now_iso(),
+                    level=value,
+                )
+            )
             self.record_custom("thinking_level", {"level": value})
 
     @property
@@ -386,7 +410,15 @@ class Agent:
 
     def record_custom(self, key: str, value: dict[str, Any]) -> None:
         """Persist an arbitrary ``CustomEntry`` on the session store."""
-        self._recorder.on_custom(key, value)
+        self._append_entry(
+            CustomEntry(
+                id=new_entry_id(),
+                parent_id=self._last_entry_id(),
+                timestamp=now_iso(),
+                key=key,
+                value=value,
+            )
+        )
 
     def set_model(self, alias: str) -> ModelConfig:
         """Switch the active model and rebuild the backend.
@@ -405,7 +437,7 @@ class Agent:
         self.stats.update_pricing(model.pricing)
         self.stats.context_window = model.context_window
         self.backend = self.backend_factory()
-        self._recorder.on_model_change(alias, model.provider)
+        self._record_model_change(alias, model.provider)
         self.record_custom("model", {"alias": alias, "provider": model.provider})
 
         if self.config.include_model_info:
@@ -449,12 +481,85 @@ class Agent:
             messages.append(self._steering.get_nowait())
         return messages
 
+    @property
+    def messages(self) -> list[LLMMessage]:
+        """Conversation sent to the model, derived from the session entry log.
+
+        Change the conversation through ``add_message``, ``edit_context``,
+        ``reset_context`` or compaction. Edits made to this list are not kept.
+        """
+        return self._context_result().messages
+
+    def _context_result(self) -> BuildResult:
+        context = self._context
+        tail_id = self._log[-1].id if self._log else None
+        if context is None:
+            context = self._context_builder.build(self._log)
+        elif context.last_entry_id != tail_id:
+            context = self._context_builder.build_from(self._log, context)
+        self._context = context
+        return context
+
+    def _last_entry_id(self) -> str | None:
+        """Parent id for the next entry: the session header id for an empty log."""
+        return self._log[-1].id if self._log else self.session_id
+
+    def _entry_id_at(self, message_index: int) -> str | None:
+        return self._context_result().entry_id_at(message_index)
+
+    def _append_entry(self, entry: SessionEntry) -> None:
+        self._log.append(entry)
+        self._recorder.write(entry)
+
+    def _set_system_message(self, content: str) -> None:
+        self._system_message = LLMMessage(role=Role.system, content=content)
+        self._context_builder = ContextBuilder(self._system_message)
+        self._context = None
+
+    def _observe_system_message(self) -> None:
+        if self.message_observer:
+            self.message_observer(self.messages[0])
+            self._last_observed_message_index = 1
+
     def add_message(self, message: LLMMessage) -> None:
         self._append_message(message)
 
     def _append_message(self, message: LLMMessage) -> None:
-        self.messages.append(message)
-        self._recorder.on_message_added(message)
+        self._append_entry(
+            MessageEntry(
+                id=new_entry_id(),
+                parent_id=self._last_entry_id(),
+                timestamp=now_iso(),
+                message=message,
+            )
+        )
+
+    def _record_model_change(self, alias: str, provider: str) -> None:
+        self._append_entry(
+            ModelChangeEntry(
+                id=new_entry_id(),
+                parent_id=self._last_entry_id(),
+                timestamp=now_iso(),
+                model_alias=alias,
+                provider=provider,
+            )
+        )
+
+    def _read_session_entries(self, filepath: Path | None) -> list[SessionEntry]:
+        if filepath is None or not self.interaction_logger.writes_entries:
+            return []
+        store = JsonlSessionStore(self.config.session_logging)
+        return list(store.read(filepath).entries)
+
+    def _sync_session_log(self) -> None:
+        """Append entries that another writer added to the session file."""
+        filepath = self.interaction_logger.filepath
+        if filepath is None or not self.interaction_logger.writes_entries:
+            return
+        store = JsonlSessionStore(self.config.session_logging)
+        tail = store.read_since(filepath, self._last_entry_id())
+        if tail.anchor_found:
+            self._log.extend(tail.entries)
 
     def _flush_new_messages(self) -> None:
         if not self.message_observer:
@@ -468,6 +573,7 @@ class Agent:
         self._last_observed_message_index = len(self.messages)
 
     async def act(self, msg: str) -> AsyncGenerator[BaseEvent]:
+        self._sync_session_log()
         self._clean_message_history()
         self._abort_event.clear()
         self._active_task = asyncio.current_task()
@@ -885,7 +991,16 @@ class Agent:
             self._record_usage(usage)
 
     def _record_usage(self, usage: LLMUsage) -> None:
-        self._recorder.on_usage(usage, self.stats.usage_cost(usage))
+        self._append_entry(
+            UsageEntry(
+                id=new_entry_id(),
+                parent_id=self._last_entry_id(),
+                timestamp=now_iso(),
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                cost_usd=self.stats.usage_cost(usage),
+            )
+        )
 
     async def _get_assistant_event(
         self, messages: list[LLMMessage] | None = None
@@ -1774,51 +1889,17 @@ class Agent:
         ACCEPTABLE_HISTORY_SIZE = 2
         if len(self.messages) < ACCEPTABLE_HISTORY_SIZE:
             return
-        self._fill_missing_tool_responses()
+        self._answer_pending_tool_calls()
         self._ensure_assistant_after_tools()
 
-    def _fill_missing_tool_responses(self) -> None:
-        i = 1
-        while i < len(self.messages):  # noqa: PLR1702
-            msg = self.messages[i]
+    def _answer_pending_tool_calls(self) -> None:
+        """Record a placeholder response for calls that were never answered.
 
-            if msg.role == "assistant" and msg.tool_calls:
-                expected_responses = len(msg.tool_calls)
-
-                if expected_responses > 0:
-                    actual_responses = 0
-                    j = i + 1
-                    while j < len(self.messages) and self.messages[j].role == "tool":
-                        actual_responses += 1
-                        j += 1
-
-                    if actual_responses < expected_responses:
-                        insertion_point = i + 1 + actual_responses
-
-                        for call_idx in range(actual_responses, expected_responses):
-                            tool_call_data = msg.tool_calls[call_idx]
-
-                            empty_response = LLMMessage(
-                                role=Role.tool,
-                                tool_call_id=tool_call_data.id or "",
-                                name=(tool_call_data.function.name or "")
-                                if tool_call_data.function
-                                else "",
-                                content=str(
-                                    get_user_cancellation_message(
-                                        CancellationReason.TOOL_NO_RESPONSE
-                                    )
-                                ),
-                            )
-
-                            self.messages.insert(insertion_point, empty_response)
-                            self._recorder.on_message_added(empty_response)
-                            insertion_point += 1
-
-                    i = i + 1 + expected_responses
-                    continue
-
-            i += 1
+        Only the trailing turn is recorded: gaps in older history are repaired
+        virtually by the context builder, while the log stays append-only.
+        """
+        for call in pending_tool_calls(self.messages):
+            self._append_message(placeholder_response(call))
 
     def _ensure_assistant_after_tools(self) -> None:
         MIN_MESSAGE_SIZE = 2
@@ -1830,31 +1911,34 @@ class Agent:
             empty_assistant_msg = LLMMessage(role=Role.assistant, content="Understood.")
             self._append_message(empty_assistant_msg)
 
-    def _reset_session(self) -> None:
-        self.session_id = str(uuid4())
-        self.interaction_logger.reset_session(self.session_id)
-
     def set_approval_callback(self, callback: ApprovalCallback) -> None:
         self.approval_callback = callback
 
     async def clear_history(self) -> None:
-        await self._recorder.flush()
-        self.messages = self.messages[:1]
+        """Clear the conversation the model sees, keeping the session itself.
 
-        self.stats = AgentStats()
+        The session log, its id, the totals and the cost are preserved; only a
+        head marker is recorded, so the context restarts from the system prompt.
+        """
+        await reset_context(self, reason="clear")
 
-        try:
-            active_model = self.config.get_active_model()
-            self.stats.update_pricing(active_model.pricing)
-            self.stats.context_window = active_model.context_window
-        except ValueError:
-            pass
-
-        self._last_usage = None
-        self.compactor.reset()
-        self.middleware_pipeline.reset()
-        self.tool_manager.reset_all()
-        self._reset_session()
+    def _load_conversation(
+        self, filepath: Path | None, messages: list[LLMMessage]
+    ) -> None:
+        """Adopt the entries of a session file, or record ``messages`` as new ones."""
+        self._context = None
+        self._log = []
+        file_backed = (
+            filepath is not None
+            and filepath.exists()
+            and self.interaction_logger.writes_entries
+        )
+        if file_backed:
+            self._log = self._read_session_entries(filepath)
+            return
+        for message in messages:
+            if message.role is not Role.system:
+                self._append_message(message)
 
     async def switch_session(
         self,
@@ -1870,8 +1954,6 @@ class Agent:
         to the given session file instead of starting a new one.
         """
         await self._recorder.flush()
-        system_messages = [msg for msg in self.messages if msg.role is Role.system]
-        non_system_messages = [msg for msg in messages if msg.role is not Role.system]
 
         self.session_id = session_id
         self.interaction_logger = InteractionLogger(
@@ -1886,7 +1968,7 @@ class Agent:
             ),
         )
         self._recorder = SessionRecorder(self.interaction_logger, agent=self)
-        self.messages = [*system_messages[:1], *non_system_messages]
+        self._load_conversation(filepath, messages)
 
         if stats is not None:
             self.stats = stats
@@ -1968,14 +2050,10 @@ class Agent:
 
     def _apply_prompt_sections(self) -> SystemPromptChangedEvent | None:
         content = self._prompt_sections.render()
-        if self.messages and self.messages[0].content == content:
+        if self._system_message.content == content:
             return None
 
-        if self.messages:
-            self.messages[0] = LLMMessage(role=Role.system, content=content)
-        else:
-            self.messages.insert(0, LLMMessage(role=Role.system, content=content))
-
+        self._set_system_message(content)
         return SystemPromptChangedEvent(content=content)
 
     def add_additional_directory_context(self, directory_path: Path) -> None:
@@ -2011,8 +2089,7 @@ class Agent:
     ) -> None:
         await self._recorder.flush()
 
-        preserved_messages = self.messages[1:] if len(self.messages) > 1 else []
-        old_system_prompt = self.messages[0].content if len(self.messages) > 0 else ""
+        old_system_prompt = self._system_message.content
         previous_model_alias = self._active_model_alias()
 
         if config is not None:
@@ -2026,9 +2103,7 @@ class Agent:
             except ValueError:
                 pass
             else:
-                self._recorder.on_model_change(
-                    active_model.alias, active_model.provider
-                )
+                self._record_model_change(active_model.alias, active_model.provider)
 
         # Recreate skill manager and tool manager with updated config
         self.skill_manager = SkillManager(self.config)
@@ -2048,11 +2123,8 @@ class Agent:
             additional_directory_contexts=self._additional_directory_contexts,
         )
         new_system_prompt = self._prompt_sections.render()
-        self.messages = [LLMMessage(role=Role.system, content=new_system_prompt)]
         did_system_prompt_change = old_system_prompt != new_system_prompt
-
-        if preserved_messages:
-            self.messages.extend(preserved_messages)
+        self._set_system_message(new_system_prompt)
 
         if len(self.messages) == 1 or did_system_prompt_change:
             self.stats.reset_context_state()
@@ -2083,3 +2155,64 @@ class Agent:
             return self.config.get_active_model().alias
         except ValueError:
             return None
+
+
+def edit_context(
+    agent: Agent,
+    target_id: str,
+    action: EditAction = "omit",
+    replacement: str | None = None,
+) -> ContextEditEntry:
+    """Record an omit or replace edit for ``target_id`` without rewriting the log."""
+    entry = ContextEditEntry(
+        id=new_entry_id(),
+        parent_id=agent._last_entry_id(),
+        timestamp=now_iso(),
+        target_id=target_id,
+        action=action,
+        replacement=replacement,
+    )
+    agent._append_entry(entry)
+    agent._refresh_context_stats()
+    return entry
+
+
+async def reset_context(
+    agent: Agent, *, keep_from_id: str | None = None, reason: str = "reset"
+) -> HeadMarkerEntry:
+    """Record a head marker so the context restarts while keeping the session log."""
+    await agent._recorder.flush()
+    marker = HeadMarkerEntry(
+        id=new_entry_id(),
+        parent_id=agent._last_entry_id(),
+        timestamp=now_iso(),
+        keep_from_id=keep_from_id,
+        reason=reason,
+    )
+    agent._append_entry(marker)
+    agent._last_usage = None
+    agent.stats.reset_context_state()
+    agent.compactor.reset()
+    agent.middleware_pipeline.reset()
+    agent.tool_manager.reset_all()
+    agent._refresh_context_stats()
+    await agent._recorder.flush()
+    return marker
+
+
+def context_overview(agent: Agent, *, recent: int = 10) -> ContextOverview:
+    """Summarize the context and session log behind ``agent`` for ``/context``."""
+    context = agent._context_result()
+    head_marker = next(
+        (entry for entry in reversed(agent._log) if isinstance(entry, HeadMarkerEntry)),
+        None,
+    )
+    actions = [edit.action for edit in context.edits.values()]
+    return ContextOverview(
+        messages=len(context.messages) - 1,
+        entries=len(agent._log),
+        head_marker=head_marker,
+        omitted=actions.count("omit"),
+        replaced=actions.count("replace"),
+        recent_entries=agent._log[-recent:],
+    )

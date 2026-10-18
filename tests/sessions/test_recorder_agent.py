@@ -124,12 +124,16 @@ async def test_flush_does_not_duplicate_recorded_messages(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_recorder_resolves_ids_for_runtime_messages(tmp_path: Path) -> None:
+async def test_context_messages_share_ids_with_the_stored_log(tmp_path: Path) -> None:
     backend = FakeBackend([mock_llm_chunk(content="ok")])
     agent = Agent(make_config(tmp_path), backend=backend)
 
     async for _ in agent.act("hello"):
         pass
 
-    assert agent._recorder.entry_id_for(agent.messages[1]) is not None
-    assert agent._recorder.entry_id_for(agent.messages[2]) is not None
+    stored_ids = [
+        entry.id
+        for entry in read_view(agent).entries
+        if isinstance(entry, MessageEntry)
+    ]
+    assert [agent._entry_id_at(index) for index in (1, 2)] == stored_ids

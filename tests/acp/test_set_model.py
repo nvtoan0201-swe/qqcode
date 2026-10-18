@@ -248,8 +248,8 @@ class TestACPSetModel:
 
         user_msg = LLMMessage(role=Role.user, content="Hello")
         assistant_msg = LLMMessage(role=Role.assistant, content="Hi there!")
-        acp_session.agent.messages.append(user_msg)
-        acp_session.agent.messages.append(assistant_msg)
+        acp_session.agent.add_message(user_msg)
+        acp_session.agent.add_message(assistant_msg)
 
         assert len(acp_session.agent.messages) == 3
 

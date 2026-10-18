@@ -101,6 +101,31 @@ class UsageEntry(SessionEntryBase):
     cost_usd: float = 0.0
 
 
+class HeadMarkerEntry(SessionEntryBase):
+    """Marks a new context head.
+
+    Older entries stay in the log but leave the context. ``keep_from_id`` keeps
+    the conversation from that entry onwards; ``None`` keeps only the entries
+    appended after the marker.
+    """
+
+    type: Literal["head_marker"] = "head_marker"
+    keep_from_id: str | None = None
+    reason: str | None = None
+
+
+class ContextEditEntry(SessionEntryBase):
+    """Removes (``omit``) or rewrites (``replace``) one message in the context.
+
+    The stored log is not touched. Later edits win over earlier ones.
+    """
+
+    type: Literal["context_edit"] = "context_edit"
+    target_id: str
+    action: Literal["omit", "replace"] = "omit"
+    replacement: str | None = None
+
+
 class CustomEntry(SessionEntryBase):
     type: Literal["custom"] = "custom"
     key: str
@@ -114,11 +139,15 @@ SessionEntry = Annotated[
     | ModelChangeEntry
     | ThinkingLevelChangeEntry
     | UsageEntry
-    | CustomEntry,
+    | CustomEntry
+    | HeadMarkerEntry
+    | ContextEditEntry,
     Field(discriminator="type"),
 ]
 
 SESSION_ENTRY_ADAPTER: TypeAdapter[SessionEntry] = TypeAdapter(SessionEntry)
+
+SUMMARY_TAG = "conversation_summary"
 
 
 def parse_entry(data: bytes | str | dict[str, Any]) -> SessionEntry:

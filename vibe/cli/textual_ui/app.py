@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 from typing import Any, ClassVar, assert_never
+from uuid import uuid4
 
 from textual.actions import SkipAction
 from textual.app import App, ComposeResult
@@ -70,7 +71,7 @@ from vibe.cli.update_notifier import (
 )
 from vibe.cli.update_notifier.version_update_gateway import VersionUpdateGateway
 from vibe.core import __version__ as CORE_VERSION
-from vibe.core.agent import Agent
+from vibe.core.agent import Agent, context_overview
 from vibe.core.ambient import ambient_setup
 from vibe.core.auth import (
     AuthKind,
@@ -600,11 +601,11 @@ class VibeApp(App):
                         stats=_stats_from_metadata(metadata),
                     )
                 else:
-                    non_system_messages = [
-                        msg for msg in loaded_messages if msg.role != Role.system
-                    ]
-                    self.agent.messages = self.agent.messages[:1]
-                    self.agent.messages.extend(non_system_messages)
+                    await self.agent.clear_history()
+                    for message in [
+                        m for m in loaded_messages if m.role != Role.system
+                    ]:
+                        self.agent.add_message(message)
 
                 await self._apply_session_preferences(metadata)
                 logger.info(
@@ -1309,7 +1310,8 @@ class VibeApp(App):
                     for msg in self._loaded_messages
                     if not (msg.role == Role.system)
                 ]
-                agent.messages.extend(non_system_messages)
+                for message in non_system_messages:
+                    agent.add_message(message)
                 logger.info(
                     "Loaded %d messages from previous session", len(non_system_messages)
                 )
@@ -1587,7 +1589,7 @@ class VibeApp(App):
                     current_tokens=self.agent.stats.context_tokens,
                 )
             await self._mount_and_scroll(
-                UserCommandMessage("Conversation history cleared!")
+                UserCommandMessage("Context cleared. The session log is preserved.")
             )
             chat = self.query_one("#chat", VerticalScroll)
             chat.scroll_home(animate=False)
@@ -1598,6 +1600,19 @@ class VibeApp(App):
                     f"Failed to clear history: {e}", collapsed=self._tools_collapsed
                 )
             )
+
+    async def _show_context(self) -> None:
+        if self.agent is None:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "No context yet. Send a message first.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        overview = context_overview(self.agent)
+        await self._mount_and_scroll(UserCommandMessage(overview.describe()))
 
     async def _show_log_path(self) -> None:
         if self.agent is None:
@@ -1821,7 +1836,9 @@ class VibeApp(App):
             )
             return
 
-        await self.agent.clear_history()
+        await self.agent.switch_session(
+            session_id=str(uuid4()), filepath=None, messages=[], stats=AgentStats()
+        )
         await self._finalize_current_streaming_message()
         messages_area = self.query_one("#messages")
         await messages_area.remove_children()

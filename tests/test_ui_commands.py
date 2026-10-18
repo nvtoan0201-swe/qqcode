@@ -32,10 +32,14 @@ async def _wait_for(
 
 class CapturingAgent(Agent):
     def __init__(self) -> None:
-        self.messages: list = []
+        self._stub_messages: list = []
         self.stats = SimpleNamespace(context_tokens=0)
         self.approval_callback = None
         self.prompts: list[str] = []
+
+    @property
+    def messages(self) -> list:
+        return self._stub_messages
 
     async def act(self, msg: str) -> AsyncGenerator[BaseEvent]:
         self.prompts.append(msg)

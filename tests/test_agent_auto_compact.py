@@ -48,12 +48,13 @@ async def test_auto_compact_triggers_and_keeps_recent_window() -> None:
     old_assistant = "old answer " * 80
     recent_user = "recent question " * 20
     recent_assistant = "recent answer " * 20
-    agent.messages.extend([
+    for message in [
         LLMMessage(role=Role.user, content=old_user),
         LLMMessage(role=Role.assistant, content=old_assistant),
         LLMMessage(role=Role.user, content=recent_user),
         LLMMessage(role=Role.assistant, content=recent_assistant),
-    ])
+    ]:
+        agent.add_message(message)
 
     events = [ev async for ev in agent.act("Hello")]
 
