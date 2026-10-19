@@ -1525,6 +1525,16 @@ DEFAULT_MODELS = [
 ]
 
 
+class ScriptToolConfig(BaseModel):
+    """Sandboxed tool scripting configuration (``[tools.script]``)."""
+
+    enabled: bool = False
+    timeout: float = Field(default=30.0, gt=0)
+    max_calls: int = Field(default=20, ge=1)
+    max_output_bytes: int = Field(default=16384, ge=256)
+    memory_mb: int = Field(default=256, ge=32)
+
+
 class ToolRuntimeConfig(BaseModel):
     """Runtime behavior shared by all tools."""
 
@@ -1549,6 +1559,7 @@ class ToolRuntimeConfig(BaseModel):
             "than this. Set a large value to keep every tool direct."
         ),
     )
+    script: ScriptToolConfig = Field(default_factory=ScriptToolConfig)
 
 
 class KeybindingsConfig(BaseModel):
@@ -1948,6 +1959,7 @@ class VibeConfig(BaseSettings):
             "sequential",
             "exposure",
             "defer_when_more_than",
+            "script",
         )
         runtime = {key: raw_tools[key] for key in runtime_keys if key in raw_tools}
         if not runtime:
@@ -1958,9 +1970,16 @@ class VibeConfig(BaseSettings):
             name: value for name, value in raw_tools.items() if name not in runtime_keys
         }
         existing = data.get("tool_runtime")
-        data["tool_runtime"] = (
-            {**runtime, **existing} if isinstance(existing, dict) else runtime
-        )
+        match existing:
+            case ToolRuntimeConfig():
+                data["tool_runtime"] = {
+                    **runtime,
+                    **existing.model_dump(exclude_unset=True),
+                }
+            case dict():
+                data["tool_runtime"] = {**runtime, **existing}
+            case _:
+                data["tool_runtime"] = runtime
         return data
 
     @field_validator("tools", mode="before")

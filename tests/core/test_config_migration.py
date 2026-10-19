@@ -334,3 +334,38 @@ def test_mcp_stdio_env_is_parsed() -> None:
     assert isinstance(server, MCPStdio)
     assert server.env == {"API_TOKEN": "abc"}
     assert server.stdio_env()["API_TOKEN"] == "abc"
+
+
+def test_missing_tools_script_section_defaults_disabled() -> None:
+    from vibe.core.tools.manager import ToolManager
+
+    loaded = VibeConfig()
+    assert loaded.tool_runtime.script.enabled is False
+    assert loaded.tool_runtime.script.timeout == 30.0
+    assert loaded.tool_runtime.script.max_calls == 20
+    assert loaded.tool_runtime.script.max_output_bytes == 16384
+    assert loaded.tool_runtime.script.memory_mb == 256
+    assert "run_tools_script" not in ToolManager(loaded).available_tools()
+
+
+def test_tools_script_section_hoists_and_registers_when_enabled() -> None:
+    from vibe.core.tools.manager import ToolManager
+
+    loaded = VibeConfig.model_validate({
+        "tools": {
+            "script": {
+                "enabled": True,
+                "timeout": 15.0,
+                "max_calls": 10,
+                "max_output_bytes": 4096,
+                "memory_mb": 128,
+            }
+        }
+    })
+    assert loaded.tool_runtime.script.enabled is True
+    assert loaded.tool_runtime.script.timeout == 15.0
+    assert loaded.tool_runtime.script.max_calls == 10
+    assert loaded.tool_runtime.script.max_output_bytes == 4096
+    assert loaded.tool_runtime.script.memory_mb == 128
+    assert "script" not in loaded.tools
+    assert "run_tools_script" in ToolManager(loaded).available_tools()

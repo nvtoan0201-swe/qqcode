@@ -115,6 +115,7 @@ class Grep(
         "Recursively search files for a regex pattern using ripgrep (rg) or grep. "
         "Respects .gitignore and .codeignore files by default when using ripgrep."
     )
+    scriptable: ClassVar[bool] = True
 
     def _detect_backend(self) -> GrepBackend:
         if shutil.which("rg"):

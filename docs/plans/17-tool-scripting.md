@@ -118,11 +118,11 @@ memory_mb = 256
 
 ## 6. DoD
 
-- [ ] `enabled=false` (mặc định): tool không xuất hiện, không ảnh hưởng gì.
-- [ ] Bật: script gọi được tool read-only, trả output gọn; sandbox chặn import/open/eval.
-- [ ] Vượt giới hạn dừng an toàn và báo rõ; subprocess luôn bị kill khi hết timeout.
-- [ ] Tool call trong script tuân thủ permission + ghi audit.
-- [ ] `ruff`, `pyright`, `pytest` xanh.
+- [x] `enabled=false` (mặc định): tool không xuất hiện, không ảnh hưởng gì.
+- [x] Bật: script gọi được tool read-only, trả output gọn; sandbox chặn import/open/eval.
+- [x] Vượt giới hạn dừng an toàn và báo rõ; subprocess luôn bị kill khi hết timeout.
+- [x] Tool call trong script tuân thủ permission + ghi audit.
+- [x] `ruff`, `pyright`, `pytest` xanh.
 
 ## 7. Rủi ro & rollback
 

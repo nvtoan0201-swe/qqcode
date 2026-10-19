@@ -148,6 +148,7 @@ PLAN_MODE_ALLOWED_TOOLS = frozenset({
     "submit_plan",
     "bash",
     "skill",
+    "run_tools_script",
 })
 
 
@@ -1731,6 +1732,12 @@ class Agent:
             attach_runner = getattr(instance, "attach_runner", None)
             if callable(attach_runner):
                 attach_runner(self._get_or_create_subagent_runner())
+        elif tool_name == "run_tools_script":
+            from vibe.core.tools.script_sandbox import ToolBridge
+
+            attach_bridge = getattr(instance, "attach_bridge", None)
+            if callable(attach_bridge):
+                attach_bridge(ToolBridge(self.tool_manager, agent=self))
         return instance
 
     async def _should_execute_tool(  # noqa: PLR0911

@@ -182,6 +182,7 @@ class BaseTool[
     prompt_path: ClassVar[Path] | None = None
     execution_mode: ClassVar[Literal["parallel", "sequential"]] = "parallel"
     exposure: ClassVar[ToolExposure] = "direct"
+    scriptable: ClassVar[bool] = False
 
     def __init__(self, config: ToolConfig, state: ToolState) -> None:
         self.config = config

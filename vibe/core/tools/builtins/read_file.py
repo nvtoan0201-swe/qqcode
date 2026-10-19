@@ -88,6 +88,7 @@ class ReadFile(
         "Read a UTF-8 file, returning content from a specific line range. "
         "Reading is capped by a byte limit for safety."
     )
+    scriptable: ClassVar[bool] = True
 
     @final
     async def run(self, args: ReadFileArgs) -> ReadFileResult:

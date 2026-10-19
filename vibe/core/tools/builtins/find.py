@@ -49,6 +49,7 @@ class Find(BaseTool[FindArgs, FindResult, FindConfig, BaseToolState]):
         "Find files and directories by glob pattern, honouring .gitignore. "
         "Uses fd when available and falls back to a built-in walk."
     )
+    scriptable: ClassVar[bool] = True
 
     async def run(self, args: FindArgs) -> FindResult:
         base = self._resolve_base_path(args.path)

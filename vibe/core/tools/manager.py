@@ -68,6 +68,11 @@ class ToolManager:
         self._available: dict[str, type[BaseTool]] = {}
         for cls in self._iter_tool_classes(self._search_paths):
             name = cls.get_name()
+            if (
+                name == "run_tools_script"
+                and not self._config.tool_runtime.script.enabled
+            ):
+                continue
             if name in self._available:
                 logger.warning(
                     "Duplicate tool '%s' from %s overrides an earlier definition",
@@ -463,6 +468,12 @@ class ToolManager:
 
         instance = tool_class.from_config(tool_config)
         instance.state.file_mutation_queue = self.file_mutation_queue
+        if tool_name == "run_tools_script":
+            from vibe.core.tools.script_sandbox import ToolBridge
+
+            attach_bridge = getattr(instance, "attach_bridge", None)
+            if callable(attach_bridge):
+                attach_bridge(ToolBridge(self, config=self._config))
         self._instances[tool_name] = instance
         return self._instances[tool_name]
 

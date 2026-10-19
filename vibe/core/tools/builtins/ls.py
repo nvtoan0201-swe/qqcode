@@ -43,6 +43,7 @@ class Ls(BaseTool[LsArgs, LsResult, LsConfig, BaseToolState]):
         "List directory contents alphabetically. Directories get a trailing '/', "
         "dotfiles are included."
     )
+    scriptable: ClassVar[bool] = True
 
     async def run(self, args: LsArgs) -> LsResult:
         base = self._resolve_base_path(args.path)
