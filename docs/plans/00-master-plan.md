@@ -2,11 +2,11 @@
 
 Bộ plan này chuyển các phát hiện trong `docs/gap-analysis/` thành kế hoạch triển khai cụ thể cho QQcode. Mỗi plan tự chứa thiết kế, task breakdown, test plan và tiêu chí hoàn thành; có thể giao cho một kỹ sư hoặc agent thực thi độc lập.
 
-## 0. Trạng thái triển khai (cập nhật 2026-10-14)
+## 0. Trạng thái triển khai (cập nhật 2026-10-19)
 
-- **Xong:** 01–11 (trước đó) và 05 (clamp `max_tokens`), 08 (compact hooks), 09 (exposure), 13 (image input), 15 (keybindings), 16 (deferred exposure + `tool_search`).
-- **Còn lại:** 12 (context store edits/head marker/delta — L), 14 (embedding SDK — L), 17 (sandboxed tool scripting — L).
-- **Việc nền đã dọn:** gate `ruff`/`ruff format --check`/`pyright`/`pytest` xanh (commit `chore(lint)`).
+- **Xong:** Toàn bộ 17/17 plans (`01`–`17`): 01–11, 12 (context store edits/head marker/delta), 13 (image input), 14 (embedding SDK), 15 (keybindings), 16 (deferred exposure + `tool_search`), 17 (sandboxed tool scripting).
+- **Còn lại:** Không còn (0/17).
+- **Việc nền đã dọn:** gate `ruff`/`ruff format --check`/`pyright`/`pytest` xanh.
 - **Lệch plan có ghi chú:** plan 13 dùng field `LLMMessage.images` thay vì union `Content`; plan 16 giữ `mcp_search` cho server MCP cấu hình `deferred` và dùng `tool_search` cho auto-defer/override.
 
 ## 1. Nguyên tắc thực thi
