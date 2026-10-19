@@ -50,6 +50,7 @@ dependencies = [
 # Resizes oversized images and probes their dimensions before sending them
 # to vision models. QQcode works without it.
 images = ["pillow>=10.0"]
+sdk = []
 
 [project.urls]
 Homepage = "https://github.com/qnguyen3/qqcode"

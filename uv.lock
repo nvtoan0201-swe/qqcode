@@ -1410,7 +1410,7 @@ requires-dist = [
     { name = "tomli-w", specifier = ">=1.2.0" },
     { name = "watchfiles", specifier = ">=1.1.1" },
 ]
-provides-extras = ["images"]
+provides-extras = ["images", "sdk"]
 
 [package.metadata.requires-dev]
 dev = [

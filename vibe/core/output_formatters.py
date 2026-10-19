@@ -7,18 +7,21 @@ import sys
 from typing import Any, TextIO
 import uuid
 
+from vibe.core.events import (
+    EVENT_SCHEMA_VERSION as EVENT_SCHEMA_VERSION,
+    AgentEventTranslator,
+    EventBus,
+    SDKEvent,
+)
 from vibe.core.types import (
     AssistantEvent,
     BaseEvent,
-    CompactEndEvent,
     LLMMessage,
     OutputFormat,
     StreamEventType,
     ToolCallEvent,
     ToolResultEvent,
 )
-
-EVENT_SCHEMA_VERSION = 1
 
 
 class OutputFormatter(ABC):
@@ -239,147 +242,39 @@ class EventJsonlFormatter(OutputFormatter):
     """
 
     def __init__(
-        self, stream: TextIO = sys.stdout, session_id: str | None = None
+        self,
+        stream: TextIO = sys.stdout,
+        session_id: str | None = None,
+        bus: EventBus | None = None,
     ) -> None:
         super().__init__(stream)
         self.session_id = session_id or str(uuid.uuid4())
-        self._turn = 0
-        self._item_id: str | None = None
-        self._content = ""
-        self._reasoning = ""
-        self._usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
-        self._cost_usd = 0.0
-        self._emit(StreamEventType.SESSION_STARTED, {"session_id": self.session_id})
+        self.bus = bus or EventBus()
+        self._translator = AgentEventTranslator(self.bus, self.session_id)
+        self._unsubscribe = self.bus.subscribe(self._write_sdk_event)
+        self._translator.start_session()
 
-    def _emit(self, event_type: StreamEventType, data: dict[str, Any]) -> None:
-        event = {
-            "type": str(event_type),
-            "schema": EVENT_SCHEMA_VERSION,
-            "timestamp": datetime.now(UTC).isoformat(),
-            **data,
-        }
-        json.dump(event, self.stream)
+    def _write_sdk_event(self, event: SDKEvent) -> None:
+        json.dump(event.to_wire_dict(), self.stream)
         self.stream.write("\n")
         self.stream.flush()
 
+    def _emit(self, event_type: StreamEventType, data: dict[str, Any]) -> None:
+        self._translator.emit_raw(event_type, data)
+
     def _emit_event(self, event_type: StreamEventType, data: dict[str, Any]) -> None:
         """Alias used by the shared stdin approval callbacks."""
-        self._emit(event_type, data)
+        self._translator.emit_raw(event_type, data)
 
     def emit_error(self, message: str) -> None:
         """Emit a top-level ``error`` event."""
-        self._emit(StreamEventType.ERROR, {"message": message})
+        self._translator.emit_error(message)
 
     def on_message_added(self, message: LLMMessage) -> None:
         self._messages.append(message)
 
     def on_event(self, event: BaseEvent) -> None:
-        match event:
-            case AssistantEvent():
-                self._handle_assistant_event(event)
-            case ToolCallEvent():
-                self._emit(
-                    StreamEventType.TOOL_CALL,
-                    {
-                        "tool_call_id": event.tool_call_id,
-                        "tool_name": event.tool_name,
-                        "args": event.args.model_dump(mode="json"),
-                    },
-                )
-            case ToolResultEvent():
-                self._emit_tool_result(event)
-            case CompactEndEvent():
-                self._emit(
-                    StreamEventType.SESSION_COMPACTED,
-                    {
-                        "tokens_before": event.old_context_tokens,
-                        "tokens_after": event.new_context_tokens,
-                    },
-                )
-
-    def _emit_tool_result(self, event: ToolResultEvent) -> None:
-        match event:
-            case ToolResultEvent(error=error) if error is not None:
-                status = "error"
-                text = error
-            case ToolResultEvent(skipped=True, skip_reason=reason):
-                status = "skipped"
-                text = reason or ""
-            case ToolResultEvent(result=result) if result is not None:
-                status = "ok"
-                text = result.model_dump_json()
-            case _:
-                status = "ok"
-                text = ""
-
-        self._emit(
-            StreamEventType.TOOL_RESULT,
-            {
-                "tool_call_id": event.tool_call_id,
-                "tool_name": event.tool_name,
-                "status": status,
-                "text": text,
-                "truncated": False,
-            },
-        )
-
-    def _handle_assistant_event(self, event: AssistantEvent) -> None:
-        if self._item_id is None:
-            self._turn += 1
-            self._item_id = f"msg_{uuid.uuid4().hex[:8]}"
-            self._content = ""
-            self._emit(StreamEventType.TURN_STARTED, {"turn": self._turn})
-
-        if event.reasoning_content:
-            reasoning_delta = event.reasoning_content[len(self._reasoning) :]
-            if reasoning_delta:
-                self._reasoning = event.reasoning_content
-                self._emit(
-                    StreamEventType.THINKING_UPDATED,
-                    {
-                        "item_id": self._item_id,
-                        "delta": reasoning_delta,
-                        "content": self._reasoning,
-                    },
-                )
-
-        content_delta = event.content[len(self._content) :] if event.content else ""
-        if content_delta:
-            self._content = event.content
-            self._emit(
-                StreamEventType.MESSAGE_DELTA,
-                {
-                    "item_id": self._item_id,
-                    "delta": content_delta,
-                    "content": self._content,
-                },
-            )
-
-        if event.cache_read_tokens:
-            self._usage["cache_read"] = event.cache_read_tokens
-        if event.cache_write_tokens:
-            self._usage["cache_write"] = event.cache_write_tokens
-        if event.prompt_tokens:
-            self._usage["input"] = event.prompt_tokens
-        if event.completion_tokens:
-            self._usage["output"] = event.completion_tokens
-        if event.cost_usd:
-            self._cost_usd = event.cost_usd
-
-        if self._is_final_turn_event(event):
-            self._emit(
-                StreamEventType.TURN_COMPLETED,
-                {"usage": dict(self._usage), "cost_usd": round(self._cost_usd, 6)},
-            )
-            self._item_id = None
-            self._content = ""
-            self._reasoning = ""
-            self._usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
-            self._cost_usd = 0.0
-
-    @staticmethod
-    def _is_final_turn_event(event: AssistantEvent) -> bool:
-        return event.stopped_by_middleware or event.completion_tokens > 0
+        self._translator.on_event(event)
 
     def finalize(self) -> str | None:
         return None

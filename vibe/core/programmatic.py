@@ -9,7 +9,6 @@ from typing import Any, Literal, Protocol, TextIO
 
 from vibe.core.agent import Agent
 from vibe.core.config import ThinkingLevel, VibeConfig
-from vibe.core.mcp.manager import MCPManager
 from vibe.core.output_formatters import (
     EventJsonlFormatter,
     VScodeJsonFormatter,
@@ -333,19 +332,20 @@ def run_programmatic(
     Returns:
         The final assistant response text, or None if no response
     """
-    agent_mode = _mode_to_agent_mode(mode)
+    from vibe.sdk.agent import AgentSession
+    from vibe.sdk.options import AgentOptions, SessionRef
 
-    # Create agent with session_id if resuming, otherwise a new session_id is generated
-    agent = Agent(
-        config,
-        mode=agent_mode,
-        message_observer=None,  # Will set observer after creating formatter
-        max_turns=max_turns,
-        max_price=max_price,
-        enable_streaming=False,
-        session_id=session_id,
-        mcp_manager=MCPManager(config),
+    session = AgentSession(
+        AgentOptions(
+            config=config,
+            mode=mode,
+            max_turns=max_turns,
+            max_price=max_price,
+            enable_streaming=False,
+            session=SessionRef(session_id=session_id) if session_id else None,
+        )
     )
+    agent = session.agent
 
     # Create formatter with agent's session_id for structured output formats
     formatter = create_formatter(output_format, session_id=agent.session_id)
@@ -409,7 +409,8 @@ def run_programmatic(
             )
 
         try:
-            return await _run_agent_with_mcp(agent, _run_agent)
+            async with session:
+                return await _run_agent_with_mcp(agent, _run_agent)
         except asyncio.CancelledError:
             logger.info("Agent turn aborted")
             return formatter.finalize()

@@ -144,11 +144,11 @@ async with create_agent(AgentOptions(model_alias="claude-sonnet-4.5")) as s:
 
 ## 6. DoD
 
-- [ ] SDK chạy được ví dụ trong `examples/sdk/` không dựa vào CLI.
-- [ ] Event schema dùng chung cho SDK và `--output events`; có JSON schema tài liệu hoá.
-- [ ] Resume/fork qua SDK hoạt động cùng `SessionStore` (plan 02).
-- [ ] `run_programmatic()` cũ giữ nguyên hành vi (test).
-- [ ] Type hints đầy đủ, `pyright` xanh; `ruff`, `pytest` xanh.
+- [x] SDK chạy được ví dụ trong `examples/sdk/` không dựa vào CLI.
+- [x] Event schema dùng chung cho SDK và `--output events`; có JSON schema tài liệu hoá.
+- [x] Resume/fork qua SDK hoạt động cùng `SessionStore` (plan 02).
+- [x] `run_programmatic()` cũ giữ nguyên hành vi (test).
+- [x] Type hints đầy đủ, `pyright` xanh; `ruff`, `pytest` xanh.
 
 ## 7. Rủi ro & rollback
 
