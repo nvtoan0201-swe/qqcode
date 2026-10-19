@@ -640,9 +640,9 @@ class TestAutoCompactIntegration:
         )
 
 
-class TestClearHistoryFullReset:
+class TestClearHistory:
     @pytest.mark.asyncio
-    async def test_clear_history_fully_resets_stats(self) -> None:
+    async def test_clear_history_keeps_session_totals(self) -> None:
         backend = FakeBackend([
             mock_llm_chunk(content="Response", finish_reason="stop")
         ])
@@ -651,14 +651,19 @@ class TestClearHistoryFullReset:
         async for _ in agent.act("Hello"):
             pass
 
-        assert agent.stats.session_prompt_tokens > 0
-        assert agent.stats.steps > 0
+        prompt_tokens = agent.stats.session_prompt_tokens
+        completion_tokens = agent.stats.session_completion_tokens
+        steps = agent.stats.steps
+        cost = agent.stats.session_cost
+        assert prompt_tokens > 0
+        assert steps > 0
 
         await agent.clear_history()
 
-        assert agent.stats.session_prompt_tokens == 0
-        assert agent.stats.session_completion_tokens == 0
-        assert agent.stats.steps == 0
+        assert agent.stats.session_prompt_tokens == prompt_tokens
+        assert agent.stats.session_completion_tokens == completion_tokens
+        assert agent.stats.steps == steps
+        assert agent.stats.session_cost == cost
 
     @pytest.mark.asyncio
     async def test_clear_history_preserves_pricing(self) -> None:
@@ -694,7 +699,7 @@ class TestClearHistoryFullReset:
         assert agent.messages[0].role == Role.system
 
     @pytest.mark.asyncio
-    async def test_clear_history_resets_session_id(self) -> None:
+    async def test_clear_history_keeps_session_id(self) -> None:
         backend = FakeBackend([
             mock_llm_chunk(content="Response", finish_reason="stop")
         ])
@@ -710,7 +715,7 @@ class TestClearHistoryFullReset:
 
         await agent.clear_history()
 
-        assert agent.session_id != original_session_id
+        assert agent.session_id == original_session_id
         assert agent.session_id == agent.interaction_logger.session_id
 
 
