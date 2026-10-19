@@ -198,3 +198,164 @@ def test_curated_provider_must_be_known(tmp_path: Path) -> None:
 
     with pytest.raises(gen.GenerationError, match="unknown provider"):
         gen.load_curated(path)
+
+
+@pytest.mark.parametrize("name", ["claude-haiku-5-5", "gpt-5.6-luna", "gpt-6-luna"])
+def test_models_that_reject_temperature_are_marked(name: str) -> None:
+    entry = {
+        "provider": "opencode-go",
+        "name": name,
+        "alias": f"opencode-go/{name}",
+        "context_window": 200_000,
+        "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+    }
+
+    model = gen.build_model(entry, None, "anthropic")
+
+    assert model["capabilities"] == {"accepts_temperature": False}
+
+
+def test_models_that_accept_temperature_keep_the_default() -> None:
+    entry = {
+        "provider": "opencode-go",
+        "name": "kimi-k3",
+        "alias": "opencode-go/kimi-k3",
+        "context_window": 200_000,
+        "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+    }
+
+    model = gen.build_model(entry, None, "openai")
+
+    assert "capabilities" not in model
+
+
+def test_catalog_rule_builds_active_tool_models_and_skips_listed_ones() -> None:
+    sources = gen.Sources(
+        models_dev={
+            "deepseek": {
+                "deepseek-flash": {"tool_call": True, "name": "Flash"},
+                "deepseek-v4-pro": {"tool_call": True, "name": "Pro"},
+                "deepseek-old": {"tool_call": True, "status": "deprecated"},
+                "deepseek-chat": {"tool_call": False},
+            }
+        }
+    )
+    curated = [
+        {
+            "provider": "deepseek",
+            "name": "deepseek-flash",
+            "alias": "deepseek/deepseek-flash",
+        }
+    ]
+
+    entries, errors = gen.catalog_entries(
+        [gen.CatalogRule("deepseek")], curated, sources
+    )
+
+    assert errors == []
+    assert entries == [
+        {
+            "provider": "deepseek",
+            "name": "deepseek-v4-pro",
+            "alias": "deepseek/deepseek-v4-pro",
+        }
+    ]
+
+
+def test_catalog_rule_exclude_drops_named_models() -> None:
+    sources = gen.Sources(
+        models_dev={
+            "opencode": {
+                "gpt-5.3-codex-spark": {"tool_call": True},
+                "kimi-k3": {"tool_call": True},
+            }
+        }
+    )
+    rules = [gen.CatalogRule("opencode", frozenset({"gpt-5.3-codex-spark"}))]
+
+    entries, _ = gen.catalog_entries(rules, [], sources)
+
+    assert [entry["name"] for entry in entries] == ["kimi-k3"]
+
+
+def test_catalog_rule_takes_api_style_from_the_models_dev_package() -> None:
+    sources = gen.Sources(
+        models_dev={
+            "opencode": {
+                "claude-x": {
+                    "tool_call": True,
+                    "provider": {"npm": "@ai-sdk/anthropic"},
+                },
+                "gpt-x": {"tool_call": True, "provider": {"npm": "@ai-sdk/openai"}},
+                "plain": {"tool_call": True},
+            },
+            "opencode-go": {
+                "qwen3.6-plus": {
+                    "tool_call": True,
+                    "provider": {"npm": "@ai-sdk/anthropic"},
+                }
+            },
+        }
+    )
+    rules = [gen.CatalogRule("opencode"), gen.CatalogRule("opencode-go")]
+
+    entries, errors = gen.catalog_entries(rules, [], sources)
+
+    assert errors == []
+    styles = {entry["name"]: entry.get("api_style", "openai") for entry in entries}
+    assert styles == {
+        "claude-x": "anthropic",
+        "gpt-x": "openai-responses",
+        "plain": "openai",
+        "qwen3.6-plus": "openai",
+    }
+
+
+def test_catalog_rule_without_active_models_is_an_error() -> None:
+    sources = gen.Sources(
+        models_dev={"deepseek": {"old": {"tool_call": True, "status": "deprecated"}}}
+    )
+
+    entries, errors = gen.catalog_entries([gen.CatalogRule("deepseek")], [], sources)
+
+    assert entries == []
+    assert errors == [
+        "deepseek: catalog rule found no active tool-capable models in models.dev"
+    ]
+
+
+def test_catalog_rule_alias_already_in_use_is_an_error() -> None:
+    sources = gen.Sources(models_dev={"deepseek": {"m": {"tool_call": True}}})
+    curated = [{"provider": "anthropic", "name": "other", "alias": "deepseek/m"}]
+
+    _, errors = gen.catalog_entries([gen.CatalogRule("deepseek")], curated, sources)
+
+    assert errors == ["deepseek/m: alias is already used by another model"]
+
+
+def test_catalog_rule_provider_needs_a_models_dev_catalog(tmp_path: Path) -> None:
+    path = tmp_path / "curated.toml"
+    path.write_text('[[catalog]]\nprovider = "openrouter"\n', encoding="utf-8")
+
+    with pytest.raises(gen.GenerationError, match="has no models.dev catalog"):
+        gen.load_catalog_rules(path)
+
+
+def test_committed_catalog_rules_cover_mimo_deepseek_and_opencode() -> None:
+    rules = gen.load_catalog_rules(CURATED_PATH)
+
+    assert {rule.provider for rule in rules} == {
+        "xiaomimimo",
+        "deepseek",
+        "opencode",
+        "opencode-go",
+    }
+
+
+def test_catalog_providers_are_left_out_of_candidates() -> None:
+    sources = gen.Sources(
+        models_dev={"deepseek": {"new-one": {"tool_call": True, "name": "New"}}}
+    )
+
+    assert gen.upstream_candidates(sources, [], [gen.CatalogRule("deepseek")]) == []
+    assert gen.upstream_candidates(sources, []) == [("deepseek", "new-one", "New")]

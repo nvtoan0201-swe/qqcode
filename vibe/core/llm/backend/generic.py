@@ -55,6 +55,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def drop_temperature(body: bytes) -> bytes:
+    """Remove temperature from a JSON request body for a model that rejects it."""
+    payload = json.loads(body)
+    payload.pop("temperature", None)
+    return json.dumps(payload).encode("utf-8")
+
+
 def _normalize_qwen_resource_url(resource_url: str | None) -> str | None:
     """Ensure a Qwen resource URL carries the https:// prefix and /v1 suffix."""
     if not resource_url:
@@ -290,6 +297,8 @@ class GenericBackend:
             cache_plan=cache_plan,
             **self._thinking_request(model, thinking_level),
         )
+        if not model.capabilities.accepts_temperature:
+            body = drop_temperature(body)
 
         # Apply OAuth headers first, then extra_headers can override
         headers.update(oauth_headers)
@@ -449,6 +458,8 @@ class GenericBackend:
             cache_plan=cache_plan,
             **self._thinking_request(model, thinking_level),
         )
+        if not model.capabilities.accepts_temperature:
+            body = drop_temperature(body)
 
         # Apply OAuth headers first, then extra_headers can override
         headers.update(oauth_headers)

@@ -46,6 +46,7 @@ from vibe.core.llm.format import (
     ResolvedMessage,
     ResolvedToolCall,
 )
+from vibe.core.llm.session_headers import session_headers
 from vibe.core.llm.types import BackendLike
 from vibe.core.mcp.manager import MCPManager
 from vibe.core.metrics import (
@@ -1598,6 +1599,7 @@ class Agent:
                     extra_headers={
                         "user-agent": get_user_agent(provider.backend),
                         "x-affinity": self.session_id,
+                        **session_headers(provider, self.session_id),
                     },
                     max_tokens=max_tokens,
                     cache_plan=cache_plan,
@@ -1669,6 +1671,7 @@ class Agent:
                     extra_headers={
                         "user-agent": get_user_agent(provider.backend),
                         "x-affinity": self.session_id,
+                        **session_headers(provider, self.session_id),
                     },
                     max_tokens=max_tokens,
                     cache_plan=cache_plan,

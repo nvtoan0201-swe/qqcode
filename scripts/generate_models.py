@@ -4,8 +4,10 @@
 ``vibe/core/data/models.curated.toml`` lists every model qqcode ships. A
 provider with an upstream catalog (models.dev, OpenRouter or the Vercel AI
 Gateway) takes its metadata from that catalog, and the fields written in the
-curated entry override it. The result is written to
-``vibe/core/data/models.generated.json``, the file qqcode loads at startup.
+curated entry override it. A ``[[catalog]]`` rule adds every active,
+tool-capable model that models.dev lists for its provider. The result is
+written to ``vibe/core/data/models.generated.json``, the file qqcode loads at
+startup.
 
 Run from the repository root::
 
@@ -17,11 +19,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 import sys
 import tomllib
 from typing import Any
@@ -53,6 +56,7 @@ MODELS_DEV_PROVIDERS = {
     "cerebras": "cerebras",
     "cloudflare-ai-gateway": "cloudflare-ai-gateway",
     "cloudflare-workers-ai": "cloudflare-workers-ai",
+    "deepseek": "deepseek",
     "fireworks": "fireworks-ai",
     "github-copilot": "github-copilot",
     "google": "google",
@@ -89,6 +93,24 @@ EFFORT_API_STYLES = frozenset({
 })
 EFFORT_VALUES = ("minimal", "low", "medium", "high", "xhigh", "max")
 
+# models.dev names the AI SDK package that serves each model. These are the
+# qqcode api_style values for the packages that differ from the provider default.
+NPM_API_STYLES = {
+    "@ai-sdk/anthropic": "anthropic",
+    "@ai-sdk/google": "google-generative-ai",
+    "@ai-sdk/openai": "openai-responses",
+}
+# OpenCode Go serves these models on chat completions, although models.dev
+# names the Anthropic package for them.
+OPENCODE_GO_CHAT_MODELS = frozenset({"qwen3.5-plus", "qwen3.6-plus"})
+# Models that reject the temperature parameter. The Anthropic names follow pi's
+# generator. The GPT-5.6 and GPT-6 names are reasoning models: gpt-5.6-luna and
+# gpt-6-luna were observed rejecting it on OpenCode Go. Omitting temperature only
+# falls back to the model default, but sending it to a model that rejects it fails.
+TEMPERATURE_UNSUPPORTED = re.compile(
+    r"claude-(?:opus-(?:4[.-][78]|5)|(?:sonnet|haiku)-5[.-]5)|gpt-(?:5\.6|6(?:\.1)?)-"
+)
+
 
 class GenerationError(Exception):
     """A curated entry or an upstream payload cannot produce a valid model."""
@@ -115,6 +137,14 @@ class Sources:
     models_dev: dict[str, dict[str, Any]] = field(default_factory=dict)
     openrouter: dict[str, dict[str, Any]] = field(default_factory=dict)
     vercel_gateway: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CatalogRule:
+    """Build every active, tool-capable model that models.dev lists for a provider."""
+
+    provider: str
+    exclude: frozenset[str] = frozenset()
 
 
 def upstream_source(provider: str) -> str | None:
@@ -286,6 +316,11 @@ def build_model(
                 f"{label}: upstream model {entry['name']!r} does not support tools"
             )
         model.update(upstream_fields(upstream, api_style))
+    if TEMPERATURE_UNSUPPORTED.search(entry["name"]):
+        model["capabilities"] = {
+            **model.get("capabilities", {}),
+            "accepts_temperature": False,
+        }
     for key, value in entry.items():
         if key == "manual":
             continue
@@ -329,6 +364,36 @@ def load_curated(path: Path) -> list[dict[str, Any]]:
     return entries
 
 
+def load_catalog_rules(path: Path) -> list[CatalogRule]:
+    """Read the [[catalog]] rules that build whole providers from models.dev."""
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    providers = {provider.name for provider in DEFAULT_PROVIDERS}
+    rules: list[CatalogRule] = []
+    for entry in data.get("catalog", []):
+        provider = entry.get("provider")
+        if provider not in providers:
+            raise GenerationError(
+                f"{path}: [[catalog]] has unknown provider {provider!r}"
+            )
+        if provider not in MODELS_DEV_PROVIDERS:
+            raise GenerationError(
+                f"{path}: [[catalog]] provider {provider!r} has no models.dev catalog"
+            )
+        if any(rule.provider == provider for rule in rules):
+            raise GenerationError(
+                f"{path}: {provider!r} has more than one [[catalog]] rule"
+            )
+        exclude = entry.get("exclude", [])
+        if not isinstance(exclude, list) or not all(
+            isinstance(name, str) for name in exclude
+        ):
+            raise GenerationError(
+                f"{path}: exclude for {provider!r} must be a list of model names"
+            )
+        rules.append(CatalogRule(provider, frozenset(exclude)))
+    return rules
+
+
 def build_models(
     curated: list[dict[str, Any]], sources: Sources
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -357,13 +422,82 @@ def build_models(
     return models, errors
 
 
-def upstream_candidates(
-    sources: Sources, curated: list[dict[str, Any]]
-) -> list[tuple[str, str, str]]:
-    """Return tool-capable upstream models that the curated list omits."""
+def catalog_api_style(
+    provider: str, model_id: str, raw: Mapping[str, Any]
+) -> str | None:
+    """Return the api_style a models.dev model implies, or None for the default."""
+    if provider == "opencode-go" and model_id in OPENCODE_GO_CHAT_MODELS:
+        return "openai"
+    package = (raw.get("provider") or {}).get("npm") or ""
+    return NPM_API_STYLES.get(package)
+
+
+def catalog_entries(
+    rules: Sequence[CatalogRule], curated: list[dict[str, Any]], sources: Sources
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Expand each catalog rule into curated-style entries.
+
+    A model the curated list already names keeps its curated entry. A rule that
+    finds no active tool-capable model is an error, because an empty provider
+    would otherwise disappear without notice.
+    """
     listed = {(entry["provider"], entry["name"]) for entry in curated}
+    aliases = {entry["alias"] for entry in curated}
+    entries: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for rule in rules:
+        active = 0
+        upstream = sources.models_dev.get(MODELS_DEV_PROVIDERS[rule.provider], {})
+        for model_id, raw in upstream.items():
+            if raw.get("tool_call") is not True or raw.get("status") == "deprecated":
+                continue
+            active += 1
+            if model_id in rule.exclude or (rule.provider, model_id) in listed:
+                continue
+            alias = f"{rule.provider}/{model_id}"
+            if alias in aliases:
+                errors.append(f"{alias}: alias is already used by another model")
+                continue
+            aliases.add(alias)
+            entry: dict[str, Any] = {
+                "provider": rule.provider,
+                "name": model_id,
+                "alias": alias,
+            }
+            api_style = catalog_api_style(rule.provider, model_id, raw)
+            if api_style is not None:
+                entry["api_style"] = api_style
+            entries.append(entry)
+        if active == 0:
+            errors.append(
+                f"{rule.provider}: catalog rule found no active tool-capable "
+                "models in models.dev"
+            )
+    return entries, errors
+
+
+def build_catalog(
+    curated: list[dict[str, Any]], rules: Sequence[CatalogRule], sources: Sources
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build the curated entries together with the entries each rule generates."""
+    generated, errors = catalog_entries(rules, curated, sources)
+    models, build_errors = build_models([*curated, *generated], sources)
+    return models, [*errors, *build_errors]
+
+
+def upstream_candidates(
+    sources: Sources, curated: list[dict[str, Any]], rules: Sequence[CatalogRule] = ()
+) -> list[tuple[str, str, str]]:
+    """Return tool-capable upstream models that the curated list omits.
+
+    Providers with a catalog rule are skipped, because the rule builds them.
+    """
+    listed = {(entry["provider"], entry["name"]) for entry in curated}
+    covered = {rule.provider for rule in rules}
     found: list[tuple[str, str, str]] = []
     for provider, key in MODELS_DEV_PROVIDERS.items():
+        if provider in covered:
+            continue
         for model_id, raw in sources.models_dev.get(key, {}).items():
             if (
                 raw.get("tool_call") is True
@@ -469,13 +603,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         curated = load_curated(CURATED_PATH)
-        needs_upstream = any(
+        rules = load_catalog_rules(CURATED_PATH)
+        needs_upstream = bool(rules) or any(
             upstream_source(entry["provider"]) is not None
             and entry.get("manual") is not True
             for entry in curated
         )
         sources = fetch_sources() if needs_upstream else Sources()
-        models, errors = build_models(curated, sources)
+        models, errors = build_catalog(curated, rules, sources)
     except (GenerationError, OSError, ValueError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -487,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
     models.sort(key=lambda model: (model["provider"], model["alias"]))
     previous = load_model_snapshot() if SNAPSHOT_PATH.exists() else {}
     changes = describe_changes(previous.get("models", []), models)
-    candidates = upstream_candidates(sources, curated)
+    candidates = upstream_candidates(sources, curated, rules)
     digest = models_digest(models)
     unchanged = previous.get("models_sha256") == digest
 

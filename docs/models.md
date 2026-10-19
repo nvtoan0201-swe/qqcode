@@ -40,6 +40,29 @@ change because `active_model` in user configs refers to them.
 - Upstream models that are not listed are reported as candidates. Add one to
   the curated file to ship it.
 
+## Catalog rules
+
+A `[[catalog]]` entry builds every active, tool-capable model that models.dev
+lists for its provider. `exclude` drops model names that must not be generated
+for it:
+
+```toml
+[[catalog]]
+provider = "opencode"
+exclude = ["gpt-5.3-codex-spark"]
+```
+
+- Each generated model gets the alias `provider/name`.
+- Its `api_style` comes from the AI SDK package models.dev names:
+  `@ai-sdk/anthropic` gives `anthropic`, `@ai-sdk/openai` gives
+  `openai-responses`, `@ai-sdk/google` gives `google-generative-ai`. Any other
+  package uses the provider's default.
+- Deprecated models are skipped. A rule that finds no active model fails the
+  run, so a provider cannot empty out silently.
+- A `[[models]]` entry with the same provider and name replaces the generated
+  entry, so curated overrides still apply.
+- Providers with a rule are not reported as candidates.
+
 ## Thinking levels
 
 A model accepts the levels in `thinking_levels`. A request for an unsupported
@@ -62,4 +85,5 @@ config, and the snapshot:
 - `models_sha256` matches the model list, which catches hand edits,
 - `generated_at` is present and timezone-aware.
 
-A snapshot older than 30 days is reported as a warning, not an error.
+A snapshot older than 30 days is reported as a warning, not an error. Pass
+`--strict` (`uv run qqcode models validate --strict`) to make that an error.
