@@ -200,6 +200,35 @@ def test_curated_provider_must_be_known(tmp_path: Path) -> None:
         gen.load_curated(path)
 
 
+@pytest.mark.parametrize("name", ["claude-haiku-5-5", "gpt-5.6-luna", "gpt-6-luna"])
+def test_models_that_reject_temperature_are_marked(name: str) -> None:
+    entry = {
+        "provider": "opencode-go",
+        "name": name,
+        "alias": f"opencode-go/{name}",
+        "context_window": 200_000,
+        "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+    }
+
+    model = gen.build_model(entry, None, "anthropic")
+
+    assert model["capabilities"] == {"accepts_temperature": False}
+
+
+def test_models_that_accept_temperature_keep_the_default() -> None:
+    entry = {
+        "provider": "opencode-go",
+        "name": "kimi-k3",
+        "alias": "opencode-go/kimi-k3",
+        "context_window": 200_000,
+        "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+    }
+
+    model = gen.build_model(entry, None, "openai")
+
+    assert "capabilities" not in model
+
+
 def test_catalog_rule_builds_active_tool_models_and_skips_listed_ones() -> None:
     sources = gen.Sources(
         models_dev={

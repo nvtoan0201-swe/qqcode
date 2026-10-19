@@ -565,6 +565,7 @@ class ModelCapabilities(BaseModel):
     vision: bool = False
     prompt_cache: Literal["none", "short", "long"] = "none"
     parallel_tool_calls: bool = True
+    accepts_temperature: bool = True
 
 
 class ModelPricing(BaseModel):

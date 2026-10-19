@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 import sys
 import tomllib
 from typing import Any
@@ -102,6 +103,13 @@ NPM_API_STYLES = {
 # OpenCode Go serves these models on chat completions, although models.dev
 # names the Anthropic package for them.
 OPENCODE_GO_CHAT_MODELS = frozenset({"qwen3.5-plus", "qwen3.6-plus"})
+# Models that reject the temperature parameter. The Anthropic names follow pi's
+# generator. The GPT-5.6 and GPT-6 names are reasoning models: gpt-5.6-luna and
+# gpt-6-luna were observed rejecting it on OpenCode Go. Omitting temperature only
+# falls back to the model default, but sending it to a model that rejects it fails.
+TEMPERATURE_UNSUPPORTED = re.compile(
+    r"claude-(?:opus-(?:4[.-][78]|5)|(?:sonnet|haiku)-5[.-]5)|gpt-(?:5\.6|6(?:\.1)?)-"
+)
 
 
 class GenerationError(Exception):
@@ -308,6 +316,11 @@ def build_model(
                 f"{label}: upstream model {entry['name']!r} does not support tools"
             )
         model.update(upstream_fields(upstream, api_style))
+    if TEMPERATURE_UNSUPPORTED.search(entry["name"]):
+        model["capabilities"] = {
+            **model.get("capabilities", {}),
+            "accepts_temperature": False,
+        }
     for key, value in entry.items():
         if key == "manual":
             continue

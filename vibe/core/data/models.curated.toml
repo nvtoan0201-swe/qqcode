@@ -18,11 +18,11 @@ provider = "deepseek"
 
 [[catalog]]
 provider = "opencode"
-exclude = ["gpt-5.3-codex-spark"]
+exclude = ["gpt-5.3-codex-spark", "claude-sonnet-4", "deepseek-v4-flash-vision-exp", "nemotron-3-ultra-free"]  # models.dev lists these, but neither zen/v1 nor zen/go/v1 serves them
 
 [[catalog]]
 provider = "opencode-go"
-exclude = ["gpt-5.3-codex-spark"]
+exclude = ["gpt-5.3-codex-spark", "gemini-4-argon-contributor"]  # no Go route: 404 on the Google protocol, rejected on chat completions
 
 [[models]]
 provider = "mistral"
