@@ -7,6 +7,7 @@ from vibe.core.config import ThinkingLevel, extra_body_has_reasoning
 from vibe.core.llm.backend.adapters.base import (
     APIAdapter,
     PreparedRequest,
+    effective_reasoning_effort,
     register_adapter,
 )
 from vibe.core.llm.cache import CachePlan
@@ -97,6 +98,7 @@ class OpenAIAdapter(APIAdapter):
         tool_choice: StrToolChoice | AvailableTool | None,
         extra_body: dict[str, Any] | None = None,
         thinking_level: ThinkingLevel | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model_name,
@@ -118,11 +120,9 @@ class OpenAIAdapter(APIAdapter):
             payload.update(extra_body)
 
         if (
-            thinking_level is not None
-            and thinking_level is not ThinkingLevel.OFF
-            and not extra_body_has_reasoning(extra_body)
-        ):
-            payload["reasoning_effort"] = thinking_level.value
+            effort := effective_reasoning_effort(thinking_level, reasoning_effort)
+        ) is not None and not extra_body_has_reasoning(extra_body):
+            payload["reasoning_effort"] = effort
 
         return payload
 
@@ -166,6 +166,7 @@ class OpenAIAdapter(APIAdapter):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        reasoning_effort: str | None = None,
     ) -> PreparedRequest:
         converted_messages = [self._message_to_payload(msg) for msg in messages]
 
@@ -182,6 +183,7 @@ class OpenAIAdapter(APIAdapter):
             tool_choice,
             extra_body,
             thinking_level,
+            reasoning_effort,
         )
 
         if cache_plan and cache_plan.enabled:

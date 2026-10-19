@@ -25,6 +25,7 @@ from pydantic_settings import (
 )
 import tomli_w
 
+from vibe.core.model_catalog import SNAPSHOT_PATH, load_model_snapshot
 from vibe.core.oauth.registry import get_flow
 from vibe.core.oauth.token import OAuthToken
 from vibe.core.prompts import SystemPrompt
@@ -527,6 +528,22 @@ class ThinkingLevel(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+
+# Every thinking level, from the least effort to the most.
+THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = (
+    ThinkingLevel.OFF,
+    ThinkingLevel.MINIMAL,
+    ThinkingLevel.LOW,
+    ThinkingLevel.MEDIUM,
+    ThinkingLevel.HIGH,
+    ThinkingLevel.XHIGH,
+    ThinkingLevel.MAX,
+)
+# Levels a model accepts when its catalog entry declares none.
+LEGACY_THINKING_LEVELS: tuple[ThinkingLevel, ...] = THINKING_LEVEL_ORDER[:5]
 
 
 DEFAULT_BUDGETS: dict[ThinkingLevel, int] = {
@@ -534,6 +551,8 @@ DEFAULT_BUDGETS: dict[ThinkingLevel, int] = {
     ThinkingLevel.LOW: 2048,
     ThinkingLevel.MEDIUM: 8192,
     ThinkingLevel.HIGH: 16384,
+    ThinkingLevel.XHIGH: 24576,
+    ThinkingLevel.MAX: 32768,
 }
 
 REASONING_EXTRA_BODY_KEYS = frozenset({"reasoning", "reasoning_effort", "thinking"})
@@ -573,6 +592,20 @@ class ModelConfig(BaseModel):
     pricing: ModelPricing = Field(default_factory=ModelPricing)
     reasoning_level: ThinkingLevel | None = None
     extra_body: dict[str, Any] = Field(default_factory=dict)
+    thinking_levels: list[ThinkingLevel] = Field(
+        default_factory=list,
+        description=(
+            "Thinking levels the model accepts. Empty means the legacy set "
+            "(off through high)."
+        ),
+    )
+    thinking_efforts: dict[ThinkingLevel, str] = Field(
+        default_factory=dict,
+        description=(
+            "Provider effort value for a level when it differs from the level "
+            "name. Off sends no effort parameter unless it is mapped here."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -609,6 +642,27 @@ class ModelConfig(BaseModel):
         data["pricing"] = pricing
         return data
 
+    @model_validator(mode="after")
+    def _check_thinking_levels(self) -> ModelConfig:
+        if self.thinking_levels and not self.capabilities.reasoning:
+            raise ValueError(
+                f"Model '{self.alias}' declares thinking levels but reasoning is off"
+            )
+        if len(set(self.thinking_levels)) != len(self.thinking_levels):
+            raise ValueError(f"Model '{self.alias}' lists a thinking level twice")
+        supported = set(supported_thinking_levels(self))
+        unsupported = [
+            level.value for level in self.thinking_efforts if level not in supported
+        ]
+        if unsupported:
+            raise ValueError(
+                f"Model '{self.alias}' maps levels it does not support: "
+                f"{', '.join(unsupported)}"
+            )
+        if any(not effort.strip() for effort in self.thinking_efforts.values()):
+            raise ValueError(f"Model '{self.alias}' has an empty effort value")
+        return self
+
     @property
     def context_limit(self) -> int:
         return self.context_window
@@ -629,28 +683,71 @@ def extra_body_has_reasoning(extra_body: dict[str, Any] | None) -> bool:
     )
 
 
+def supported_thinking_levels(model: ModelConfig) -> tuple[ThinkingLevel, ...]:
+    """Return the thinking levels ``model`` accepts, from off to max."""
+    if not model.thinking_levels:
+        return LEGACY_THINKING_LEVELS
+    declared = set(model.thinking_levels)
+    return tuple(level for level in THINKING_LEVEL_ORDER if level in declared)
+
+
+def clamp_thinking_level(model: ModelConfig, level: ThinkingLevel) -> ThinkingLevel:
+    """Return ``level`` if ``model`` accepts it, else the nearest level it accepts.
+
+    A higher level is preferred, so an OFF the model cannot honor becomes its
+    lowest effort level.
+    """
+    supported = supported_thinking_levels(model)
+    if level in supported:
+        return level
+    index = THINKING_LEVEL_ORDER.index(level)
+    if above := [
+        candidate
+        for candidate in THINKING_LEVEL_ORDER[index:]
+        if candidate in supported
+    ]:
+        return above[0]
+    below = [
+        candidate
+        for candidate in THINKING_LEVEL_ORDER[:index]
+        if candidate in supported
+    ]
+    return below[-1]
+
+
+def thinking_effort(model: ModelConfig, level: ThinkingLevel | None) -> str | None:
+    """Return the provider effort value for ``level``, or None to send none."""
+    if level is None:
+        return None
+    if level in model.thinking_efforts:
+        return model.thinking_efforts[level]
+    if level is ThinkingLevel.OFF:
+        return None
+    return level.value
+
+
 def resolve_thinking_level(
     model: ModelConfig, override: ThinkingLevel | None
 ) -> ThinkingLevel | None:
     """Resolve the effective thinking level for a request.
 
-    The session override wins over the model's configured level. Levels other
-    than OFF are ignored (with a debug log) when the model does not declare
-    reasoning support.
+    The session override wins over the model's configured level. The result is
+    clamped to the levels the model accepts. Levels other than OFF are ignored
+    (with a debug log) when the model does not declare reasoning support.
     """
     level = override if override is not None else model.reasoning_level
-    match level:
-        case None | ThinkingLevel.OFF:
+    if level is None:
+        return None
+    if not model.capabilities.reasoning:
+        if level is ThinkingLevel.OFF:
             return level
-        case _ if model.capabilities.reasoning:
-            return level
-        case _:
-            logger.debug(
-                "Ignoring thinking level '%s' for model '%s': reasoning not supported",
-                level,
-                model.name,
-            )
-            return None
+        logger.debug(
+            "Ignoring thinking level '%s' for model '%s': reasoning not supported",
+            level,
+            model.name,
+        )
+        return None
+    return clamp_thinking_level(model, level)
 
 
 DEFAULT_PROVIDERS = [
@@ -886,643 +983,14 @@ DEFAULT_PROVIDERS = [
     ),
 ]
 
-DEFAULT_MODELS = [
-    ModelConfig(
-        name="mistral-vibe-cli-latest",
-        provider="mistral",
-        alias="devstral-2",
-        pricing=ModelPricing(input_per_million=0.4, output_per_million=2.0),
-    ),
-    ModelConfig(
-        name="devstral-small-latest",
-        provider="mistral",
-        alias="devstral-small",
-        pricing=ModelPricing(input_per_million=0.1, output_per_million=0.3),
-    ),
-    ModelConfig(name="devstral", provider="llamacpp", alias="local"),
-    # OpenRouter GPT-5.2 models with reasoning effort levels
-    ModelConfig(
-        name="openai/gpt-5.2",
-        provider="openrouter",
-        alias="openrouter/gpt-5.2",
-        context_window=400_000,
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-        extra_body={"reasoning": {"effort": "none"}},
-    ),
-    ModelConfig(
-        name="openai/gpt-5.2",
-        provider="openrouter",
-        alias="openrouter/gpt-5.2:low",
-        context_window=400_000,
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-        extra_body={"reasoning": {"effort": "low"}},
-    ),
-    ModelConfig(
-        name="openai/gpt-5.2",
-        provider="openrouter",
-        alias="openrouter/gpt-5.2:medium",
-        context_window=400_000,
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-        extra_body={"reasoning": {"effort": "medium"}},
-    ),
-    ModelConfig(
-        name="openai/gpt-5.2",
-        provider="openrouter",
-        alias="openrouter/gpt-5.2:high",
-        context_window=400_000,
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-        extra_body={"reasoning": {"effort": "high"}},
-    ),
-    ModelConfig(
-        name="openai/gpt-5.2",
-        provider="openrouter",
-        alias="openrouter/gpt-5.2:xhigh",
-        context_window=400_000,
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-        extra_body={"reasoning": {"effort": "xhigh"}},
-    ),
-    # Anthropic Claude models (via Claude Max subscription OAuth)
-    ModelConfig(
-        name="claude-sonnet-4-5-20250929",
-        provider="anthropic",
-        alias="claude-sonnet-4.5",
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-    ),
-    ModelConfig(
-        name="claude-sonnet-4-5-20250929",
-        provider="anthropic",
-        alias="claude-sonnet-4.5:thinking",
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-        extra_body={"thinking": {"type": "enabled", "budget_tokens": 2000}},
-    ),
-    ModelConfig(
-        name="claude-haiku-4-5-20251001",
-        provider="anthropic",
-        alias="claude-haiku-4.5",
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-    ),
-    ModelConfig(
-        name="claude-haiku-4-5-20251001",
-        provider="anthropic",
-        alias="claude-haiku-4.5:thinking",
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-        extra_body={"thinking": {"type": "enabled", "budget_tokens": 2000}},
-    ),
-    ModelConfig(
-        name="claude-opus-4-5-20251101",
-        provider="anthropic",
-        alias="claude-opus-4.5",
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-    ),
-    ModelConfig(
-        name="claude-opus-4-5-20251101",
-        provider="anthropic",
-        alias="claude-opus-4.5:thinking",
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-        extra_body={"thinking": {"type": "enabled", "budget_tokens": 2000}},
-    ),
-    # Z.ai GLM models (thinking enabled by default)
-    ModelConfig(
-        name="glm-4.6",
-        provider="zai",
-        alias="zai/glm-4.6",
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(name="glm-4.5", provider="zai", alias="zai/glm-4.5"),
-    ModelConfig(name="glm-4.5-air", provider="zai", alias="zai/glm-4.5-air"),
-    # Qwen models (via Qwen OAuth or DashScope API key)
-    ModelConfig(
-        name="qwen3-coder-plus",
-        provider="qwen",
-        alias="qwen-coder-plus",
-        capabilities=ModelCapabilities(prompt_cache="short"),
-    ),
-    ModelConfig(
-        name="qwen3-coder-flash",
-        provider="qwen",
-        alias="qwen-coder-flash",
-        capabilities=ModelCapabilities(prompt_cache="short"),
-    ),
-    # XiaomiMimo models
-    # Note: thinking variant removed - MiMo returns tool calls as XML in reasoning content
-    # which isn't compatible with our structured tool call handling
-    ModelConfig(
-        name="mimo-v2-flash",
-        provider="xiaomimimo",
-        alias="mimo-v2-flash",
-        context_window=256_000,
-        pricing=ModelPricing(input_per_million=0.1, output_per_million=0.3),
-    ),
-    # OpenAI (Responses API)
-    ModelConfig(
-        name="gpt-5.4",
-        provider="openai",
-        alias="openai/gpt-5.4",
-        context_window=400_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gpt-5.4-mini",
-        provider="openai",
-        alias="openai/gpt-5.4-mini",
-        context_window=400_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gpt-4o",
-        provider="openai",
-        alias="openai/gpt-4o",
-        context_window=128_000,
-        capabilities=ModelCapabilities(vision=True),
-    ),
-    # OpenAI Codex (ChatGPT subscription Responses backend)
-    ModelConfig(
-        name="gpt-5.1-codex",
-        provider="openai-codex",
-        alias="openai-codex/gpt-5.1-codex",
-        context_window=400_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gpt-5.1-codex-mini",
-        provider="openai-codex",
-        alias="openai-codex/gpt-5.1-codex-mini",
-        context_window=400_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    # DeepSeek
-    ModelConfig(
-        name="deepseek-v4-pro",
-        provider="deepseek",
-        alias="deepseek/deepseek-v4-pro",
-        context_window=128_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="deepseek-flash",
-        provider="deepseek",
-        alias="deepseek/deepseek-flash",
-        context_window=128_000,
-    ),
-    # NVIDIA NIM
-    ModelConfig(
-        name="nvidia/nemotron-3-ultra-550b-a55b",
-        provider="nvidia",
-        alias="nvidia/nemotron-3-ultra",
-        context_window=128_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    # Google Gemini (native generateContent API)
-    ModelConfig(
-        name="gemini-2.5-flash",
-        provider="google",
-        alias="google/gemini-2.5-flash",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gemini-2.5-flash-lite",
-        provider="google",
-        alias="google/gemini-2.5-flash-lite",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gemini-2.5-pro",
-        provider="google",
-        alias="google/gemini-2.5-pro",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gemini-3-flash-preview",
-        provider="google",
-        alias="google/gemini-3-flash",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gemini-3-pro-preview",
-        provider="google",
-        alias="google/gemini-3-pro",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    # GitHub Copilot
-    ModelConfig(
-        name="gpt-4o",
-        provider="github-copilot",
-        alias="github-copilot/gpt-4o",
-        api_style="openai-responses",
-        context_window=128_000,
-        capabilities=ModelCapabilities(vision=True),
-    ),
-    ModelConfig(
-        name="claude-sonnet-4-5",
-        provider="github-copilot",
-        alias="github-copilot/claude-sonnet-4.5",
-        api_style="anthropic",
-        context_window=200_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    # Groq
-    ModelConfig(
-        name="llama-3.3-70b-versatile",
-        provider="groq",
-        alias="groq/llama-3.3-70b",
-        context_window=128_000,
-    ),
-    ModelConfig(
-        name="openai/gpt-oss-120b",
-        provider="groq",
-        alias="groq/gpt-oss-120b",
-        context_window=128_000,
-    ),
-    # Cerebras
-    ModelConfig(
-        name="gpt-oss-120b",
-        provider="cerebras",
-        alias="cerebras/gpt-oss-120b",
-        context_window=128_000,
-    ),
-    # xAI
-    ModelConfig(
-        name="grok-4.7",
-        provider="xai",
-        alias="xai/grok-4.7",
-        context_window=256_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="grok-4.6",
-        provider="xai",
-        alias="xai/grok-4.6",
-        context_window=256_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    # Vercel AI Gateway (Anthropic Messages)
-    ModelConfig(
-        name="anthropic/claude-haiku-4.5",
-        provider="vercel-ai-gateway",
-        alias="vercel/claude-haiku-4.5",
-        context_window=200_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="google/gemini-2.5-flash",
-        provider="vercel-ai-gateway",
-        alias="vercel/gemini-2.5-flash",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    # Z.AI Coding CN
-    ModelConfig(
-        name="glm-4.7",
-        provider="zai-coding-cn",
-        alias="zai-cn/glm-4.7",
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    # Hugging Face
-    ModelConfig(
-        name="moonshotai/Kimi-K2.5",
-        provider="huggingface",
-        alias="hf/kimi-k2.5",
-        context_window=256_000,
-    ),
-    # Fireworks
-    ModelConfig(
-        name="accounts/fireworks/models/kimi-k3",
-        provider="fireworks",
-        alias="fireworks/kimi-k3",
-        context_window=256_000,
-    ),
-    ModelConfig(
-        name="accounts/fireworks/models/glm-5p3",
-        provider="fireworks",
-        alias="fireworks/glm-5.3",
-        context_window=200_000,
-    ),
-    # Together
-    ModelConfig(
-        name="moonshotai/Kimi-K3",
-        provider="together",
-        alias="together/kimi-k3",
-        context_window=256_000,
-    ),
-    ModelConfig(
-        name="openai/gpt-oss-120b",
-        provider="together",
-        alias="together/gpt-oss-120b",
-        context_window=128_000,
-    ),
-    # Baseten
-    ModelConfig(
-        name="zai-org/GLM-5.2",
-        provider="baseten",
-        alias="baseten/glm-5.2",
-        context_window=200_000,
-    ),
-    ModelConfig(
-        name="moonshotai/Kimi-K2.6",
-        provider="baseten",
-        alias="baseten/kimi-k2.6",
-        context_window=256_000,
-    ),
-    # Kimi For Coding (Anthropic Messages)
-    ModelConfig(
-        name="k3",
-        provider="kimi-coding",
-        alias="kimi/k3",
-        context_window=256_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="kimi-for-coding",
-        provider="kimi-coding",
-        alias="kimi/kimi-for-coding",
-        context_window=256_000,
-    ),
-    # Meta (Responses API)
-    ModelConfig(
-        name="muse-spark-1.3",
-        provider="meta",
-        alias="meta/muse-spark-1.3",
-        context_window=128_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    # MiniMax (Anthropic Messages)
-    ModelConfig(
-        name="MiniMax-M2.7",
-        provider="minimax",
-        alias="minimax/minimax-m2.7",
-        context_window=204_800,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="MiniMax-M2.7",
-        provider="minimax-cn",
-        alias="minimax-cn/minimax-m2.7",
-        context_window=204_800,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    # Moonshot AI
-    ModelConfig(
-        name="kimi-k2.7-code",
-        provider="moonshotai",
-        alias="moonshot/kimi-k2.7-code",
-        context_window=256_000,
-    ),
-    ModelConfig(
-        name="kimi-k2.7-code",
-        provider="moonshotai-cn",
-        alias="moonshot-cn/kimi-k2.7-code",
-        context_window=256_000,
-    ),
-    # Qwen Token Plan
-    ModelConfig(
-        name="qwen3.7-max",
-        provider="qwen-token-plan",
-        alias="qwen-token-plan/qwen3.7-max",
-        context_window=262_144,
-    ),
-    ModelConfig(
-        name="qwen3.7-max",
-        provider="qwen-token-plan-cn",
-        alias="qwen-token-plan-cn/qwen3.7-max",
-        context_window=262_144,
-    ),
-    # Ant Ling
-    ModelConfig(
-        name="Ling-2.6-flash",
-        provider="ant-ling",
-        alias="ant-ling/ling-2.6-flash",
-        context_window=262_144,
-    ),
-    ModelConfig(
-        name="Ring-2.6-1T",
-        provider="ant-ling",
-        alias="ant-ling/ring-2.6-1t",
-        context_window=262_144,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    # OpenCode Zen
-    ModelConfig(
-        name="gpt-5.4",
-        provider="opencode",
-        alias="opencode/gpt-5.4",
-        api_style="openai-responses",
-        context_window=400_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="claude-sonnet-4-5",
-        provider="opencode",
-        alias="opencode/claude-sonnet-4.5",
-        api_style="anthropic",
-        context_window=200_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="kimi-k2.6",
-        provider="opencode",
-        alias="opencode/kimi-k2.6",
-        context_window=256_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="grok-build-0.1",
-        provider="opencode",
-        alias="opencode/grok-build-0.1",
-        context_window=256_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="gemini-3-pro-preview",
-        provider="opencode",
-        alias="opencode/gemini-3-pro",
-        api_style="google-generative-ai",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gemini-2.5-flash",
-        provider="opencode",
-        alias="opencode/gemini-2.5-flash",
-        api_style="google-generative-ai",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    # OpenCode Go
-    ModelConfig(
-        name="gpt-5.6-luna",
-        provider="opencode-go",
-        alias="opencode-go/gpt-5.6-luna",
-        api_style="openai-responses",
-        context_window=400_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="kimi-k3",
-        provider="opencode-go",
-        alias="opencode-go/kimi-k3",
-        context_window=256_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="deepseek-v4-flash",
-        provider="opencode-go",
-        alias="opencode-go/deepseek-v4-flash",
-        context_window=256_000,
-    ),
-    ModelConfig(
-        name="deepseek-v4.1-flash",
-        provider="opencode-go",
-        alias="opencode-go/deepseek-v4.1-flash",
-        context_window=256_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="kimi-k2.6",
-        provider="opencode-go",
-        alias="opencode-go/kimi-k2.6",
-        context_window=256_000,
-        capabilities=ModelCapabilities(reasoning=True),
-    ),
-    ModelConfig(
-        name="claude-sonnet-4-5",
-        provider="opencode-go",
-        alias="opencode-go/claude-sonnet-4.5",
-        api_style="anthropic",
-        context_window=200_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    # Radius gateway (pi-messages protocol)
-    ModelConfig(
-        name="claude-sonnet-4-5",
-        provider="radius",
-        alias="radius/claude-sonnet-4.5",
-        context_window=200_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gpt-5.1",
-        provider="radius",
-        alias="radius/gpt-5.1",
-        context_window=400_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    # Google Vertex AI (Application Default Credentials or an API key)
-    ModelConfig(
-        name="gemini-2.5-pro",
-        provider="google-vertex",
-        alias="vertex/gemini-2.5-pro",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gemini-2.5-flash",
-        provider="google-vertex",
-        alias="vertex/gemini-2.5-flash",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gemini-3-pro-preview",
-        provider="google-vertex",
-        alias="vertex/gemini-3-pro",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="gemini-3-flash-preview",
-        provider="google-vertex",
-        alias="vertex/gemini-3-flash",
-        context_window=1_000_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    # Amazon Bedrock (AWS credential chain or a Bedrock bearer token)
-    ModelConfig(
-        name="anthropic.claude-sonnet-4-5-20250929-v1:0",
-        provider="amazon-bedrock",
-        alias="bedrock/claude-sonnet-4.5",
-        context_window=200_000,
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-    ),
-    ModelConfig(
-        name="anthropic.claude-3-5-haiku-20241022-v1:0",
-        provider="amazon-bedrock",
-        alias="bedrock/claude-3.5-haiku",
-        context_window=200_000,
-        capabilities=ModelCapabilities(
-            reasoning=True, vision=True, prompt_cache="short"
-        ),
-    ),
-    ModelConfig(
-        name="amazon.nova-pro-v1:0",
-        provider="amazon-bedrock",
-        alias="bedrock/nova-pro",
-        context_window=300_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    ModelConfig(
-        name="amazon.nova-lite-v1:0",
-        provider="amazon-bedrock",
-        alias="bedrock/nova-lite",
-        context_window=300_000,
-        capabilities=ModelCapabilities(reasoning=True, vision=True),
-    ),
-    # Cloudflare Workers AI
-    ModelConfig(
-        name="@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-        provider="cloudflare-workers-ai",
-        alias="cloudflare/llama-3.3-70b",
-        context_window=128_000,
-    ),
-    ModelConfig(
-        name="@cf/qwen/qwen2.5-coder-32b-instruct",
-        provider="cloudflare-workers-ai",
-        alias="cloudflare/qwen2.5-coder",
-        context_window=128_000,
-    ),
-    ModelConfig(
-        name="@cf/meta/llama-4-scout-17b-16e-instruct",
-        provider="cloudflare-workers-ai",
-        alias="cloudflare/llama-4-scout",
-        context_window=128_000,
-    ),
-    # Cloudflare AI Gateway (OpenAI-compatible endpoint)
-    ModelConfig(
-        name="openai/gpt-4o",
-        provider="cloudflare-ai-gateway",
-        alias="cloudflare-gateway/gpt-4o",
-        context_window=128_000,
-        capabilities=ModelCapabilities(vision=True),
-    ),
-]
+
+def _load_builtin_models() -> list[ModelConfig]:
+    """Return the built-in models from the committed snapshot."""
+    payload = load_model_snapshot(SNAPSHOT_PATH)
+    return [ModelConfig.model_validate(entry) for entry in payload["models"]]
+
+
+DEFAULT_MODELS = _load_builtin_models()
 
 
 class ScriptToolConfig(BaseModel):
@@ -2189,12 +1657,17 @@ class VibeConfig(BaseSettings):
             )
 
             overlay_paths = default_overlay_paths()
-            overlay_paths.extend(
-                Path(provider.models_path).expanduser()
-                for provider in config.providers
-                if provider.models_path
-                and not provider.models_path.startswith(("http://", "https://"))
-            )
+            for provider in config.providers:
+                if not provider.models_path:
+                    continue
+                if provider.models_path.startswith(("http://", "https://")):
+                    logger.warning(
+                        "Ignoring models_path for provider %s: remote model "
+                        "overlays are not supported",
+                        provider.name,
+                    )
+                    continue
+                overlay_paths.append(Path(provider.models_path).expanduser())
             if overlay_models := load_model_overlay(overlay_paths):
                 config.models = merge_model_overlays(config.models, overlay_models)
 

@@ -66,6 +66,8 @@ class OpenAICodexResponsesAdapter(OpenAIResponsesAdapter):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        *,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         payload = super().build_payload(
             model_name,
@@ -77,6 +79,7 @@ class OpenAICodexResponsesAdapter(OpenAIResponsesAdapter):
             extra_body,
             cache_plan,
             thinking_level,
+            reasoning_effort=reasoning_effort,
         )
         payload["store"] = False
         payload.setdefault("instructions", _DEFAULT_INSTRUCTIONS)
@@ -102,6 +105,7 @@ class OpenAICodexResponsesAdapter(OpenAIResponsesAdapter):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        reasoning_effort: str | None = None,
     ) -> PreparedRequest:
         converted_messages = [msg.model_dump(exclude_none=True) for msg in messages]
         payload = self.build_payload(
@@ -114,6 +118,7 @@ class OpenAICodexResponsesAdapter(OpenAIResponsesAdapter):
             extra_body,
             cache_plan,
             thinking_level,
+            reasoning_effort=reasoning_effort,
         )
         payload["stream"] = enable_streaming
 

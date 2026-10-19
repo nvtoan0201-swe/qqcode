@@ -259,6 +259,7 @@ class AnthropicAdapter(APIAdapter):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        reasoning_effort: str | None = None,
     ) -> PreparedRequest:
         # Check if OAuth is being used - need to inject Claude Code prefix
         is_oauth = provider.oauth_token is not None

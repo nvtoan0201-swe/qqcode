@@ -7,6 +7,7 @@ from vibe.core.config import ThinkingLevel, extra_body_has_reasoning
 from vibe.core.llm.backend.adapters.base import (
     APIAdapter,
     PreparedRequest,
+    effective_reasoning_effort,
     register_adapter,
 )
 from vibe.core.llm.cache import CachePlan
@@ -138,6 +139,8 @@ class OpenAIResponsesAdapter(APIAdapter):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        *,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         instructions, input_items = self._convert_messages(converted_messages)
 
@@ -165,11 +168,9 @@ class OpenAIResponsesAdapter(APIAdapter):
                 payload["prompt_cache_retention"] = "24h"
 
         if (
-            thinking_level is not None
-            and thinking_level is not ThinkingLevel.OFF
-            and not extra_body_has_reasoning(extra_body)
-        ):
-            payload["reasoning"] = {"effort": thinking_level.value}
+            effort := effective_reasoning_effort(thinking_level, reasoning_effort)
+        ) is not None and not extra_body_has_reasoning(extra_body):
+            payload["reasoning"] = {"effort": effort}
 
         return payload
 
@@ -188,6 +189,7 @@ class OpenAIResponsesAdapter(APIAdapter):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        reasoning_effort: str | None = None,
     ) -> PreparedRequest:
         converted_messages = [msg.model_dump(exclude_none=True) for msg in messages]
 
@@ -201,6 +203,7 @@ class OpenAIResponsesAdapter(APIAdapter):
             extra_body,
             cache_plan,
             thinking_level,
+            reasoning_effort=reasoning_effort,
         )
 
         if enable_streaming:

@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import httpx
 
-from vibe.core.config import ThinkingLevel, resolve_thinking_level, save_oauth_token
+from vibe.core.config import (
+    ThinkingLevel,
+    resolve_thinking_level,
+    save_oauth_token,
+    thinking_effort,
+)
 from vibe.core.images import resolve_messages
 from vibe.core.llm.backend.adapters import (
     ADAPTER_REGISTRY,
@@ -223,6 +228,16 @@ class GenericBackend:
     ) -> ThinkingLevel | None:
         return resolve_thinking_level(model, thinking_level)
 
+    def _thinking_request(
+        self, model: ModelConfig, thinking_level: ThinkingLevel | None
+    ) -> dict[str, Any]:
+        """Return the thinking arguments for an adapter's ``prepare_request``."""
+        level = self._resolve_thinking_level(model, thinking_level)
+        return {
+            "thinking_level": level,
+            "reasoning_effort": thinking_effort(model, level),
+        }
+
     async def complete(
         self,
         *,
@@ -273,7 +288,7 @@ class GenericBackend:
             api_key=api_key,
             extra_body=extra_body,
             cache_plan=cache_plan,
-            thinking_level=self._resolve_thinking_level(model, thinking_level),
+            **self._thinking_request(model, thinking_level),
         )
 
         # Apply OAuth headers first, then extra_headers can override
@@ -432,7 +447,7 @@ class GenericBackend:
             api_key=api_key,
             extra_body=extra_body,
             cache_plan=cache_plan,
-            thinking_level=self._resolve_thinking_level(model, thinking_level),
+            **self._thinking_request(model, thinking_level),
         )
 
         # Apply OAuth headers first, then extra_headers can override

@@ -8,6 +8,7 @@ from vibe.core.config import ThinkingLevel
 from vibe.core.llm.backend.adapters.base import (
     APIAdapter,
     PreparedRequest,
+    effective_reasoning_effort,
     register_adapter,
 )
 from vibe.core.llm.cache import CachePlan
@@ -199,14 +200,18 @@ class PiMessagesAdapter(APIAdapter):
         provider_name: str = "",
         thinking_level: ThinkingLevel | None = None,
         extra_body: dict[str, Any] | None = None,
+        *,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {"temperature": temperature}
         if max_tokens is not None:
             options["maxTokens"] = max_tokens
         if tool_choice is not None:
             options["toolChoice"] = self._convert_tool_choice(tool_choice)
-        if thinking_level is not None and thinking_level is not ThinkingLevel.OFF:
-            options["reasoning"] = thinking_level.value
+        if (
+            effort := effective_reasoning_effort(thinking_level, reasoning_effort)
+        ) is not None:
+            options["reasoning"] = effort
 
         payload: dict[str, Any] = {
             "model": model_name,
@@ -234,6 +239,7 @@ class PiMessagesAdapter(APIAdapter):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        reasoning_effort: str | None = None,
     ) -> PreparedRequest:
         payload = self.build_payload(
             model_name,
@@ -245,6 +251,7 @@ class PiMessagesAdapter(APIAdapter):
             provider_name=provider.name,
             thinking_level=thinking_level,
             extra_body=extra_body,
+            reasoning_effort=reasoning_effort,
         )
         headers = self.build_headers(api_key)
         body = json.dumps(payload).encode("utf-8")

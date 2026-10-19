@@ -252,6 +252,7 @@ class GoogleGenerativeAIAdapter(APIAdapter):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        reasoning_effort: str | None = None,
     ) -> PreparedRequest:
         payload = self.build_payload(
             model_name,

@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, TypeVar
 
+from vibe.core.config import ThinkingLevel
+
 if TYPE_CHECKING:
-    from vibe.core.config import ProviderConfig, ThinkingLevel
+    from vibe.core.config import ProviderConfig
     from vibe.core.llm.cache import CachePlan
     from vibe.core.types import AvailableTool, LLMChunk, LLMMessage, StrToolChoice
 
@@ -45,6 +47,7 @@ class APIAdapter(Protocol):
         extra_body: dict[str, Any] | None = None,
         cache_plan: CachePlan | None = None,
         thinking_level: ThinkingLevel | None = None,
+        reasoning_effort: str | None = None,
     ) -> PreparedRequest: ...
 
     def parse_response(self, data: dict[str, Any]) -> LLMChunk: ...
@@ -52,6 +55,22 @@ class APIAdapter(Protocol):
     def postprocess_response(self, chunk: LLMChunk) -> LLMChunk:
         """Hook for adapters that need to adjust every parsed chunk."""
         return chunk
+
+
+def effective_reasoning_effort(
+    thinking_level: ThinkingLevel | None, reasoning_effort: str | None
+) -> str | None:
+    """Return the effort value to send, or None to send no effort parameter.
+
+    ``reasoning_effort`` is the provider value the backend mapped from the
+    model's thinking table. Without it, the level name is sent and OFF sends
+    nothing.
+    """
+    if reasoning_effort is not None:
+        return reasoning_effort
+    if thinking_level is None or thinking_level is ThinkingLevel.OFF:
+        return None
+    return thinking_level.value
 
 
 ADAPTER_REGISTRY: dict[str, type[APIAdapter]] = {}

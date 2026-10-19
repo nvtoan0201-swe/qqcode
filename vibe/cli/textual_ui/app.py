@@ -90,6 +90,7 @@ from vibe.core.config import (
     VibeConfig,
     get_vibe_home,
     save_oauth_token,
+    supported_thinking_levels,
 )
 from vibe.core.interaction_logger import InteractionLogger
 from vibe.core.mcp.manager import MCPManager
@@ -138,6 +139,8 @@ THINKING_LEVELS: tuple[ThinkingLevel, ...] = (
     ThinkingLevel.LOW,
     ThinkingLevel.MEDIUM,
     ThinkingLevel.HIGH,
+    ThinkingLevel.XHIGH,
+    ThinkingLevel.MAX,
 )
 
 
@@ -1819,7 +1822,10 @@ class VibeApp(App):
         current = (
             self.agent.thinking_level if self.agent else self._initial_thinking_level
         )
-        levels = list(THINKING_LEVELS)
+        try:
+            levels = list(supported_thinking_levels(self.config.get_active_model()))
+        except ValueError:
+            levels = list(THINKING_LEVELS)
         current_index = next(
             (index for index, level in enumerate(levels) if level == current), -1
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ from vibe.core.config import (
     load_api_keys_from_env,
 )
 from vibe.core.interaction_logger import InteractionLogger
+from vibe.core.model_catalog import load_model_snapshot, snapshot_problems
 from vibe.core.models_overlay import validate_models
 from vibe.core.packages import (
     InstalledPackage,
@@ -512,7 +514,8 @@ def _build_models_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Output the catalog as JSON"
     )
     subparsers.add_parser(
-        "validate", help="Validate model aliases, capabilities and providers"
+        "validate",
+        help="Validate model aliases, providers and the generated model snapshot",
     )
     return parser
 
@@ -567,9 +570,14 @@ def run_models_command(argv: list[str]) -> int:
             return 0
         case "validate":
             errors = validate_models(config.models, config.providers)
-            for error in errors:
+            snapshot_errors, snapshot_warnings = snapshot_problems(
+                load_model_snapshot(), now=datetime.now(UTC)
+            )
+            for warning in snapshot_warnings:
+                print(f"warning: {warning}", file=sys.stderr)
+            for error in [*errors, *snapshot_errors]:
                 print(error, file=sys.stderr)
-            if errors:
+            if errors or snapshot_errors:
                 return 1
             print(f"Validated {len(config.models)} models: OK")
             return 0
