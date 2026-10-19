@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from vibe.cli.entrypoint import _build_models_parser
 from vibe.core.config import DEFAULT_MODELS
 from vibe.core.model_catalog import (
     SNAPSHOT_MAX_AGE,
@@ -74,3 +75,8 @@ def test_unknown_schema_version_is_an_error() -> None:
     errors, _ = snapshot_problems(payload, now=NOW)
 
     assert any("schema_version" in error for error in errors)
+
+
+def test_models_validate_accepts_strict_flag() -> None:
+    assert _build_models_parser().parse_args(["validate"]).strict is False
+    assert _build_models_parser().parse_args(["validate", "--strict"]).strict is True

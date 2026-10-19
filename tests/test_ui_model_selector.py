@@ -102,7 +102,9 @@ async def test_model_selector_search_filters_and_selects(
         screen = await _wait_for_screen(pilot, app)
 
         search = screen.query_one(SEARCH, Input)
-        search.value = "deepseek-v4.1"
+        # opencode and opencode-go share OPENCODE_API_KEY, so both list a
+        # deepseek-v4.1-flash; the provider prefix picks the one under test.
+        search.value = "opencode-go/deepseek-v4.1"
         await pilot.pause()
 
         assert screen.filtered[0].alias == "opencode-go/deepseek-v4.1-flash"

@@ -513,9 +513,14 @@ def _build_models_parser() -> argparse.ArgumentParser:
     list_parser.add_argument(
         "--json", action="store_true", help="Output the catalog as JSON"
     )
-    subparsers.add_parser(
+    validate_parser = subparsers.add_parser(
         "validate",
         help="Validate model aliases, providers and the generated model snapshot",
+    )
+    validate_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat a snapshot older than 30 days as an error",
     )
     return parser
 
@@ -573,6 +578,9 @@ def run_models_command(argv: list[str]) -> int:
             snapshot_errors, snapshot_warnings = snapshot_problems(
                 load_model_snapshot(), now=datetime.now(UTC)
             )
+            if args.strict:
+                snapshot_errors = [*snapshot_errors, *snapshot_warnings]
+                snapshot_warnings = []
             for warning in snapshot_warnings:
                 print(f"warning: {warning}", file=sys.stderr)
             for error in [*errors, *snapshot_errors]:

@@ -5,6 +5,24 @@
 # Gateway) takes context window, pricing and reasoning metadata from it. Fields
 # written here override it. An entry with manual = true has no upstream source,
 # so it must state context_window and pricing itself.
+#
+# A [[catalog]] rule builds every active, tool-capable model that models.dev
+# lists for its provider, as a "provider/name" alias. A [[models]] entry with
+# the same provider and name replaces the generated one. exclude drops names.
+
+[[catalog]]
+provider = "xiaomimimo"
+
+[[catalog]]
+provider = "deepseek"
+
+[[catalog]]
+provider = "opencode"
+exclude = ["gpt-5.3-codex-spark"]
+
+[[catalog]]
+provider = "opencode-go"
+exclude = ["gpt-5.3-codex-spark"]
 
 [[models]]
 provider = "mistral"
@@ -352,46 +370,28 @@ output_per_million = 0.0
 cache_read_per_million = 0.0
 cache_write_per_million = 0.0
 
+# models.dev lists half of these DeepSeek rates. They are the standard rates
+# pi uses; the cost schema has no time-based discount tiers.
 [[models]]
 provider = "deepseek"
 name = "deepseek-v4-pro"
 alias = "deepseek/deepseek-v4-pro"
-manual = true
-context_window = 128000
-
-[models.capabilities]
-tools = true
-tool_choice = true
-reasoning = true
-vision = false
-prompt_cache = "none"
-parallel_tool_calls = true
 
 [models.pricing]
-input_per_million = 0.0
-output_per_million = 0.0
-cache_read_per_million = 0.0
+input_per_million = 1.32
+output_per_million = 3.96
+cache_read_per_million = 0.044
 cache_write_per_million = 0.0
 
 [[models]]
 provider = "deepseek"
 name = "deepseek-flash"
 alias = "deepseek/deepseek-flash"
-manual = true
-context_window = 128000
-
-[models.capabilities]
-tools = true
-tool_choice = true
-reasoning = false
-vision = false
-prompt_cache = "none"
-parallel_tool_calls = true
 
 [models.pricing]
-input_per_million = 0.0
-output_per_million = 0.0
-cache_read_per_million = 0.0
+input_per_million = 0.3
+output_per_million = 1.2
+cache_read_per_million = 0.006
 cache_write_per_million = 0.0
 
 [[models]]
