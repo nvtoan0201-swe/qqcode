@@ -100,7 +100,7 @@ Screen {
     width: 1fr;
     height: auto;
     max-height: 16;
-    background: transparent;
+    background: $background;
     color: $text;
     border: none;
     padding: 0;
