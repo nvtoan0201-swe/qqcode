@@ -108,7 +108,11 @@ def test_describe_image_rejects_unsupported_files(tmp_path: Path) -> None:
         describe_image(path)
 
 
-def test_read_image_bytes_enforces_the_size_limit(tmp_path: Path) -> None:
+def test_read_image_bytes_enforces_the_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without Pillow an oversized image cannot be resized, so reading must fail.
+    monkeypatch.setattr("vibe.core.images._pillow_image_module", lambda: None)
     path = write_png(tmp_path / "huge.png", size=MAX_IMAGE_BYTES + 1)
 
     with pytest.raises(ImageError, match="Pillow"):
